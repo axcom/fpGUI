@@ -48,6 +48,14 @@ const
 {$IFDEF AGG_LINUX}
   ft_lib = 'freetype';
 {$ENDIF }
+{$IFDEF AGG_OHOS}
+  ft_lib = 'freetype';
+{$ENDIF }
+{$IFDEF AGG_ANDROID}
+  { Android 系统没有公开的 libfreetype.so 可供应用命名空间直接链接，
+    因此 APK 内自带 libfreetype.so（jniLibs），运行时从应用命名空间加载。 }
+  ft_lib = 'freetype';
+{$ENDIF }
 
 // Mac OS X
 {$IFDEF AGG_MACOSX}
@@ -386,6 +394,12 @@ type
             load_flags : FT_Int32 ) : FT_Error; cdecl; external ft_lib name 'FT_Load_Glyph';
 
  function  FT_Render_Glyph(slot : FT_GlyphSlot_ptr; render_mode : FT_Render_Mode ) : FT_Error; cdecl; external ft_lib name 'FT_Render_Glyph';
+
+ { Synthetic styling (freetype/ftsynth.h). Used on platforms whose system
+   fonts ship only the regular face (e.g. OHOS) so bold/italic requests can
+   still be rendered. Emboldens/oblices the freshly loaded glyph slot. }
+ function  FT_GlyphSlot_Embolden(slot : FT_GlyphSlot_ptr ) : FT_Error; cdecl; external ft_lib name 'FT_GlyphSlot_Embolden';
+ function  FT_GlyphSlot_Oblique(slot : FT_GlyphSlot_ptr ) : FT_Error; cdecl; external ft_lib name 'FT_GlyphSlot_Oblique';
 
  function  FT_Get_Kerning(
             face : FT_Face_ptr;

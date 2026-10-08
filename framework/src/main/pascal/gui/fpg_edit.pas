@@ -542,8 +542,9 @@ begin
   begin
     dpos := UTF8CharAtByte(dtext, dpos, ch);
     ptw := tw;
+    tw  := tw + Font.GetTextWidth(ch);   // ← 逐字符累加（有误差）
     // Calculate width of substring instead of accumulating per-character to avoid rounding errors
-    tw  := Font.GetTextWidth(UTF8Copy(dtext, 1, chnum));
+    //tw  := Font.GetTextWidth(UTF8Copy(dtext, 1, chnum));
     chx := tw - FTextOffset + FSideMargin;
     if UsePxCursorPos then
     begin
@@ -622,7 +623,7 @@ begin
     pdp := dpos;
     dpos := UTF8CharAtByte(dtext, dpos, ch);
     ptw := tw;
-    tw  := tw + Font.GetTextWidth(ch);
+    tw  := Font.GetTextWidth(UTF8Copy(dtext, 1, chnum));
     chx := tw - FTextOffset + FSideMargin;
 
     // calculate selection-related fields

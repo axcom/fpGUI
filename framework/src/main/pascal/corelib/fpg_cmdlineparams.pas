@@ -54,6 +54,7 @@ type
     function    GetOptionChar: char;
     procedure   SetCaseSensitiveOptions(AValue: Boolean);
     procedure   SetOptionChar(AValue: char);
+    function    ParamStr(AIndex: integer): string;
     function    GetParams(AIndex: integer): string;
     function    GetParamCount: integer;
     { our properties }
@@ -88,6 +89,7 @@ type
     function    GetOptionChar: char;
     procedure   SetCaseSensitiveOptions(AValue: Boolean);
     procedure   SetOptionChar(AValue: char);
+    function    ParamStr(AIndex: integer): string;
     function    GetParams(AIndex: integer): string;
     function    GetParamCount: integer;
     { our properties }
@@ -509,6 +511,11 @@ end;
 procedure TfpgCmdLineParams.SetOptionChar(AValue: char);
 begin
   FOptionChar := AValue;
+end;
+
+function TfpgCmdLineParams.ParamStr(AIndex: integer): string;
+begin
+  Result := system.ParamStr(AIndex);
 end;
 
 function TfpgCmdLineParams.GetParams(AIndex: integer): string;

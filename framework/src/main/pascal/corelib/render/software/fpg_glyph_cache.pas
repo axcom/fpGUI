@@ -49,12 +49,28 @@ type
     FCurrentSize: double;
     FCurrentBold: Boolean;
     FCurrentItalic: Boolean;
+    FCurrentScale: Double;
+    FScale: Double;
     FAscent: Integer;
     FDescent: Integer;
     FLineHeight: Integer;
     FEnginePtr: Pointer;       { ^font_engine_freetype_int32 }
     FCacheManagerPtr: Pointer;  { ^font_cache_manager }
+    { CJK/glyph fallback engine: used when the primary font has no glyph
+      for a code point (e.g. Roboto has no Han characters). }
+    FFallbackTried: Boolean;
+    FFallbackPath: string;
+    FFallbackEnginePtr: Pointer;
+    FFallbackCacheManagerPtr: Pointer;
+    FFallbackSizedSize: double;
+    FFallbackSizedScale: Double;
+    procedure SetScale(AValue: Double);
     procedure EnsureInitialised;
+    procedure EnsureFallback;
+    procedure SizeFallbackEngine;
+    { Returns a glyph_cache_ptr (agg unit type not visible in the
+      interface); Pointer keeps the declaration unit-independent. }
+    function TryFallbackGlyph(ACharId: Cardinal): Pointer;
     procedure BlitGlyph(ABuf: PByte; AStride, ABufW, ABufH: Integer;
       AGlyphData: PByte; ADataSize: Cardinal;
       ADestX, ADestY: Integer;
@@ -75,10 +91,15 @@ type
       AClipX1, AClipY1, AClipX2, AClipY2: Integer); overload;
     function TextWidth(const AText: string): Integer;
     { Font metrics from the same FreeType instance that renders glyphs.
-      Guaranteed consistent with rendered output. }
+      Guaranteed consistent with rendered output.
+      NOTE: metrics and glyph bitmaps are in DEVICE pixels when Scale<>1;
+      the caller converts to logical units by dividing by Scale. }
     property Ascent: Integer read FAscent;
     property Descent: Integer read FDescent;
     property LineHeight: Integer read FLineHeight;
+    { Device pixels per logical pixel (HiDPI). 1.0 = no scaling.
+      Positions passed to DrawText must already be scaled by the caller. }
+    property Scale: Double read FScale write SetScale;
   end;
 
 
@@ -99,6 +120,56 @@ type
   PFontEngine = ^font_engine_freetype_int32;
   PCacheManager = ^font_cache_manager;
 
+{$IFDEF OHOS}
+procedure OH_LOG_Print(logType: Integer; logLevel: Integer;
+  domain: Cardinal; tag: PChar; fmt: PChar); cdecl; varargs;
+  external 'libhilog_ndk.z.so';
+const
+  LOG_APP  = 0;
+  LOG_INFO = 3;
+  LOG_WARN = 4;
+  LOG_ERROR = 5;
+  FP_LOG_DOMAIN = $FF00;
+  FP_LOG_TAG = 'fpGUI';
+procedure fpGUI_Hilog(level: Integer; const Msg: String);
+var
+  buf: array[0..1023] of Char;
+begin
+  StrPCopy(buf, Msg);
+  OH_LOG_Print(LOG_APP, level, FP_LOG_DOMAIN, FP_LOG_TAG, '%{public}s', buf);
+end;
+{$ELSE}
+{$IFDEF ANDROID}
+procedure __android_log_write(prio: LongInt; tag, text: PAnsiChar); cdecl;
+  external 'log';
+const
+  LOG_INFO  = 4;
+  LOG_WARN  = 5;
+  LOG_ERROR = 6;
+  FP_LOG_TAG = 'fpGUI-font';
+procedure fpGUI_Hilog(level: Integer; const Msg: String);
+begin
+  { 字形/字体诊断日志量极大（每字形多条），发布构建默认只放行错误；
+    调试时定义 FPGLYPH_VERBOSE 打开全部。 }
+  {$IFNDEF FPGLYPH_VERBOSE}
+  if level < LOG_ERROR then
+    Exit;
+  {$ENDIF}
+  __android_log_write(level, FP_LOG_TAG, PAnsiChar(AnsiString(Msg)));
+end;
+{$ELSE}
+const
+  LOG_INFO  = 4;
+  LOG_WARN  = 5;
+  LOG_ERROR = 6;
+procedure fpGUI_Hilog(level: Integer; const Msg: String);
+begin
+  { Desktop backends: no log sink wired here. }
+  if level = 0 then ;
+  if Msg = '' then ;
+end;
+{$ENDIF}
+{$ENDIF}
 
 { Helper: read a little-endian int32 from serialised scanline data }
 function ReadInt32(var p: PByte): Int32;
@@ -122,8 +193,28 @@ begin
   FAscent := 0;
   FDescent := 0;
   FCurrentItalic := False;
+  FCurrentScale := 1.0;
+  FScale := 1.0;
   FEnginePtr := nil;
   FCacheManagerPtr := nil;
+  FFallbackTried := False;
+  FFallbackPath := '';
+  FFallbackEnginePtr := nil;
+  FFallbackCacheManagerPtr := nil;
+  FFallbackSizedSize := 0;
+  FFallbackSizedScale := 0;
+end;
+
+procedure TGlyphCache.SetScale(AValue: Double);
+begin
+  if AValue < 1.0 then
+    AValue := 1.0;
+  if FScale = AValue then
+    Exit;
+  FScale := AValue;
+  { Force the next SetFont to reload at the new device size. }
+  FCurrentSize := 0;
+  FCurrentScale := 0;
 end;
 
 destructor TGlyphCache.Destroy;
@@ -134,6 +225,13 @@ begin
     PFontEngine(FEnginePtr)^.Destruct;
     FreeMem(FCacheManagerPtr);
     FreeMem(FEnginePtr);
+  end;
+  if FFallbackCacheManagerPtr <> nil then
+  begin
+    PCacheManager(FFallbackCacheManagerPtr)^.Destruct;
+    PFontEngine(FFallbackEnginePtr)^.Destruct;
+    FreeMem(FFallbackCacheManagerPtr);
+    FreeMem(FFallbackEnginePtr);
   end;
   inherited Destroy;
 end;
@@ -256,9 +354,127 @@ begin
       if i >= 0 then
         Result := gFontCache.Items[i].FileName;
     end;
+    if (Result = '') and (gFontCache.Count > 0) then
+    begin
+      { Last resort: any cacheable font with a real family name (prefer a
+        plain face). Keeps text rendering on systems whose font families
+        differ from the built-in defaults (e.g. a minimal Android image
+        without Roboto). }
+      for i := 0 to gFontCache.Count - 1 do
+        if (gFontCache.Items[i] <> nil) and
+           (gFontCache.Items[i].FamilyName <> '') and
+           (gFontCache.Items[i].StyleFlags = (1 shl 0)) then
+        begin
+          Result := gFontCache.Items[i].FileName;
+          Break;
+        end;
+      if Result = '' then
+        for i := 0 to gFontCache.Count - 1 do
+          if (gFontCache.Items[i] <> nil) and
+             (gFontCache.Items[i].FamilyName <> '') then
+          begin
+            Result := gFontCache.Items[i].FileName;
+            Break;
+          end;
+    end;
   finally
     fnt.Free;
+    fpGUI_Hilog(LOG_INFO, 'ResolveFontPath: desc="' + AFontDesc +
+      '" facename="' + facename + '" size=' + FloatToStr(ASize) +
+      ' result="' + Result + '"');
   end;
+end;
+
+{ Pick a font file that can supply CJK (and other missing) glyphs. }
+procedure TGlyphCache.EnsureFallback;
+var
+  i: Integer;
+  item: TFontCacheItem;
+  fam, fname: string;
+  candidate: string;
+begin
+  if FFallbackTried then
+    Exit;
+  FFallbackTried := True;
+  candidate := '';
+
+  { Priority 1: CJK-capable families by family name. }
+  for i := 0 to gFontCache.Count - 1 do
+  begin
+    item := gFontCache.Items[i];
+    if (item = nil) or (item.FamilyName = '') then
+      Continue;
+    fam := item.FamilyName;
+    if (Pos('CJK', fam) > 0) or (Pos('Noto Sans SC', fam) > 0) or
+       (Pos('Noto Sans TC', fam) > 0) or (Pos('Droid Sans Fallback', fam) > 0) then
+    begin
+      candidate := item.FileName;
+      Break;
+    end;
+  end;
+
+  { Priority 2: known fallback file names. }
+  if candidate = '' then
+    for i := 0 to gFontCache.Count - 1 do
+    begin
+      item := gFontCache.Items[i];
+      if item = nil then
+        Continue;
+      fname := ExtractFileName(item.FileName);
+      if (Pos('CJK', fname) > 0) or (Pos('DroidSansFallback', fname) > 0) or
+         (Pos('NotoSans', fname) > 0) then
+      begin
+        candidate := item.FileName;
+        Break;
+      end;
+    end;
+
+  if candidate = '' then
+    Exit;
+
+  FFallbackEnginePtr := AllocMem(SizeOf(font_engine_freetype_int32));
+  FFallbackCacheManagerPtr := AllocMem(SizeOf(font_cache_manager));
+  PFontEngine(FFallbackEnginePtr)^.Construct;
+  PCacheManager(FFallbackCacheManagerPtr)^.Construct(font_engine_ptr(FFallbackEnginePtr));
+  PFontEngine(FFallbackEnginePtr)^.load_font(
+    PChar(candidate), 0, glyph_ren_agg_gray8);
+  PFontEngine(FFallbackEnginePtr)^.hinting_(True);
+  PFontEngine(FFallbackEnginePtr)^.flip_y_(True);
+  FFallbackPath := candidate;
+  FFallbackSizedSize := 0;
+  FFallbackSizedScale := 0;
+  fpGUI_Hilog(LOG_INFO, 'glyph fallback font: ' + candidate);
+end;
+
+{ Keep the fallback engine at the same device size as the primary font. }
+procedure TGlyphCache.SizeFallbackEngine;
+var
+  px: Integer;
+begin
+  if FFallbackEnginePtr = nil then
+    Exit;
+  if (FFallbackSizedSize = FCurrentSize) and (FFallbackSizedScale = FCurrentScale) then
+    Exit;
+  px := Round(FCurrentSize * fpgApplication.Screen_dpi / 72 * FCurrentScale);
+  if px < 1 then
+    px := 1;
+  PFontEngine(FFallbackEnginePtr)^.height_(px);
+  if PFontEngine(FFallbackEnginePtr)^.m_cur_face <> nil then
+    FT_Set_Pixel_Sizes(PFontEngine(FFallbackEnginePtr)^.m_cur_face, px, px);
+  FFallbackSizedSize := FCurrentSize;
+  FFallbackSizedScale := FCurrentScale;
+end;
+
+function TGlyphCache.TryFallbackGlyph(ACharId: Cardinal): Pointer;
+begin
+  Result := nil;
+  if FCurrentSize <= 0 then
+    Exit;
+  EnsureFallback;
+  if FFallbackCacheManagerPtr = nil then
+    Exit;
+  SizeFallbackEngine;
+  Result := Pointer(PCacheManager(FFallbackCacheManagerPtr)^.glyph(ACharId));
 end;
 
 procedure TGlyphCache.SetFont(AFontRes: TfpgFontResourceBase);
@@ -272,8 +488,8 @@ begin
     Exit;
 
   desc := AFontRes.FontDesc;
-  if desc = FCurrentFontDesc then
-    Exit;  { Same font, nothing to do }
+  if (desc = FCurrentFontDesc) and (FScale = FCurrentScale) then
+    Exit;  { Same font and scale, nothing to do }
 
   EnsureInitialised;
 
@@ -282,15 +498,29 @@ begin
     Exit;  { Font not found }
 
   if (fontpath <> FCurrentFontPath) or (sz <> FCurrentSize) or
-     (bold <> FCurrentBold) or (italic <> FCurrentItalic) then
+     (bold <> FCurrentBold) or (italic <> FCurrentItalic) or
+     (FScale <> FCurrentScale) then
   begin
     PFontEngine(FEnginePtr)^.load_font(
       PChar(fontpath), 0, glyph_ren_agg_gray8);
+
     PFontEngine(FEnginePtr)^.hinting_(True);
     PFontEngine(FEnginePtr)^.flip_y_(True);
     PFontEngine(FEnginePtr)^.height_(
-      sz * fpgApplication.Screen_dpi / 72);
+      sz * fpgApplication.Screen_dpi / 72 * FScale);
 
+    { Force-correct pixel size. height_ calls FT_Set_Pixel_Sizes via
+      update_char_size but may not take effect on some FreeType versions.
+      Calling it directly with explicit non-zero pixel_width guarantees
+      the face size is set correctly. }
+    if PFontEngine(FEnginePtr)^.m_cur_face <> nil then
+    begin
+      FT_Set_Pixel_Sizes(
+        PFontEngine(FEnginePtr)^.m_cur_face,
+        Round(sz * fpgApplication.Screen_dpi / 72 * FScale),  { pixel_width }
+        Round(sz * fpgApplication.Screen_dpi / 72 * FScale)); { pixel_height }
+    end;
+                
     { Read metrics from face->size->metrics (populated by FT_Set_Pixel_Sizes).
       These are 26.6 fixed-point values scaled by units_per_EM, which matches
       how X11/Xft computes ascent and descent.
@@ -303,10 +533,17 @@ begin
     FDescent := (-PFontEngine(FEnginePtr)^.m_cur_face^.size^.metrics.descender + 63) shr 6;
     FLineHeight := (PFontEngine(FEnginePtr)^.m_cur_face^.size^.metrics.height + 63) shr 6;
 
+    fpGUI_Hilog(LOG_INFO, 'FONT: y_ppem=' +
+      IntToStr(PFontEngine(FEnginePtr)^.m_cur_face^.size^.metrics.y_ppem) +
+      ' ascent=' + IntToStr(FAscent) +
+      ' descent=' + IntToStr(FDescent) +
+      ' height=' + IntToStr(FLineHeight));
+
     FCurrentFontPath := fontpath;
     FCurrentSize := sz;
     FCurrentBold := bold;
     FCurrentItalic := italic;
+    FCurrentScale := FScale;
   end;
 
   FCurrentFontDesc := desc;
@@ -329,6 +566,11 @@ var
   drawX, drawY: Integer;
   i, clipLeft, clipRight, clipStart: Integer;
 begin
+  {$IFDEF FPGLYPH_VERBOSE}
+  fpGUI_Hilog(LOG_INFO, 'BlitGlyph ENTER: ADestX=' + IntToStr(ADestX) + ' ADestY=' + IntToStr(ADestY) +
+    ' ADataSize=' + IntToStr(ADataSize) + ' AR=' + IntToStr(AR) + ' AG=' + IntToStr(AG) + ' AB=' + IntToStr(AB));
+  {$ENDIF}
+
   if (AGlyphData = nil) or (ADataSize = 0) then
     Exit;
 
@@ -339,6 +581,9 @@ begin
   minY := ReadInt32(p);
   maxX := ReadInt32(p);
   maxY := ReadInt32(p);
+  {$IFDEF FPGLYPH_VERBOSE}
+  fpGUI_Hilog(LOG_INFO, 'BlitGlyph bbox: minX=' + IntToStr(minX) + ' minY=' + IntToStr(minY) + ' maxX=' + IntToStr(maxX) + ' maxY=' + IntToStr(maxY) + ' remaining=' + IntToStr(ADataSize - 16));
+  {$ENDIF}
 
   { Iterate serialised scanlines }
   while PtrUInt(p) < PtrUInt(AGlyphData) + ADataSize do
@@ -447,16 +692,20 @@ var
   engine: PFontEngine;
   cache: PCacheManager;
   glyph: glyph_cache_ptr;
-  startX, startY: double;
+  startY: double;
+  lAdv: Double;
   rgb: TfpgColor;
   r, g, b: Byte;
   str_: PChar;
   charLen: int;
   charId: int32u;
-  first: Boolean;
+  lIsFallback: Boolean;
 begin
   if (AText = '') or (ABuf = nil) or not FInitialised then
     Exit;
+  {$IFDEF FPGLYPH_VERBOSE}
+  fpGUI_Hilog(LOG_WARN, 'AGGDrawText:'+AText);
+  {$ENDIF}
 
   engine := PFontEngine(FEnginePtr);
   cache := PCacheManager(FCacheManagerPtr);
@@ -474,12 +723,19 @@ begin
   b := rgb and $FF;
 
   { AY is the baseline Y — caller has already added Ascent. }
-  startX := AX;
   startY := AY;
+  lAdv := 0;
 
-  { Iterate UTF-8 characters }
+  { Iterate UTF-8 characters.
+
+    Advances are quantised to the LOGICAL pixel grid
+    (Round(advance / FScale) * FScale) and kerning is not applied: this makes
+    the rendered text width strictly additive - width(s) = sum(width(ch)) -
+    which the fpGUI edit controls rely on (they mix per-character sums and
+    substring widths for the caret position and erase regions; with raw
+    fractional advances those two disagree and the caret drifts from the
+    glyphs, leaving slivers behind after Backspace). }
   str_ := PChar(AText);
-  first := True;
 
   while str_^ <> #0 do
   begin
@@ -487,25 +743,32 @@ begin
     Inc(str_, charLen);
 
     glyph := cache^.glyph(charId);
+    lIsFallback := False;
+    { A missing character does NOT yield nil: FreeType renders glyph index 0
+      (.notdef, a box). Detect it via glyph_index=0 and try the CJK fallback
+      font; draw nothing when even that fails (never a tofu box). }
+    if (glyph = nil) or (glyph^.glyph_index = 0) then
+    begin
+      glyph := glyph_cache_ptr(TryFallbackGlyph(charId));
+      lIsFallback := (glyph <> nil) and (glyph^.glyph_index <> 0);
+      if not lIsFallback then
+        glyph := nil;
+    end;
     if glyph <> nil then
     begin
-      if not first then
-        cache^.add_kerning(@startX, @startY)
-      else
-        first := False;
-
       { Only handle gray8 bitmap data (the fast path) }
       if glyph^.data_type = glyph_data_gray8 then
       begin
-        cache^.init_embedded_adaptors(glyph, startX, startY);
+        if not lIsFallback then
+          cache^.init_embedded_adaptors(glyph, AX + lAdv, startY);
         BlitGlyph(ABuf, AStride, ABufW, ABufH,
           glyph^.data, glyph^.data_size,
-          Trunc(startX), Trunc(startY),
+          Trunc(AX + lAdv), Trunc(startY),
           r, g, b,
           AClipX1, AClipY1, AClipX2, AClipY2);
       end;
 
-      startX := startX + glyph^.advance_x;
+      lAdv := lAdv + Round(glyph^.advance_x / FScale) * FScale;
       startY := startY + glyph^.advance_y;
     end;
   end;
@@ -515,11 +778,11 @@ function TGlyphCache.TextWidth(const AText: string): Integer;
 var
   cache: PCacheManager;
   glyph: glyph_cache_ptr;
-  x, y: double;
+  x: double;
   str_: PChar;
   charLen: int;
   charId: int32u;
-  first: Boolean;
+  lIsFallback: Boolean;
 begin
   Result := 0;
   if (AText = '') or not FInitialised then
@@ -527,28 +790,31 @@ begin
 
   cache := PCacheManager(FCacheManagerPtr);
   x := 0;
-  y := 0;
-  first := True;
   str_ := PChar(AText);
 
+  { Must mirror DrawText exactly: no kerning, advances quantised to the
+    logical grid (Round(advance / FScale) * FScale), so that
+    width(s) = sum(width(ch)) holds and the edit controls' caret math agrees
+    with the rendered glyph positions. }
   while str_^ <> #0 do
   begin
     charId := UTF8CharToUnicode(str_, charLen);
     Inc(str_, charLen);
 
     glyph := cache^.glyph(charId);
-    if glyph <> nil then
+    lIsFallback := False;
+    if (glyph = nil) or (glyph^.glyph_index = 0) then
     begin
-      if not first then
-        cache^.add_kerning(@x, @y)
-      else
-        first := False;
-      x := x + glyph^.advance_x;
-      y := y + glyph^.advance_y;
+      glyph := glyph_cache_ptr(TryFallbackGlyph(charId));
+      lIsFallback := (glyph <> nil) and (glyph^.glyph_index <> 0);
+      if not lIsFallback then
+        glyph := nil;
     end;
+    if glyph <> nil then
+      x := x + Round(glyph^.advance_x / FScale) * FScale;
   end;
 
-  Result := Trunc(x);
+  Result := Round(x);
 end;
 
 

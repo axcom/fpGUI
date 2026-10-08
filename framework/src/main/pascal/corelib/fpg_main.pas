@@ -374,6 +374,9 @@ type
     FHeight: TfpgCoord;
     FTimer: TfpgTimer;
     procedure   OnTimerTime(Sender: TObject);
+    { XOR the caret rectangle into the canvas without toggling the blink
+      state (used to restore the caret after a repaint cleared the buffer). }
+    procedure   PaintCaret;
   public
     constructor Create;
     destructor  Destroy; override;
@@ -384,6 +387,8 @@ type
     function    IsVisible(acanvas: TfpgCanvas): Boolean;
     property    Width: integer read FWidth;
     property    Height: integer read FHeight;
+    property    Visible: boolean read FVisible;
+    property    Canvas: TfpgCanvas read FCanvas;
   end;
 
 
@@ -2220,7 +2225,7 @@ constructor TfpgNativeWindow.Create(AOwner: TComponent);
 begin
   inherited Create(AOwner); // initialize the platform internals
 
-  FModalForWin := nil;
+  //FModalForWin := nil;
 
   if not (FWindowType in [wtModalForm, wtPopup]) then
   begin
@@ -3105,6 +3110,20 @@ end;
 
 procedure TfpgCaret.SetCaret(ACanvas: TfpgCanvas; x, y, w, h: TfpgCoord);
 begin
+  { Repaints call SetCaret for the same caret on every frame. Restarting the
+    blink timer each time would keep the caret permanently on (any periodic
+    repaint - e.g. a clock label - would reset the phase before the timer
+    ever fires). When nothing changed, keep the current phase: restore the
+    caret only if it is currently in its visible phase (the caller's repaint
+    cleared the canvas buffer). }
+  if FEnabled and (FCanvas = ACanvas) and
+     (FLeft = x) and (FTop = y) and (FWidth = w) and (FHeight = h) then
+  begin
+    if FVisible then
+      PaintCaret;
+    Exit;
+  end;
+
   FEnabled := True;
   FVisible := False;
   FCanvas  := ACanvas;
@@ -3129,7 +3148,8 @@ begin
   end;
 end;
 
-procedure TfpgCaret.InvertCaret;
+{ XOR the caret rectangle into the canvas without touching the blink state. }
+procedure TfpgCaret.PaintCaret;
 begin
   if FCanvas = nil then
     Exit; //==>
@@ -3140,7 +3160,6 @@ begin
     try
       // this works well on narrow characters like 'i' or 'l' in non-mono fonts
       FCanvas.XORFillRectangle($FFFFFF, FLeft, FTop, FWidth, FHeight);
-      FVisible := not FVisible;
     finally
       FCanvas.EndDraw(FLeft, FTop, FWidth, FHeight);
     end;
@@ -3151,6 +3170,15 @@ begin
     SendDebug('TfpgCaret.InvertCaret cause an exception');
     {$ENDIF}
   end;
+end;
+
+procedure TfpgCaret.InvertCaret;
+begin
+  if FCanvas = nil then
+    Exit; //==>
+
+  PaintCaret;
+  FVisible := not FVisible;
 end;
 
 procedure TfpgCaret.ResetTimeout;
@@ -3444,16 +3472,20 @@ initialization
   fpgImages       := nil;
   iCallTrace      := -1;
 
+if DefaultCanvasClass = nil then
+begin
 {$ifdef AGGCanvas}
   { Hybrid canvas is available when platform buffer manager factories
     are registered (done in fpg_interface.pas initialization). }
   if Assigned(fpg_hybrid_canvas.CreateBufferManager) then
-    DefaultCanvasClass := THybridCanvas
-  else
+  begin
+    if DefaultCanvasClass = nil then DefaultCanvasClass := THybridCanvas
+  end else
     DefaultCanvasClass := TfpgCanvas;  { fallback if no buffer manager }
 {$else}
   DefaultCanvasClass := TfpgCanvas;
 {$endif}
+end;
   {$IF FPC_FULLVERSION >= 30000}
   // This switches RTL, FCL and String data type to UTF-8. Many of fpg_utils functions will not be needed any more.
   DefaultSystemCodePage := CP_UTF8;

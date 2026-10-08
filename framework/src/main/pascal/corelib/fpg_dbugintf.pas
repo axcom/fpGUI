@@ -71,7 +71,14 @@ Uses
   SysUtils,
   process,
   simpleipc,
-  fpg_dbugmsg;
+  fpg_dbugmsg
+  {$IFDEF OHOS}
+  { OHOS 沙箱内无法使用 FIFO/临时目录 IPC，且禁止执行外部程序。
+    该单元注入 TCP loopback / AF_UNIX 传输后端（设备端调试输出经
+    hdc 端口转发到 PC 端的 dbugsrv_tcp）。 }
+  ,fpg_simpleipc_ohos
+  {$ENDIF}
+  ;
 
 const
   IndentChars    = 2;
@@ -237,6 +244,17 @@ end;
 
 function StartDebugServer : Integer;
 begin
+  {$IFDEF OHOS}
+  { OHOS 沙箱禁止应用通过 TProcess 执行外部程序（如 dbugsrv），因此本机
+    没有可启动的调试服务器。调试服务器运行在 PC 端（dbugsrv_tcp），通过
+    hdc 端口转发把设备回环端口映射到 PC：hdc rport tcp:<port> tcp:<port>。
+    若此时服务器不可达，返回 0 表示"无服务器"，由调用方关闭调试输出。 }
+  WriteLn(stderr, '[fpg_dbugintf] No local debug server on OHOS. ' +
+                  'Start dbugsrv_tcp on the PC and forward the port: ' +
+                  'hdc rport tcp:' + IntToStr(OHOSIPCGetPort(DebugServerID)) +
+                  ' tcp:' + IntToStr(OHOSIPCGetPort(DebugServerID)));
+  Result := 0;
+  {$ELSE}
   With TProcess.Create(Nil) do
     begin
     Try
@@ -251,6 +269,7 @@ begin
     end;
     Free;
     end;
+  {$ENDIF}
 end;
 
 procedure FreeDebugClient;
@@ -282,6 +301,12 @@ begin
   Result := False;
   DebugClient:=TSimpleIPCClient.Create(Nil);
   DebugClient.ServerID:=DebugServerID;
+  {$IFDEF OHOS}
+  { OHOS: 设备级 TCP 回环后端（对应服务器端 Global=True），与 PC 端
+    dbugsrv_tcp 经 hdc rport 转发互通；若改为 False 则使用同应用内的
+    AF_UNIX 后端。 }
+  DebugClient.SystemGlobal := True;
+  {$ENDIF}
   If not DebugClient.ServerRunning then
     begin
     ServerID:=StartDebugServer;

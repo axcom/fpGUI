@@ -1,0 +1,11 @@
+{
+  "name": "fp_bridge",
+  "version": "1.0.0",
+  "description": "Please describe the basic information.",
+  "main": "",
+  "author": "",
+  "license": "",
+  "dependencies": {
+    "libfp_bridge.so": "file:./src/main/cpp/types/libfp_bridge"
+  }
+}

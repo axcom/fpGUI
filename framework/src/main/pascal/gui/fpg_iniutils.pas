@@ -77,8 +77,8 @@ var
   lFileName: TfpgString;
 begin
   FReadOnly := AReadOnly;
-  lDir      := fpgExtractFileDir(AFileName);
-  lFileName := fpgExtractFileName(AFileName);
+  lDir      := ExtractFileDir(AFileName);
+  lFileName := ExtractFileName(AFileName);
 
   if lDir = '' then
     lDir := fpgGetAppConfigDir(False);

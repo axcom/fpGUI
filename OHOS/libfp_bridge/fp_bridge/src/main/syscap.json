@@ -1,0 +1,14 @@
+{
+  "devices": {
+    "general": ["default", "tablet"]
+  },
+  "production": {
+    "removedSysCaps": [
+      "SystemCapability.Communication.FusionConnectivity.Core",
+      "SystemCapability.Applications.IntelligentScene",
+      "SystemCapability.Resourceschedule.BackgroundProcessManager",
+      "SystemCapability.Test.PerfTest",
+      "SystemCapability.ArkUI.ArkUI.Circle"
+    ]
+  }
+}

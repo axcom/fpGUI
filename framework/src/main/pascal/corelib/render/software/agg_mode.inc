@@ -40,8 +40,29 @@
  {$ENDIF}
 {$ENDIF }
 
-// Linux, FreeBSD, Solaris etc.
-{$if defined(UNIX) and not defined(DARWIN)}
+{$IFDEF OHOS }
+ { OHOS 定义 AGG_OHOS
+    OHOS 的平台实现由 agg_platform_ohos.inc 提供。}
+ {$DEFINE AGG_OHOS }
+ { OHOS 文字渲染使用 native_drawing（OH_Drawing_TextBlob/FontMgr），
+    不使用 AggPas 内置字体引擎 → 定义 AGG2D_NO_FONT，
+    避免编译/链接 FreeType（agg_2D 不再 uses agg_font_freetype）。 }
+ {$IFNDEF AGG2D_USE_FREETYPE}      // ← FreeType 请求优先
+  {$DEFINE AGG2D_NO_FONT}
+ {$ENDIF}
+{$ENDIF }
+
+{$IFDEF ANDROID }
+ { Android 定义 AGG_ANDROID：无 X11/平台层，仅用于选择合适的 FreeType
+   库名（libfreetype.so，随 APK 打包）与字体引擎。 }
+ {$DEFINE AGG_ANDROID }
+ {$IFNDEF AGG2D_NO_FONT}
+  {$DEFINE AGG2D_USE_FREETYPE}
+ {$ENDIF}
+{$ENDIF }
+
+// Linux, FreeBSD, Solaris etc.  —— OHOS/Android 避免包含 agg_platform_x11.inc（X11 API 不适用）。
+{$if defined(UNIX) and not defined(DARWIN) and not defined(OHOS) and not defined(ANDROID)}
  {$DEFINE AGG_LINUX }
  {$IFNDEF AGG2D_NO_FONT}
   {$DEFINE AGG2D_USE_FREETYPE}

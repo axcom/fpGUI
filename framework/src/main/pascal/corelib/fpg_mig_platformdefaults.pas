@@ -21,6 +21,8 @@ const
   PLATFORM_WINDOWS = 0;
   PLATFORM_MAC_OSX = 1;
   PLATFORM_GNOME = 2;
+  PLATFORM_OHOS = 3;
+  PLATFORM_ANDROID = 4;
 
   { Logical pixel base modes }
   BASE_FONT_SIZE = 100;      // Use font size as base for logical pixels
@@ -225,7 +227,15 @@ begin
     {$IFDEF DARWIN}
     Result := PLATFORM_MAC_OSX;
     {$ELSE}
-    Result := PLATFORM_GNOME;  // Linux/Unix
+      {$IFDEF OHOS}
+      Result := PLATFORM_OHOS;
+      {$ELSE}
+        {$IFDEF ANDROID}
+        Result := PLATFORM_ANDROID;
+        {$ELSE}
+        Result := PLATFORM_GNOME;  // Linux/Unix
+        {$ENDIF}
+      {$ENDIF}
     {$ENDIF}
   {$ENDIF}
 end;
@@ -262,6 +272,29 @@ begin
       SetGridCellGap(FLPX6, FLPY6);
       SetMinimumButtonWidth(FLPX70);
       SetButtonOrder('L_HE+UNYACBXO_I_R');  // GNOME button order
+      SetDialogInsets(FLPY12, FLPX12, FLPY12, FLPX12);
+      SetPanelInsets(FLPY6, FLPX6, FLPY6, FLPX6);
+    end;
+
+    PLATFORM_OHOS:
+    begin
+      SetRelatedGap(FLPX6, FLPY6);
+      SetUnrelatedGap(FLPX12, FLPY12);
+      SetGridCellGap(FLPX6, FLPY6);
+      SetMinimumButtonWidth(FLPX70);
+      SetButtonOrder('L_E+U+YNBXOCAH_I_R');  // Similar to Windows button order
+      SetDialogInsets(FLPY12, FLPX12, FLPY12, FLPX12);
+      SetPanelInsets(FLPY6, FLPX6, FLPY6, FLPX6);
+    end;
+
+    PLATFORM_ANDROID:
+    begin
+      // No upstream MigLayout defaults for Android; mirror the OHOS mobile values
+      SetRelatedGap(FLPX6, FLPY6);
+      SetUnrelatedGap(FLPX12, FLPY12);
+      SetGridCellGap(FLPX6, FLPY6);
+      SetMinimumButtonWidth(FLPX70);
+      SetButtonOrder('L_E+U+YNBXOCAH_I_R');  // Similar to Windows button order
       SetDialogInsets(FLPY12, FLPX12, FLPY12, FLPX12);
       SetPanelInsets(FLPY6, FLPX6, FLPY6, FLPX6);
     end;

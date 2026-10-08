@@ -1395,6 +1395,8 @@ begin
   if FOpenMode then
   begin
     e := grid.CurrentEntry;
+    if e = nil then
+      Exit;
     if e.EntryType = etDir then
     begin
       SetCurrentDirectory(e.Name);
@@ -1534,6 +1536,8 @@ begin
 
   if not grid.FileList.ReadDirectory(ADir) then
   begin
+    // 读目录失败：清空列表，保持 UI 可用
+    grid.FileList.Clear;
     ShowMessage(Format(rsErrCouldNotOpenDir, [ADir]), rsError);
     Exit; //==>
   end;

@@ -1,0 +1,28 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "module description"
+    },
+    {
+      "name": "Fp_bridgeAbility_desc",
+      "value": "description"
+    },
+    {
+      "name": "Fp_bridgeAbility_label",
+      "value": "fpGUI-Bridge"
+    },
+    {
+      "name": "reason_read_pasteboard",
+      "value": "Read clipboard content for paste"
+    },
+    {
+      "name": "reason_write_pasteboard",
+      "value": "Write clipboard content for copy/cut"
+    },
+    {
+      "name": "reason_documents",
+      "value": "读写文档目录"
+    }
+  ]
+}

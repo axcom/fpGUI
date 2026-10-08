@@ -1,0 +1,19 @@
+
+**用法**：
+```
+build.bat [ABI] [source.lpr] [-o libs-dir]
+  ABI        : x86_64 | arm64-v8a | aarch64 | all   (默认 all)
+  source.lpr : 当前目录的 Pascal 源，默认 fpgapp.lpr
+  -o libs-dir: 额外复制到 libs-dir\ABI\libNAME.so（如 HAP 的 entry\libs）
+  FPCEXTRA   : 环境变量传额外 FPC 开关（如 -O2 -dDEBUG）
+```
+- 在**任意工程目录**下执行即可，编译该目录的 `fpgapp.lpr`（当前工作目录即工程目录，不依赖脚本所在位置）。
+- 输出：`build-ohos\<ABI>\lib<name>.so`（`fpgapp.lpr` → `libfpgapp.so`），单元缓存按 ABI 隔离 `build-ohos\<ABI>\`。
+- 默认 `-B` 全量重编（规避框架单元改动后 PPU 级联导致的 FPC 崩溃）。
+- 合并要点：x86 的 FreeType 路径与 arm64 的 `-FcUTF8 -dUseCThreads -g -k"--eh-frame-hdr"` 统一到两个 ABI；`-P/-XP` 按 ABI 选 `x86_64`/`aarch64`；不再写死拷贝到固定 HAP 工程，改为可选 `-o`。
+
+**实机验证（4 项全部通过）**：
+- 无源文件目录：正确报错 `source not found`，退出码 1
+- 默认 `fpgapp.lpr`：x86_64/arm64 均编译成功，ELF 架构正确（0x3E / 0xB7）
+- `-o` 复制路径生效
+- 含空格/括号目录（`proj test (2)`）默认无参跑 `all` 成功；显式源名 `myapp.lpr` → `libmyapp.so` 成功

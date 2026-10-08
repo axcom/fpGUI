@@ -77,6 +77,8 @@ type
 
    m_hinting             ,
    m_flip_y              ,
+   m_bold                ,
+   m_italic              ,
    m_library_initialized : boolean;
 
    m_library : FT_Library_ptr;    // handle to library
@@ -126,6 +128,11 @@ type
    function  width_    (w : double ) : boolean;
    procedure hinting_  (h : boolean );
    procedure flip_y_   (flip : boolean );
+   { Synthetic styling: when the loaded face has no dedicated bold/italic
+     font (OHOS ships only the regular face), embolden / oblique each
+     glyph via FreeType's ftsynth API. }
+   procedure bold_     (b : boolean );
+   procedure italic_   (i : boolean );
    procedure transform_(affine : trans_affine_ptr );
 
   // Set Gamma
@@ -796,6 +803,8 @@ begin
  m_width  :=0;
  m_hinting:=true;
  m_flip_y :=false;
+ m_bold   :=false;
+ m_italic :=false;
 
  m_library_initialized:=false;
 
@@ -1108,6 +1117,26 @@ begin
 
 end;
 
+{ BOLD_ }
+procedure font_engine_freetype_base.bold_(b : boolean );
+begin
+ m_bold:=b;
+
+ if m_cur_face <> NIL then
+  update_signature;
+
+end;
+
+{ ITALIC_ }
+procedure font_engine_freetype_base.italic_(i : boolean );
+begin
+ m_italic:=i;
+
+ if m_cur_face <> NIL then
+  update_signature;
+
+end;
+
 { TRANSFORM_ }
 procedure font_engine_freetype_base.transform_(affine : trans_affine_ptr );
 begin
@@ -1243,7 +1272,22 @@ begin
   m_last_error:=FT_Load_Glyph(m_cur_face ,m_glyph_index ,FT_LOAD_NO_HINTING );
 
  if m_last_error = 0 then
-  case m_glyph_rendering of
+  begin
+   { Synthetic bold/italic (freetype ftsynth): the loaded face may only
+     have a regular style (e.g. OHOS system fonts). Apply before the
+     glyph is outlined/rasterised below so both the outline and the
+     gray8/mono render paths — and the glyph metrics (advance) — carry
+     the style. Skipped when the face itself already provides the style
+     (real bold/italic files) to avoid double styling. }
+   if m_bold and
+      ((m_cur_face.style_flags and FT_STYLE_FLAG_BOLD ) = 0 ) then
+    FT_GlyphSlot_Embolden(m_cur_face.glyph );
+
+   if m_italic and
+      ((m_cur_face.style_flags and FT_STYLE_FLAG_ITALIC ) = 0 ) then
+    FT_GlyphSlot_Oblique(m_cur_face.glyph );
+
+   case m_glyph_rendering of
    glyph_ren_native_mono :
     begin
      m_last_error:=FT_Render_Glyph(m_cur_face.glyph ,FT_RENDER_MODE_MONO );
@@ -1475,6 +1519,7 @@ begin
      end;
 
   end;
+ end;
 
 end;
 
@@ -1659,6 +1704,8 @@ begin
    sprintf(char_ptr(ptrcomp(str ) + StrLen(PChar(str ) ) ) ,'%d,'  ,m_width );
    sprintf(char_ptr(ptrcomp(str ) + StrLen(PChar(str ) ) ) ,'%d,'  ,int(m_hinting ) );
    sprintf(char_ptr(ptrcomp(str ) + StrLen(PChar(str ) ) ) ,'%d,'  ,int(m_flip_y ) );
+   sprintf(char_ptr(ptrcomp(str ) + StrLen(PChar(str ) ) ) ,'%d,'  ,int(m_bold ) );
+   sprintf(char_ptr(ptrcomp(str ) + StrLen(PChar(str ) ) ) ,'%d,'  ,int(m_italic ) );
    sprintf(char_ptr(ptrcomp(str ) + StrLen(PChar(str ) ) ) ,'%08X' ,gamma_hash );
 
    if (m_glyph_rendering = glyph_ren_outline ) or

@@ -1,9 +1,17 @@
 // common compiler options
 {$mode objfpc}{$H+}
+{$codepage utf8}
 {$interfaces com}
 {$if defined(darwin)}
   {$define AggCanvas}
   {$modeswitch objectivec1}
+{$endif}
+{$if defined(OHOS)}
+  { OHOS supports both AGGCanvas (default, AggPas software rendering) and
+    native_drawing (GPU-accelerated via Skia) paths.
+    Define NO_AGGCANVAS to use the native OHOS_Drawing API instead. }
+  {$define NO_AGGCANVAS}
+  //{$define AggCanvas}
 {$endif}
 {$WARN 5024 off : Parameter "$1" not used}
 
@@ -11,7 +19,9 @@
 // The AggPas hybrid canvas is the default canvas on all platforms.
 // Font rendering uses FreeType on Linux/FreeBSD/macOS (system library) and
 // the Win32 GDI TrueType engine on Windows (no external DLL required).
-{$define AggCanvas}
+{$ifndef NO_AGGCANVAS}
+  {$define AggCanvas}
+{$endif}
 
 
 // **** Feature specific defines ****

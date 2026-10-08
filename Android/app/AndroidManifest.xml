@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.fpgui.helloworld"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+  <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="35"/>
+
+  <!-- Freeform multi-window: signature|privileged permission (not granted to
+       normal installs; declared for the rooted/priv-app test path and for
+       documentation of the requirement). -->
+  <uses-permission android:name="android.permission.MANAGE_ACTIVITY_TASKS"/>
+  <!-- Normal permission: needed to raise the modal window's task above the
+       other fpGUI windows while a ShowModal form is active. -->
+  <uses-permission android:name="android.permission.REORDER_TASKS"/>
+
+  <application android:label="fpGUI Hello"
+               android:extractNativeLibs="true"
+               android:hasCode="true"
+               android:resizeableActivity="true">
+    <meta-data android:name="com.fpgui.lib_name"
+               android:value="helloworld"/>
+    <!-- FpTheme = NoActionBar + windowDisablePreview (res/values/styles.xml):
+         no title bar for waBorderless/waFullScreen main windows and no system
+         starting window (Splash preview) that would flash/jump before the
+         window content appears. -->
+    <activity android:name="com.fpgui.FpActivity"
+              android:exported="true"
+              android:launchMode="standard"
+              android:documentLaunchMode="always"
+              android:resizeableActivity="true"
+              android:theme="@style/FpTheme"
+              android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|density"
+              android:windowSoftInputMode="adjustResize">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+    </activity>
+  </application>
+</manifest>

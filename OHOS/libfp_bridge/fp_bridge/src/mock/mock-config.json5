@@ -1,0 +1,5 @@
+{
+  "libfp_bridge.so": {
+    "source": "src/mock/Libfp_bridge.mock.ets"
+  }
+}

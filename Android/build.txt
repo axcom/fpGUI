@@ -1,0 +1,25 @@
+
+**功能**
+```
+build.bat [ABI] [source.lpr] [-i]
+  ABI        : x86_64 | arm64-v8a | aarch64 | all   (默认 all)
+  source.lpr : 当前目录的 Pascal 源，默认 fpgapp.lpr
+  -i         : 编译完后用 adb 安装
+  FPCEXTRA   : 环境变量传额外 FPC 开关
+```
+- 在**任意工程目录**执行（当前目录即工程目录，脚本放哪都行/拷到别处也行），编译该目录的 `fpgapp.lpr`（或指定的 `.lpr`）。
+- 输出**目录结构**（`build-android\` 顶层）
+```
+build-android\
+  <ABI>\            ← libfpgapp.so + FPC units（295 个文件，合并）
+  jniLibs\<ABI>\    ← 打包暂存（libfpgapp.so + libfreetype.so）
+  stubs\<ABI>\
+  classes\  dex\
+  fpgapp.apk        ← 最终签名 APK
+```
+- Android 壳工程资源（`app\java`、`app\res`、`AndroidManifest.xml`、`tools`、`debug.keystore`、`build-freetype.bat`）从 `SHELLDIR` 取：脚本所在目录，找不到时回退到 `D:\fpGUI\fpGUI-2.1.0\test\android\`。
+- 新增 `tools\manifest-setlib.ps1`：构建时把 manifest 的 `com.fpgui.lib_name` 元数据改成当前源名，Java 壳 `System.loadLibrary` 就能正确加载 `lib<名字>.so`（`fpgapp.lpr` → `libfpgapp.so` + `fpgapp.apk`）。
+
+**验证（实机编译，均通过）**
+- 在 `test\android` 跑 `build.bat x86_64`：生成 `build-android\fpgapp.apk`（apksigner verify 通过），APK 内含 `classes.dex`、`lib/x86_64/libfpgapp.so`、`lib/x86_64/libfreetype.so`，manifest 元数据为 `fpgapp`。
+- 把 build.bat 拷到临时工程目录 + `myapp.lpr`，跑 `build.bat arm64-v8a myapp.lpr`：生成 `build-android\myapp.apk`，内含 `lib/arm64-v8a/libmyapp.so`，元数据 `myapp`——验证了任意目录执行、SHELLDIR 回退、显式源名三条路径。

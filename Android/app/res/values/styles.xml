@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- NoActionBar: waBorderless / waFullScreen main windows must never show
+         a title bar.
+         windowDisablePreview: the system must not create a "starting window"
+         (Splash preview) for our activities - that preview is a separate
+         window that our alpha=0 / setWindowAnimations(0) cannot hide and it
+         visibly jumps while the freeform task is placed/clamped. -->
+    <style name="FpTheme" parent="@android:style/Theme.DeviceDefault.NoActionBar">
+        <item name="android:windowDisablePreview">true</item>
+    </style>
+</resources>

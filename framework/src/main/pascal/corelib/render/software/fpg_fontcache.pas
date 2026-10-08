@@ -29,7 +29,13 @@ unit fpg_fontcache;
 { The hybrid canvas uses FreeType (via AggPas) for glyph rendering on all
   platforms. The font cache must always scan font files using FreeType so
   it can resolve font descriptors to TTF file paths. }
-{$DEFINE AGG2D_USE_FREETYPE}
+//{$DEFINE AGG2D_USE_FREETYPE}
+{$IFDEF OHOS}
+  { OHOS 默认 native 字体模式：不编译 FreeType（避免链接 libfreetype）；
+    FreeType 模式由命令行 -dAGG2D_USE_FREETYPE 显式开启（命令行宏全局可见）。 }
+{$ELSE}
+  {$DEFINE AGG2D_USE_FREETYPE}
+{$ENDIF}
 
 interface
 
@@ -225,9 +231,15 @@ var
   face_ptr: FT_Face_ptr;
   s: Ansistring;
   flags: integer;
+  err: FT_Error;
 begin
-  FT_New_Face(m_library, PChar(AFontFile), 0, face_ptr);
+  err := FT_New_Face(m_library, PChar(AFontFile), 0, face_ptr);
   Result := TFontCacheItem.Create(AFontFile);
+  if err <> 0 then
+  begin
+    Result.FamilyName := '';
+    Exit;
+  end;
   Result.FamilyName := face_ptr^.family_name;
 
   // extract simple styles first
@@ -327,6 +339,16 @@ begin
     lPathList.Add('/usr/local/lib/X11/fonts/');
     lPathList.Add('/usr/local/share/fonts/');
     {$ENDIF}
+    {$IFDEF OHOS}
+    { OHOS 应用内置字体目录（CWD 启动时重定向到 Context.resourceDir=resfile）。
+      系统字体不在此扫描（不按路径读系统字体，需系统字体请走 FontMgr）。 }
+    lPathList.Add('fonts/');
+    {$ENDIF}
+    {$IFDEF ANDROID}
+    { Android 系统字体目录（只读，公开可读；版本无关递归扫描）}
+    lPathList.Add('/system/fonts/');
+    lPathList.Add('/system/fonts/typefaces/');
+    {$ENDIF}
     {$IFNDEF WINDOWS}
     lPathList.Add(GetUserDir + '.local/share/fonts/');  // XDG standard user font directory
     lPathList.Add(GetUserDir + '.fonts/');               // Legacy user font directory
@@ -337,12 +359,52 @@ begin
     lPathList.Add('/Library/Fonts/');
     lPathList.Add(GetUserDir + 'Library/Fonts/');
     {$ENDIF}
+    {$IFDEF OHOS}
+    { Also search app writable data directory for bundled fonts }
+    lPath := GetEnvironmentVariable('APP_DATA_DIR');
+    if lPath <> '' then
+      lPathList.Add(IncludeTrailingPathDelimiter(lPath) + 'fonts' + PathDelim);
+    {$ENDIF}
+    {$IFDEF ANDROID}
+    lPathList.Add('/system/fonts/');
+    { Also search writable app data directory for bundled fonts
+      (HOME is redirected to the app files dir by the Android backend). }
+    lPath := GetEnvironmentVariable('APP_DATA_DIR');
+    if lPath <> '' then
+      lPathList.Add(IncludeTrailingPathDelimiter(lPath) + 'fonts' + PathDelim);
+    {$ENDIF}
 
     for i := 0 to lPathList.Count-1 do
     begin
       lPath := lPathList[i];
       SearchForFont(lPath);
     end;
+
+    {$IFDEF OHOS}
+    { 应用内置字体兜底登记（resfile=相对名、filesDir 等应用沙箱路径；
+      系统字体禁止按路径读取——本 FreeType 路径如需系统字体应改用 FontMgr）。
+      BuildFontCacheItem 对缺失文件内部容错，不影响其它项。 }
+    begin
+      Add(BuildFontCacheItem('fonts/HarmonyOS_Sans_SC.ttf'));
+      Add(BuildFontCacheItem('fonts/HarmonyOS_Sans.ttf'));
+      Add(BuildFontCacheItem('HarmonyOS_Sans_SC.ttf'));
+      Add(BuildFontCacheItem('HarmonyOS_Sans.ttf'));
+    end;
+    {$ENDIF}
+    {$IFDEF ANDROID}
+    { Android 已知字体兜底登记（目录扫描的补充；缺文件时
+      BuildFontCacheItem 内部处理失败，不影响其它项）。 }
+    begin
+      Add(BuildFontCacheItem('/system/fonts/Roboto-Regular.ttf'));
+      Add(BuildFontCacheItem('/system/fonts/Roboto-Bold.ttf'));
+      Add(BuildFontCacheItem('/system/fonts/Roboto-Italic.ttf'));
+      Add(BuildFontCacheItem('/system/fonts/Roboto-Medium.ttf'));
+      Add(BuildFontCacheItem('/system/fonts/NotoSansCJK-Regular.ttc'));
+      Add(BuildFontCacheItem('/system/fonts/DroidSansFallback.ttf'));
+      Add(BuildFontCacheItem('/system/fonts/DroidSansMono.ttf'));
+      Add(BuildFontCacheItem('/system/fonts/NotoSerif-Regular.ttf'));
+    end;
+    {$ENDIF}
   finally
     FT_Done_FreeType(m_library);
     m_library := nil;

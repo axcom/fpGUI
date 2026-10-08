@@ -140,12 +140,30 @@ var
   FPG_DEFAULT_SANS: string = 'Arial';
   FPG_DEFAULT_FIXED: string = 'Courier New';
   FPG_DEFAULT_FIXED_FONT_DESC: string = 'Courier New-10';
-  {$ENDIF}
-  {$IFDEF UNIX}
-  FPG_DEFAULT_FONT_DESC: string = 'Liberation Sans-10:antialias=true';
-  FPG_DEFAULT_SANS: string = 'Liberation Sans';
-  FPG_DEFAULT_FIXED: string = 'Liberation Mono';
-  FPG_DEFAULT_FIXED_FONT_DESC: string = 'Liberation Mono-10';
+  {$ELSE}
+    {$IFDEF OHOS}
+    FPG_DEFAULT_FONT_DESC: string = 'HarmonyOS Sans-12:antialias=true';
+    FPG_DEFAULT_SANS: string = 'HarmonyOS Sans';
+    FPG_DEFAULT_FIXED: string = 'HarmonyOS Sans Mono';
+    FPG_DEFAULT_FIXED_FONT_DESC: string = 'HarmonyOS Sans Mono-12';
+    {$ELSE}
+      {$IFDEF ANDROID}
+      { Android system fonts: Roboto ships on every device (see
+        fpg_fontcache.pas for the known-file fallback list). 12pt matches
+        the OHOS default and stays readable on phone-sized logical screens. }
+      FPG_DEFAULT_FONT_DESC: string = 'Roboto-12:antialias=true';
+      FPG_DEFAULT_SANS: string = 'Roboto';
+      FPG_DEFAULT_FIXED: string = 'Droid Sans Mono';
+      FPG_DEFAULT_FIXED_FONT_DESC: string = 'Droid Sans Mono-12';
+      {$ELSE}
+      {$IFDEF UNIX}
+      FPG_DEFAULT_FONT_DESC: string = 'Liberation Sans-10:antialias=true';
+      FPG_DEFAULT_SANS: string = 'Liberation Sans';
+      FPG_DEFAULT_FIXED: string = 'Liberation Mono';
+      FPG_DEFAULT_FIXED_FONT_DESC: string = 'Liberation Mono-10';
+      {$ENDIF}
+      {$ENDIF}
+    {$ENDIF}
   {$ENDIF}
 
 const
@@ -341,6 +359,25 @@ type
     procedure   DrawTextToBuffer(ABuf: PByte; AStride, ABufW, ABufH,
                   AX, AY: Integer; const AText: string; AColor: TfpgColor;
                   AClipX1, AClipY1, AClipX2, AClipY2: Integer); virtual;
+    { Agg2D vector-text variant: renders AText with an optional stroke
+      (outline), rotation (radians, about APivotX/APivotY) and vertical
+      flip (mirror about the baseline at AX/AY). AX/AY is the glyph
+      baseline start; APivotX/APivotY is the AGG anchor point the rotation
+      pivots around (logical coordinates, same space as AX/AY). Used by
+      Agg2D.Text() on platforms without an AggPas font engine (OHOS).
+      Default implementation ignores the extras and forwards to
+      DrawTextToBuffer. }
+    procedure   DrawTextExtToBuffer(ABuf: PByte; AStride, ABufW, ABufH,
+                  AX, AY: Integer; const AText: string; AFillColor: TfpgColor;
+                  AStrokeColor: TfpgColor; AStrokeWidth: Double;
+                  AAngleRad: Double; AFlipY: Boolean;
+                  APivotX, APivotY: Double;
+                  AClipX1, AClipY1, AClipX2, AClipY2: Integer); virtual;
+    { Switch the underlying font face (TTF file path or font family name).
+      Used by Agg2D.Font() where no AggPas font engine exists (OHOS).
+      Default no-op. }
+    procedure   SetFontFace(const APathOrFamily: string); virtual;
+    procedure   SetTextSize(APtSize: Integer); virtual;
     property    FontDesc: string read FFontDesc;
   end;
 
@@ -455,6 +492,9 @@ type
     procedure   DoDrawRectangle(x, y, w, h: TfpgCoord); virtual; abstract;
     procedure   DoDrawLine(x1, y1, x2, y2: TfpgCoord); virtual; abstract;
     procedure   DoDrawImagePart(x, y: TfpgCoord; img: TfpgImageBase; xi, yi, w, h: integer); virtual; abstract;
+    { Stretch image (whole source) into dest rect (x,y,w,h). Default uses the
+      interpolation engine via SetPixel; backends with native scaling override. }
+    procedure   DoStretchDraw(x, y, w, h: TfpgCoord; ASource: TfpgImageBase); virtual;
     procedure   DoDrawString(x, y: TfpgCoord; const txt: string); virtual; abstract;
     procedure   DoSetClipRect(const ARect: TfpgRect); virtual; abstract;
     function    DoGetClipRect: TfpgRect; virtual; abstract;
@@ -490,7 +530,7 @@ type
     procedure   StretchDraw (x, y, w, h: TfpgCoord; ASource: TfpgImageBase);
     procedure   CopyRect(ADest_x, ADest_y: TfpgCoord; ASrcCanvas: TfpgCanvasBase; var ASrcRect: TfpgRect); virtual;
     // x,y is the top/left corner of where the text output will start.
-    procedure   DrawString(x, y: TfpgCoord; const txt: string);
+    procedure   DrawString(x, y: TfpgCoord; const txt: string); virtual;
     procedure   FillRectangle(x, y, w, h: TfpgCoord); overload;
     procedure   FillRectangle(r: TfpgRect); overload;
     procedure   FillTriangle(x1, y1, x2, y2, x3, y3: TfpgCoord);
@@ -623,6 +663,7 @@ type
     procedure   MoveAndResize(ALeft, ATop, AWidth, AHeight: TfpgCoord);
     property    OnDragStartDetected: TNotifyEvent read FOnDragStartDetected write FOnDragStartDetected;
   public
+    EmbeddedSurfaceId: UInt64;
     // The standard constructor.
     constructor Create(AOwner: TComponent); override;
     destructor  Destroy; override;
@@ -799,15 +840,13 @@ type
     FWakeChannel: IWakeChannel;
     FHelpKey: word;
     FHelpFile: TfpgString;
-    FCmdLineParams: ICmdLineParams;
     FDesignedDPI: integer;
     function    GetForm(Index: Integer): TfpgWidgetBase;
     function    GetFormCount: integer;
     function    GetTopModalForm: TfpgWidgetBase;
     function    GetHelpFile: TfpgString;
-    function    GetCmdLineParamsInterface: ICmdLineParams;
-    property    CmdLineParams: ICmdLineParams read GetCmdLineParamsInterface implements ICmdLineParams;
   protected
+    FCmdLineParams: ICmdLineParams;
     FOnIdle: TNotifyEvent;
     FIsInitialized: Boolean;
     FModalFormStack: TList;
@@ -819,6 +858,8 @@ type
     procedure   DoFlush; virtual; abstract;
     function    GetMonitorCount: Integer; virtual; abstract;
     function    GetMonitorInfo(AIndex: Integer): TfpgScreenInfo; virtual; abstract;
+    function    GetCmdLineParamsInterface: ICmdLineParams; virtual;
+    property    CmdLineParams: ICmdLineParams read GetCmdLineParamsInterface implements ICmdLineParams;
   public { METADATA }
     AppTitle: TfpgString;
     AppVersion: TfpgString;
@@ -931,7 +972,7 @@ type
     destructor  Destroy; override;
     function    Count: integer;
     function    CurrentSpecialDir: integer;
-    function    ReadDirectory(const aDirectory: TfpgString = ''): boolean;
+    function    ReadDirectory(const aDirectory: TfpgString = ''): boolean; virtual;
     procedure   Clear;
     procedure   Sort(AOrder: TFileListSortOrder);
     property    DirectoryName: TfpgString read FDirectoryName;
@@ -1077,6 +1118,8 @@ type
     procedure   Hide; virtual; abstract;
     function    IsSystemTrayAvailable: boolean; virtual; abstract;
     function    SupportsMessages: boolean; virtual; abstract;
+    { 气泡消息/通知（SupportsMessages=True 的平台实现；默认不支持，空实现）}
+    procedure   ShowMessage(const ATitle, AMessage: TfpgString); virtual;
   end;
 
 
@@ -2538,6 +2581,13 @@ begin
   if msg.MsgCode = FPGM_MOUSEEXIT then
     FCurrentWidget := nil;
 
+  { 鼠标事件派发守卫：PrimaryWidget/捕获控件所属窗口已失效（销毁竞态）时
+    不再派发——否则 direct dispatch 到已释放控件 → HandleMouseExit 内
+    BeginDraw 读失效对象 → SIGSEGV（菜单切换期 MOUSEEXIT 高频窗口）。
+    w 为窗口内活对象（读其 Window 字段安全）；仅跳过派发，不触碰悬空对象。 }
+  if (w = nil) or (w.Window = nil) or (not w.Window.HasHandle) then
+    Exit;
+
   MouseCursor:=w.MouseCursor;
   w.WindowToWidget(msg.Params.mouse.x, msg.Params.mouse.y);
   msg.Dest := w;
@@ -2957,6 +3007,13 @@ begin
 end;
 
 procedure TfpgCanvasBase.StretchDraw(x, y, w, h: TfpgCoord; ASource: TfpgImageBase);
+begin
+  if (ASource = nil) or (w <= 0) or (h <= 0) then
+    Exit;
+  DoStretchDraw(x, y, w, h, ASource);
+end;
+
+procedure TfpgCanvasBase.DoStretchDraw(x, y, w, h: TfpgCoord; ASource: TfpgImageBase);
 var
   FreeInterpolation: boolean;
   IP: TfpgCustomInterpolation;
@@ -3207,6 +3264,13 @@ begin
   // convert our 0,0 position to the position inside the native window
   if FWidget.Window = nil then
     exit;
+  { 加固：窗口句柄已失效或主控件不存在时跳过绘制。扫菜单反复开合 popup 时，
+    残留在绘制队列里的重绘可能作用于已释放/未分配的窗口 → 对失效画布/主控件
+    访问导致 SIGSEGV（回归崩溃：菜单扫动 cppcrash）。 }
+  if not FWidget.Window.HasHandle then
+    exit;
+  if FWidget.Window.PrimaryWidget = nil then
+    exit;
   FWidget.WidgetToWindow(dx, dy);
   BeginDraw(FWidget.Window.PrimaryWidget.Canvas, dx, dy);
 end;
@@ -3361,6 +3425,26 @@ begin
     pixel buffers. Override in AggCanvas font resources. }
 end;
 
+procedure TfpgFontResourceBase.DrawTextExtToBuffer(ABuf: PByte;
+  AStride, ABufW, ABufH, AX, AY: Integer; const AText: string;
+  AFillColor: TfpgColor; AStrokeColor: TfpgColor; AStrokeWidth: Double;
+  AAngleRad: Double; AFlipY: Boolean; APivotX, APivotY: Double;
+  AClipX1, AClipY1, AClipX2, AClipY2: Integer);
+begin
+  { Default: fall back to the plain renderer, ignoring stroke/rotation/flip. }
+  DrawTextToBuffer(ABuf, AStride, ABufW, ABufH, AX, AY, AText, AFillColor,
+    AClipX1, AClipY1, AClipX2, AClipY2);
+end;
+
+procedure TfpgFontResourceBase.SetFontFace(const APathOrFamily: string);
+begin
+  { Default no-op. Override where a native typeface must be swapped. }
+end;
+
+procedure TfpgFontResourceBase.SetTextSize(APtSize: Integer);
+begin
+  { Default no-op. Override where a native font handle must be resized. }
+end;
 
 { TfpgFontDefinition }
 
@@ -3935,7 +4019,10 @@ begin
       n := PLongWord(FImageData)[row * FWidth + col];
       if n = c then
         { set Alpha value 100% transparent }
-        PLongWord(FImageData)[row * FWidth + col] := n and $00FFFFFF;
+        PLongWord(FImageData)[row * FWidth + col] := n and $00FFFFFF
+      else
+        { ensure opaque pixels have full alpha (BMP data often has alpha=0) }
+        PLongWord(FImageData)[row * FWidth + col] := n or $FF000000;
     end;
   end;
 
@@ -4035,8 +4122,8 @@ var
 begin
   // Default location is in same directory as current running application
   // This location might change in the future.
-  ext := fpgExtractFileExt(ParamStr(0));
-  Result := fpgExtractFilePath(ParamStr(0)) + FPG_HELPVIEWER + ext;
+  ext := ExtractFileExt(ParamStr(0));
+  Result := ExtractFilePath(ParamStr(0)) + FPG_HELPVIEWER + ext;
 end;
 
 constructor TfpgApplicationBase.Create(const AParams: string);
@@ -4211,7 +4298,7 @@ var
   p: TProcess;
 begin
   Result := False;
-  if fpgExtractFilePath(GetHelpViewer) = '' then
+  if ExtractFilePath(GetHelpViewer) = '' then
   begin
     // do nothing - we are hoping docview is in the system PATH
   end
@@ -4242,7 +4329,7 @@ var
   p: TProcess;
 begin
   Result := False;
-  if fpgExtractFilePath(GetHelpViewer) = '' then
+  if ExtractFilePath(GetHelpViewer) = '' then
   begin
     // do nothing - we are hoping docview is in the system PATH
   end
@@ -4373,7 +4460,7 @@ var
 begin
   e := TFileEntry.Create;
   e.Name        := sr.Name;
-  e.Extension   := fpgExtractFileExt(e.Name);
+  e.Extension   := ExtractFileExt(e.Name);
   e.Size        := sr.Size;
   // e.Attributes  := sr.Attr; // this is incorrect and needs to improve!
   e.ModTime     := FileDateToDateTime(sr.Time);
@@ -4474,7 +4561,7 @@ begin
     dir := fpgExpandFileName(aDirectory)
   else
     dir := fpgGetCurrentDir;
-
+{
   // vvzh: now we have to use SetCurrentDir in order to make ExpandFileName work
   if not fpgSetCurrentDir(dir) then
     Exit; //==>
@@ -4498,6 +4585,35 @@ begin
       until fpgFindNext(SearchRec) <> 0;
     end;
     Result:=True;
+  finally
+    SysUtils.FindClose(SearchRec);
+  end;
+}
+  // chdir 成功后目录列表的 FDirectoryName 还是 dir（已解析的绝对路径）
+  if fpgSetCurrentDir(dir) then
+    FDirectoryName := IncludeTrailingPathDelimiter(dir)
+  else
+  begin
+    // chdir 失败（无权限），但仍用已解析的绝对路径去读目录
+    FDirectoryName := IncludeTrailingPathDelimiter(dir);
+    // 甚至可加标记，记录当前 CWD 未改变
+  end;
+
+  PopulateSpecialDirs(FDirectoryName);
+  Clear;
+  try
+    if fpgFindFirst(FDirectoryName + AllFilesMask, faAnyFile or $00000080, SearchRec) = 0 then
+    begin
+      repeat
+        // ... AddEntry ...
+        if (FSearchMode=smAny) or
+           ((FSearchMode=smFiles) and (not HasAttrib(SearchRec.Attr, faDirectory))) or
+           ((FSearchMode=smDirs) and HasAttrib(SearchRec.Attr, faDirectory))
+        then
+          AddEntry(SearchRec);
+      until fpgFindNext(SearchRec) <> 0;
+    end;
+    Result:=True;  // 即使 chdir 失败，目录列表成功也算成功
   finally
     SysUtils.FindClose(SearchRec);
   end;
@@ -4915,6 +5031,10 @@ begin
   end;
 end;
 
+{ 默认不支持气泡消息：SupportsMessages=False 的平台继承此空实现 }
+procedure TfpgSystemTrayHandlerBase.ShowMessage(const ATitle, AMessage: TfpgString);
+begin
+end;
 
 
 end.

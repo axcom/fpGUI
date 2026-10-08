@@ -1121,9 +1121,10 @@ begin
   end;
 
   // The little square in the bottom right corner
+  Canvas.ClearClipRect;
   if FHScrollBar.Visible and FVScrollBar.Visible then
   begin
-    Canvas.ClearClipRect;
+    //Canvas.ClearClipRect;
     Canvas.SetColor(clButtonFace);
     Canvas.FillRectangle(FHScrollBar.Left+FHScrollBar.ActualWidth,
                          FVScrollBar.Top+FVScrollBar.ActualHeight,
@@ -1715,7 +1716,7 @@ begin
   FTemp             := 50;  // Just to prove that ColumnWidth does adjust.
   FDefaultColWidth  := 64;
   FDefaultRowHeight := FFont.GetHeight + 2;
-  FHeaderHeight     := FHeaderFont.GetHeight + 2;
+  FHeaderHeight     := FFont.GetHeight; //FHeaderFont.GetHeight + 2;
   FBackgroundColor  := clBoxColor;
   FAlternativeBGColor := clHilite1;
   FColResizing      := False;

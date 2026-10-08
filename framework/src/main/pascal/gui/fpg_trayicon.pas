@@ -150,16 +150,17 @@ end;
 
 procedure TfpgSystemTrayIcon.Hide;
 begin
-  { TODO : TfpgSystemTrayIcon.Hide not implemented yet! }
-//  FVisible := False;
-//  FSysTrayHandler.Hide;
+  { 接线平台托盘 handler（此前为 TODO 空实现，托盘图标无法移除）}
+  FVisible := False;
+  FSysTrayHandler.Hide;
 end;
 
 procedure TfpgSystemTrayIcon.ShowMessage(const ATitle: TfpgString;
   const AMessage: TfpgString; const AMessageIcon: TfpgMessageIconType;
   const AMillisecondsTimeoutHint: Word);
 begin
-  { TODO : TfpgSystemTrayIcon.ShowMessage not implemented yet! }
+  { 委托平台 handler（SupportsMessages 平台实现；其余为空操作）}
+  FSysTrayHandler.ShowMessage(ATitle, AMessage);
 end;
 
 end.

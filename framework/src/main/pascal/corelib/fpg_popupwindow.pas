@@ -53,6 +53,7 @@ type
     procedure   DoAllocateWindowHandle; override;
   public
     constructor Create(AOwner: TComponent); override;
+    destructor  Destroy; override;
     procedure   ShowAt(AWidget: TfpgWidget; x, y: TfpgCoord; const ACanAdjustPos: boolean = false); overload;
     procedure   ShowAt(x, y: TfpgCoord); overload;
     procedure   Close; virtual;
@@ -323,6 +324,17 @@ begin
   Parent := nil;
   FPopupFrame := False;
   FIsContainer := True;
+end;
+
+destructor TfpgPopupWindow.Destroy;
+begin
+  // A popup window can be freed without going through Close (e.g. when the
+  // owning ComboBox or Dialog is destroyed while its dropdown is still open).
+  // Make sure we are removed from the global popup list first, otherwise a
+  // later ClosePopups call would dereference a dangling pointer (use-after-free).
+  // Close() already removes us, in which case this is a harmless no-op.
+  PopupListRemove(Self);
+  inherited Destroy;
 end;
 
 procedure TfpgPopupWindow.ShowAt(AWidget: TfpgWidget; x, y: TfpgCoord; const ACanAdjustPos: boolean);

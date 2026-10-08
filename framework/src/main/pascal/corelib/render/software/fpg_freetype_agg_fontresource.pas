@@ -11,6 +11,10 @@
       font metrics (GetTextWidth, GetAscent, GetDescent, GetHeight) using the
       same FreeType engine that TGlyphCache uses for rendering, ensuring
       measurement and rendering are always consistent.
+
+      RenderScale (default 1.0) supports HiDPI backends: glyphs are
+      rasterised at device size (logical size x RenderScale) while the
+      public metrics stay in logical units.
 }
 
 unit fpg_freetype_agg_fontresource;
@@ -32,7 +36,9 @@ type
   TfpgFreeTypeFontResource = class(TfpgFontResourceBase)
   private
     FGlyphCache: TGlyphCache;
+    FRenderScale: Double;
     FValid: Boolean;
+    procedure SetRenderScale(AValue: Double);
   public
     constructor Create(const AFontDesc: string); override;
     destructor Destroy; override;
@@ -44,6 +50,11 @@ type
     procedure DrawTextToBuffer(ABuf: PByte; AStride, ABufW, ABufH,
       AX, AY: Integer; const AText: string; AColor: TfpgColor;
       AClipX1, AClipY1, AClipX2, AClipY2: Integer); override;
+    { Device pixels per logical pixel. Glyphs are rasterised at
+      logical size x RenderScale; metrics/text width reported here are
+      logical. DrawTextToBuffer positions are DEVICE pixels — the canvas
+      scales them before calling. }
+    property RenderScale: Double read FRenderScale write SetRenderScale;
   end;
 
 
@@ -55,6 +66,7 @@ implementation
 constructor TfpgFreeTypeFontResource.Create(const AFontDesc: string);
 begin
   inherited Create(AFontDesc);
+  FRenderScale := 1.0;
   FGlyphCache := TGlyphCache.Create;
   { SetFont triggers FreeType font loading and metric capture }
   FGlyphCache.SetFont(Self);
@@ -67,6 +79,18 @@ begin
   inherited Destroy;
 end;
 
+procedure TfpgFreeTypeFontResource.SetRenderScale(AValue: Double);
+begin
+  if AValue < 1.0 then
+    AValue := 1.0;
+  if FRenderScale = AValue then
+    Exit;
+  FRenderScale := AValue;
+  FGlyphCache.Scale := AValue;
+  FGlyphCache.SetFont(Self);   { reload at new device size }
+  FValid := (FGlyphCache.Ascent > 0) or (FGlyphCache.Descent > 0);
+end;
+
 function TfpgFreeTypeFontResource.HandleIsValid: boolean;
 begin
   Result := FValid;
@@ -74,22 +98,34 @@ end;
 
 function TfpgFreeTypeFontResource.GetAscent: integer;
 begin
-  Result := FGlyphCache.Ascent;
+  if FRenderScale = 1.0 then
+    Result := FGlyphCache.Ascent
+  else
+    Result := Round(FGlyphCache.Ascent / FRenderScale);
 end;
 
 function TfpgFreeTypeFontResource.GetDescent: integer;
 begin
-  Result := FGlyphCache.Descent;
+  if FRenderScale = 1.0 then
+    Result := FGlyphCache.Descent
+  else
+    Result := Round(FGlyphCache.Descent / FRenderScale);
 end;
 
 function TfpgFreeTypeFontResource.GetHeight: integer;
 begin
-  Result := FGlyphCache.LineHeight;
+  if FRenderScale = 1.0 then
+    Result := FGlyphCache.LineHeight
+  else
+    Result := Round(FGlyphCache.LineHeight / FRenderScale);
 end;
 
 function TfpgFreeTypeFontResource.GetTextWidth(const txt: string): integer;
 begin
-  Result := FGlyphCache.TextWidth(txt);
+  if FRenderScale = 1.0 then
+    Result := FGlyphCache.TextWidth(txt)
+  else
+    Result := Round(FGlyphCache.TextWidth(txt) / FRenderScale);
 end;
 
 procedure TfpgFreeTypeFontResource.DrawTextToBuffer(ABuf: PByte;
