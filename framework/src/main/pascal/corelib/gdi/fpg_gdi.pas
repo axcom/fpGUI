@@ -3552,23 +3552,41 @@ function TfpgGDIClipboard.DoGetText: TfpgString;
 var
   h: THANDLE;
   p: PChar;
+  wp: PWideChar;
 begin
   Result := '';
   if not Windows.OpenClipboard(0) then
     Exit;
 
-  h := GetClipboardData(CF_TEXT);
+  { Prefer CF_UNICODETEXT (DoSetText writes this format); fall back to
+    CF_TEXT for clipboard content from other applications.
+    [fpGUI fix 2026-10: previously only CF_TEXT was read, so text set by
+     fpGUI itself (CF_UNICODETEXT only) lost non-ANSI characters like CJK.] }
+  h := GetClipboardData(CF_UNICODETEXT);
   if h <> 0 then
   begin
-    p := Windows.GlobalLock(h);
-    FClipboardText := '';
-    while p^ <> #0 do
-    begin
-      FClipboardText := FClipboardText + p^;
-      inc(p);
+    wp := Windows.GlobalLock(h);
+    try
+      FClipboardText := UTF8Encode(WideString(wp));
+    finally
+      GlobalUnlock(h);
     end;
-    GlobalUnlock(h);
-    FClipboardText := AnsiToUtf8(FClipboardText);
+  end
+  else
+  begin
+    h := GetClipboardData(CF_TEXT);
+    if h <> 0 then
+    begin
+      p := Windows.GlobalLock(h);
+      FClipboardText := '';
+      while p^ <> #0 do
+      begin
+        FClipboardText := FClipboardText + p^;
+        inc(p);
+      end;
+      GlobalUnlock(h);
+      FClipboardText := AnsiToUtf8(FClipboardText);
+    end;
   end;
   CloseClipboard;
   Result := FClipboardText;
