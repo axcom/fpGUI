@@ -35,7 +35,7 @@ uses
   cthreads, classes, sysutils, frm_main;   { 项目自己的 uses }
 
 { ── 应用启动 ───────────────────────────────────────────── }
-function MainProc;
+procedure MainProc;
 var
   frm: TfrmMain;
 begin
@@ -60,6 +60,8 @@ end.
 
 3- 复制 build-ohos 下  <ABI> 目录内的.so库 到 DevEco 工程目录下的 libs 目录对应的 <ABI> 目录下。
 
+另：注意修改DevEco 工程 `src\main\ets\common\FpAppConfig.ets` 内的 **APP_LIB_NAME** 为你的.so库名。
+
 
 
 ## Android
@@ -76,7 +78,7 @@ uses
   frm_main;   { 项目自己的 uses }
 
 { ── 应用启动 ───────────────────────────────────────────── }
-function MainProc;
+procedure MainProc;
 var
   frm: TfrmMain;
 begin
@@ -103,7 +105,7 @@ end.
 2- 编译android的.APK应用（示例）：
 
 ```
-修改 Android\build.bat 中 FPCDIR\BINUTILS\NDK\SDK\BUILD_TOOLS\ANDROID_JAR\ADB\FPSRC\RESDIR 路径为你本机的路径，执行build.bat（只能放在Android目录引用使用）
+修改 Android\build.bat 中 FPCDIR\BINUTILS\NDK\SDK\BUILD_TOOLS\ANDROID_JAR\ADB\FPSRC\RESDIR 路径为你本机的路径，执行build.bat（该BAT只能放在Android目录引用使用/否则会找不到JAR资源）
 ```
 
 
