@@ -34,6 +34,7 @@ uses
 const
   native_window = 'libnative_window.so';
   native_display_manager = 'libnative_display_manager.so';
+  native_fence = 'libnative_fence.so';
 
 type
   TOH_Region_Rect = record
@@ -65,6 +66,10 @@ function OH_NativeWindow_NativeWindowAbortBuffer(window: Pointer; buffer: Pointe
 function OH_NativeWindow_NativeWindowFlushBuffer(window: Pointer; buffer: Pointer; fenceFd: Int32; region: TOH_Region): Int32; cdecl; external native_window;
 { API 20+ 已移除 OH_NativeWindow_LockBuffer / UnlockAndFlushBuffer（external_window.h 确认），
   统一使用 RequestBuffer + FlushBuffer（API 9+ 全版本兼容）}
+
+function OH_NativeFence_IsValid(fenceFd: Int32): Boolean; cdecl; external native_fence;
+function OH_NativeFence_Wait(fenceFd: Int32; timeout: UInt32): Boolean; cdecl; external native_fence;
+procedure OH_NativeFence_Close(fenceFd: Int32); cdecl; external native_fence;
 
 { libc mmap/munmap — shared by fpg_ohos.pas (DoPutBufferToScreen) and
   fpg_ohos_buffer_manager.pas (buffer mapping). }

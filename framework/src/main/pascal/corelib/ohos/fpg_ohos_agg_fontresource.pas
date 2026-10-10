@@ -100,8 +100,54 @@ function TryLoadTypeface(out APath: string; AIsBold, AIsItalic: Boolean;
   const AFaceName: string = ''): POH_Drawing_Typeface;
 var
   p: string;
+  fname: string;
+  ttcIdx: Integer;
+  hpos: Integer;
+  cands: array of string;
 begin
   Result := nil;
+  APath := '';
+  { 应用内置字体文件优先：FontDesc 直接以文件名指定（如 'simsun.ttc#1-12'）时，
+    从 resfile/filesDir/libs 解析并按文件创建，优先于系统家族匹配——
+    与 fpg_ohos.pas 原生字体链的 TryLoadTypeface 补丁保持一致
+    （原生/AGG 两条链行为对齐；任一侧修改需同步）。
+    '#N' 后缀指定 TTC 集合内索引（simsun.ttc#1 = NSimSun 严格等宽）；候选名
+    同时含小写变体（NormalizeFaceName 会把 'simsun.ttc' 规范为 'Simsun.ttc'，
+    而目标文件系统大小写敏感）。 }
+  if AFaceName <> '' then
+  begin
+    fname := AFaceName;
+    ttcIdx := 0;
+    hpos := Pos('#', fname);
+    if hpos > 0 then
+    begin
+      ttcIdx := StrToIntDef(Copy(fname, hpos + 1, MaxInt), 0);
+      fname := Copy(fname, 1, hpos - 1);
+    end;
+    SetLength(cands, 6);
+    cands[0] := fname;
+    cands[1] := LowerCase(fname);
+    cands[2] := fname + '.ttf';
+    cands[3] := LowerCase(fname) + '.ttf';
+    cands[4] := fname + '.ttc';
+    cands[5] := LowerCase(fname) + '.ttc';
+    p := OhosResolveFontFile(cands);
+    if p <> '' then
+    begin
+      Result := OH_Drawing_TypefaceCreateFromFile(PChar(p), ttcIdx);
+      if Result <> nil then
+      begin
+        APath := p + '#' + IntToStr(ttcIdx);
+        fpGUI_Hilog(LOG_INFO, 'FONT LOADED(app): path="' + p + '" idx=' +
+          IntToStr(ttcIdx) + ' bold=' + IntToStr(Integer(AIsBold)) +
+          ' italic=' + IntToStr(Integer(AIsItalic)));
+        Exit;
+      end
+      else
+        fpGUI_Hilog(LOG_ERROR, 'FONT CREATE FAIL(app): path="' + p + '" idx=' +
+          IntToStr(ttcIdx) + ' name="' + AFaceName + '"');
+    end;
+  end;
   { FontMgr 系统字体优先（含中文，且支持粗体/斜体 style 选择） }
   Result := TryLoadSystemTypeface(APath, AIsBold, AIsItalic, AFaceName);
   if Result <> nil then

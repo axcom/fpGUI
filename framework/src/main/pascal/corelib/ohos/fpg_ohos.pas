@@ -93,6 +93,8 @@ type
     FNativeTypeface: POH_Drawing_Typeface;
     FNativeTypefacePath: string;   { 主 typeface 来源（'FontMgr:xxx' 或文件路径）}
     FMetricsValid: Boolean;        // True if OH_Drawing_FontGetMetrics succeeded
+    FNativeReady: Boolean;         { NativeFont 的 typeface/size 已配置完成，
+                                     绘制时无需再重复 SetTypeface/SetTextSize }
     FMetrics: TOH_Drawing_FontMetrics;
     FFallbackTypefaces: array of POH_Drawing_Typeface;  { CJK 兜底 + emoji }
     FFallbackFonts: array of POH_Drawing_Font;          { 平行于 typefaces（同 FHeight）}
@@ -1599,7 +1601,52 @@ function TryLoadTypeface(var APath: string; AIsBold, AIsItalic: Boolean;
   const AFaceName: string = ''): POH_Drawing_Typeface;
 var
   p: string;
+  fname: string;
+  ttcIdx: Integer;
+  hpos: Integer;
+  cands: array of string;
 begin
+  { 应用内置字体文件优先：FontDesc 直接以文件名指定（如 'simsun.ttc#1-12'）时，
+    从 resfile/filesDir/libs 解析并按文件创建，优先于系统家族匹配——
+    系统 MatchFamily 对未知家族会落到默认比例字体（不可用于等宽需求）。
+    '#N' 后缀指定 TTC 集合内索引（如 simsun.ttc#1 = NSimSun 严格等宽）；
+    已知名称（'Sans'/'Arial' 等）文件不存在时自然回退系统路径。 }
+  if AFaceName <> '' then
+  begin
+    fname := AFaceName;
+    ttcIdx := 0;
+    hpos := Pos('#', fname);
+    if hpos > 0 then
+    begin
+      ttcIdx := StrToIntDef(Copy(fname, hpos + 1, MaxInt), 0);
+      fname := Copy(fname, 1, hpos - 1);
+    end;
+    { 候选名同时含小写变体：TfpgFontDefinition.NormalizeFaceName 会把
+      'simsun.ttc' 规范为 'Simsun.ttc'，而 Linux 文件系统大小写敏感。 }
+    SetLength(cands, 6);
+    cands[0] := fname;
+    cands[1] := LowerCase(fname);
+    cands[2] := fname + '.ttf';
+    cands[3] := LowerCase(fname) + '.ttf';
+    cands[4] := fname + '.ttc';
+    cands[5] := LowerCase(fname) + '.ttc';
+    p := OhosResolveFontFile(cands);
+    if p <> '' then
+    begin
+      Result := OH_Drawing_TypefaceCreateFromFile(PChar(p), ttcIdx);
+      if Result <> nil then
+      begin
+        APath := p + '#' + IntToStr(ttcIdx);
+        fpGUI_Hilog(LOG_INFO, 'FONT LOADED(app): path="' + p + '" idx=' +
+          IntToStr(ttcIdx) + ' bold=' +
+          IntToStr(Integer(AIsBold)) + ' italic=' + IntToStr(Integer(AIsItalic)));
+        Exit;
+      end
+      else
+        fpGUI_Hilog(LOG_ERROR, 'FONT CREATE FAIL(app): path="' + p + '" idx=' +
+          IntToStr(ttcIdx) + ' name="' + AFaceName + '"');
+    end;
+  end;
   { FontMgr 系统字体优先（含中文，且支持粗体/斜体 style 选择） }
   Result := TryLoadSystemTypeface(APath, AIsBold, AIsItalic, AFaceName);
   if Result <> nil then
@@ -1653,6 +1700,10 @@ begin
       if FIsBold and (Pos('FontMgr:', dummy) = 0) then
         OH_Drawing_FontSetFakeBoldText(FNativeFont, True);
     end;
+    { 有 typeface 时构造已完成配置；无 typeface（字体加载失败，如模拟器
+      无 CJK 字体族）时保持 False，首次绘制用兜底 typeface 配置一次后置位，
+      避免逐次绘制重复 SetTypeface/SetTextSize（部分设备 ~24ms/次）。 }
+    FNativeReady := (FNativeFont <> nil) and (FNativeTypeface <> nil);
 
     { 字符 fallback 字体链（CJK 兜底 + emoji）：缺字形字符防方框 }
     BuildFallbackChain;
@@ -2246,10 +2297,12 @@ var
   i, clen: Integer;
   ch: string;
   fallbackUsed: Boolean;
+  needFontSetup: Boolean;
 begin
   if (FCanvas = nil) or (txt = '') then Exit;
 
   ownFont := False;
+  ohosFntRes := nil;
   if (FFont <> nil) and (FFont is TfpgOhosFontResource) then
   begin
     ohosFntRes := TfpgOhosFontResource(FFont);
@@ -2271,25 +2324,33 @@ begin
     ownFont := True;
   end;
 
-  if lTypeface = nil then
+  { 字体配置只在必要时做一次（每个资源/临时字体一次）：
+    OH_Drawing_FontSetTypeface/SetTextSize 在部分设备上 ~24ms/次，
+    逐次绘制重复设置会拖垮渲染（实测 17 次/帧 ≈ 全部 paint 耗时）。
+    资源构造时若 typeface 加载失败（如模拟器无 CJK 字体族），
+    首次绘制用兜底 typeface 配置一次并置 FNativeReady，之后不再重复。 }
+  needFontSetup := ownFont or (ohosFntRes = nil) or (not ohosFntRes.FNativeReady);
+  if needFontSetup then
   begin
-    { FFont 非 OHOS 资源时的兜底：统一探测（版本无关）。
-      探测结果（OhosFontExists/gFontProbeCache）已缓存；
-      Typeface 为进程级单例（gFallbackTypeface），仅首次创建，
-      后续绘制直接复用（兜底路径正常流程不命中，防御性开销为零）。 }
-    if gFallbackTypeface = nil then
+    if lTypeface = nil then
     begin
-      gFallbackTypefacePath := OhosResolveFontFile(OhosCJKFontFiles);
-      if gFallbackTypefacePath <> '' then
-        gFallbackTypeface := OH_Drawing_TypefaceCreateFromFile(
-          PChar(gFallbackTypefacePath), 0);
+      { FFont 非 OHOS 资源/资源缺 typeface 时的兜底：进程级单例，
+        仅首次创建，后续绘制直接复用。 }
+      if gFallbackTypeface = nil then
+      begin
+        gFallbackTypefacePath := OhosResolveFontFile(OhosCJKFontFiles);
+        if gFallbackTypefacePath <> '' then
+          gFallbackTypeface := OH_Drawing_TypefaceCreateFromFile(
+            PChar(gFallbackTypefacePath), 0);
+      end;
+      lTypeface := gFallbackTypeface;   { ownTypeface 恒 False：进程级单例不销毁 }
     end;
-    lTypeface := gFallbackTypeface;   { ownTypeface 恒 False：进程级缓存不销毁 }
+    if lTypeface <> nil then
+      OH_Drawing_FontSetTypeface(lFont, lTypeface);
+    OH_Drawing_FontSetTextSize(lFont, fontSize);
+    if ohosFntRes <> nil then
+      ohosFntRes.FNativeReady := True;
   end;
-
-  if lTypeface <> nil then
-    OH_Drawing_FontSetTypeface(lFont, lTypeface);
-  OH_Drawing_FontSetTextSize(lFont, fontSize);
 
   // TextBlob fills via brush — temporarily set brush to FTextColor
   if FBrush = nil then
@@ -2673,7 +2734,7 @@ begin
   if Assigned(fpgCaret) and (fpgCaret.Canvas <> nil) then
   begin  
     sx := 0; sy := 0; sw := bmpW; sh := bmpH;
-  end;
+  end; 
   
   { ★ 区域一律夹到 bitmap 之内 }
   if sx >= bmpW then Exit;
@@ -2696,7 +2757,19 @@ begin
     OH_NativeWindow_NativeWindowAbortBuffer(nativeWin, buf);
     Exit;
   end;
-
+  { RequestBuffer 返回的是 release fence（消费者已释放该 buffer 的信号）：
+    写入前必须等待；超时按既定策略继续写（记日志）。随后自行关闭并置 -1——
+    FlushBuffer 的 acquire fence 对 CPU 渲染传 -1，且文档禁止与 release
+    fence 复用同一 fd。 }
+  {if (fence >= 0) then
+  begin
+    if not OH_NativeFence_Wait(fence, 500) then
+      fpGUI_Hilog(LOG_WARN, format('PutBuf fence wait timeout: win=%s fd=%d',
+        [IntToHex(PtrUInt(nativeWin), 8), fence]));
+    OH_NativeFence_Close(fence);
+    fence := -1;
+  end;}
+  
   // 确保不超出 buffer 实际尺寸
   { ≤1px 视为匹配：bitmap 由逻辑尺寸×scale 往返可能有 1px 取整差
     （实测 phys=1840 → FSize=Round(1840/2.375)=775 → 775×2.375=1841），
@@ -2769,6 +2842,10 @@ begin
   copyH := sh;
   if copyH > hdl^.height - sy then copyH := hdl^.height - sy;
 
+  { 整帧且步幅一致 → 单次 Move 快路径（替代逐行约 2400 次 Move） }
+  if (copyW = srcStride) and (srcStride = dstStride) then
+    Move(PByte(px)^, PByte(addr)^, copyH * srcStride)
+  else
   for i := 0 to copyH - 1 do
     Move(PByte(px)[(sy + i) * srcStride + sx * 4], 
          PByte(addr)[(sy + i) * dstStride + sx * 4], 
