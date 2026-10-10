@@ -107,6 +107,9 @@ uses
   {$IFDEF AGG_WINDOWS}
     {$I agg_platform_gdi.inc}
   {$ENDIF}
+  {$IFDEF AGG_OHOS}
+    {$I agg_platform_ohos.inc}
+  {$ENDIF}
   {$IFDEF AGG_LINUX}
     {$I agg_platform_x11.inc}
   {$ENDIF}
@@ -164,6 +167,16 @@ const
  AGG_BlendDifference = comp_op_difference;
  AGG_BlendExclusion  = comp_op_exclusion;
  AGG_BlendContrast   = comp_op_contrast;
+
+{ GLOBAL HIDPI SCALE FACTOR }
+var
+ { Scale factor used by the standalone TAgg2D canvas. 1.0 means "no
+   scaling" (Windows/Linux/macOS default). On HiDPI platforms (OHOS) the
+   platform backend assigns its display scale factor (e.g. 1.9) at
+   runtime: the backing TfpgImage is then allocated in physical pixels
+   and an AGG transformation maps logical drawing coordinates onto it,
+   mirroring TOhosHybridCanvas/gHiDPIScaleFactor. }
+ HiDPIScaleFactor: Double = 1.0;
 
 { TYPES DEFINITION }
 type
@@ -368,6 +381,7 @@ type
    FLastFontBold: boolean;
    FLastFontItalic: boolean;
    FLastFontCache: TAggFontCacheType;
+   FTextFlip: boolean;          // FlipText state (AGG2D_NO_FONT platforms)
 
   protected
     FImg: TfpgImage;
@@ -386,6 +400,9 @@ type
   {$undef agg_platform_implementation}
     {$IFDEF AGG_WINDOWS}
       {$I agg_platform_gdi.inc}
+    {$ENDIF}
+    {$IFDEF AGG_OHOS}
+      {$I agg_platform_ohos.inc}
     {$ENDIF}
     {$IFDEF AGG_LINUX}
       {$I agg_platform_x11.inc}
@@ -733,6 +750,9 @@ uses
   {$undef agg_platform_implementation}
   {$IFDEF AGG_WINDOWS}
     {$I agg_platform_gdi.inc}
+  {$ENDIF}
+  {$IFDEF AGG_OHOS}
+    {$I agg_platform_ohos.inc}
   {$ENDIF}
   {$IFDEF AGG_LINUX}
     {$I agg_platform_x11.inc}
@@ -1264,6 +1284,9 @@ end;
 {$IFDEF AGG_WINDOWS}
   {$I agg_platform_gdi.inc}
 {$ENDIF}
+{$IFDEF AGG_OHOS}
+  {$I agg_platform_ohos.inc}
+{$ENDIF}
 {$IFDEF AGG_LINUX}
   {$I agg_platform_x11.inc}
 {$ENDIF}
@@ -1280,6 +1303,10 @@ var
   i: integer;
   lSize: double;
   lFamilyName: string;
+  {$IFDEF AGG2D_USE_FREETYPE}
+  lPlainDesc: string;
+  lColonPos: integer;
+  {$ENDIF}
   {$IFDEF AGG2D_USE_WINFONTS}
   b: int;
   tm: TEXTMETRIC;
@@ -1306,11 +1333,37 @@ begin
   begin
     // Fallback for font not in cache
     {$IFDEF AGG2D_USE_FREETYPE}
-    fnt := FontCacheItemFromFontDesc('Liberation Sans-10', lSize);
-    i := gFontCache.Find(fnt);
-    if i >= 0 then
-      FFontPath := gFontCache.Items[i].FileName;
-    fnt.Free;
+    { A styled request (':bold'/':italic') needs a matching styled FONT FILE.
+      Platforms whose system fonts ship only the regular face (OHOS) have
+      none, so retry with the style suffix stripped: the regular face is
+      loaded and the font engine synthesises the style
+      (FT_GlyphSlot_Embolden / FT_GlyphSlot_Oblique). }
+    if FBold or FItalic then
+    begin
+      lPlainDesc := AFontDesc;
+      lColonPos := Pos(':', lPlainDesc);
+      if lColonPos > 0 then
+        lPlainDesc := Copy(lPlainDesc, 1, lColonPos - 1);
+      fnt := FontCacheItemFromFontDesc(lPlainDesc, lSize);
+      i := gFontCache.Find(fnt);
+      if i >= 0 then
+        FFontPath := gFontCache.Items[i].FileName;
+      fnt.Free;
+    end;
+
+    if FFontPath = '' then
+    begin
+      {$IFDEF OHOS}
+      { OHOS: fall back to the default UI family (regular face). }
+      fnt := FontCacheItemFromFontDesc(FPG_DEFAULT_SANS + '-10', lSize);
+      {$ELSE}
+      fnt := FontCacheItemFromFontDesc('Liberation Sans-10', lSize);
+      {$ENDIF}
+      i := gFontCache.Find(fnt);
+      if i >= 0 then
+        FFontPath := gFontCache.Items[i].FileName;
+      fnt.Free;
+    end;
     {$ENDIF}
     {$IFDEF AGG2D_USE_WINFONTS}
     if lFamilyName = '' then
@@ -1336,6 +1389,11 @@ begin
   if FFontPath <> '' then
   begin
     m_fontEngine.load_font(PChar(FFontPath), 0, glyph_ren_agg_gray8);
+    { Synthesise the requested style when the loaded face is regular
+      (the engine skips it for faces that already carry the style).
+      Metrics (advance) then match the styled rendering. }
+    m_fontEngine.bold_(FBold);
+    m_fontEngine.italic_(FItalic);
     m_fontEngine.height_(FFontSize * fpgApplication.Screen_dpi / 72);
     m_fontEngine.flip_y_(True);
     m_fontEngine.hinting_(True);
@@ -1413,6 +1471,12 @@ begin
 end;
 
 function TfpgAgg2DFontResource.GetTextWidth(const txt: string): integer;
+{$IFDEF AGG2D_NO_FONT}
+begin
+  { No AggPas font engine (e.g. OHOS uses native_drawing for text). }
+  Result := 0;
+end;
+{$ELSE}
 var
   w: double;
   p: PChar;
@@ -1450,6 +1514,7 @@ begin
   end;
   Result := round(w + x);
 end;
+{$ENDIF}
 
 function TfpgAgg2DFontResource.GetCanvasRef: TObject;
 begin
@@ -1630,8 +1695,49 @@ function TAgg2D.AttachPartialImage(bitmap: TfpgImage; ARect: TfpgRect): boolean;
 var
   stride: integer;
   OffsetIntoImage: integer;
+  physL, physT, physW, physH: integer;
 begin
   stride := Integer(bitmap.ScanLine[1] - bitmap.ScanLine[0]);
+
+  if HiDPIScaleFactor <> 1.0 then
+  begin
+    { The target bitmap is a physical-pixel backing store. Convert the
+      logical window sub-rectangle to physical coordinates, clamping it
+      to the bitmap extent so an inconsistent/overflowing widget rect can
+      never attach past the buffer end (wild writes / heap corruption). }
+    physL := Round(ARect.Left * HiDPIScaleFactor);
+    physT := Round(ARect.Top * HiDPIScaleFactor);
+    physW := Round(ARect.Width * HiDPIScaleFactor);
+    physH := Round(ARect.Height * HiDPIScaleFactor);
+
+    if physL < 0 then
+    begin
+      Inc(physW, physL);
+      physL := 0;
+    end;
+    if physT < 0 then
+    begin
+      Inc(physH, physT);
+      physT := 0;
+    end;
+    if physL + physW > bitmap.Width then
+      physW := bitmap.Width - physL;
+    if physT + physH > bitmap.Height then
+      physH := bitmap.Height - physT;
+    if (physW < 1) or (physH < 1) then
+      Exit(False);
+
+    { A sub-region must not span more bytes than one source row, otherwise
+      every rendered row writes past the row end. }
+    if physW * 4 > Abs(stride) then
+      physW := Abs(stride) div 4;
+    if physW < 1 then
+      Exit(False);
+
+    OffsetIntoImage := physL * 4 + physT * Abs(stride);
+    Exit(Attach(bitmap, physW, physH, stride, OffsetIntoImage));
+  end;
+
   OffsetIntoImage := ARect.Left * 4 + ARect.Top * stride;
 
   Result := Attach(bitmap, ARect.Width, ARect.Height, stride, OffsetIntoImage);
@@ -1693,6 +1799,11 @@ begin
      m_renBaseCompPre.reset_clipping(true );
 
      ResetTransformations;
+
+     { HiDPI: callers pass the buffer in physical pixels when
+       HiDPIScaleFactor is not 1.0. ResetTransformations already installs
+       the logical→physical base scale (vector paths, line widths and image
+       destination rectangles land on the physical backing store). }
 
      LineWidth(1.0 );
      LineColor(0   ,0   ,0 );
@@ -2530,8 +2641,24 @@ end;
 
 { RESETTRANSFORMATIONS }
 procedure TAgg2D.ResetTransformations;
+var
+ tas : trans_affine_scaling;
 begin
+ { The canvas base coordinate system includes the HiDPI scale (logical
+   drawing coordinates → physical backing store). Reset must return to
+   that base transform, not pure identity — otherwise any draw after a
+   ResetTransformations call (e.g. the vector demo's arrow shapes) would
+   bypass the scale and land unscaled in the physical buffer. }
  m_transform.reset;
+
+ if HiDPIScaleFactor <> 1.0 then
+ begin
+  tas.Construct(HiDPIScaleFactor ,HiDPIScaleFactor );
+  m_transform.multiply(@tas );
+ end;
+
+ m_convCurve.approximation_scale_ (worldToScreen(1.0 ) * g_approxScale );
+ m_convStroke.approximation_scale_(worldToScreen(1.0 ) * g_approxScale );
 
 end;
 
@@ -2604,7 +2731,15 @@ var
  tat : trans_affine_translation;
 
 begin
- tat.Construct(x ,y );
+ { Translate moves the coordinate system in LOGICAL (world) units. The
+   current transform may already carry the HiDPI base scale
+   (logical→physical, installed by Attach/DoBeginDraw/ResetTransformations);
+   since the translation is concatenated AFTER that scale (row-vector:
+   p×M×T), its vector must be pre-scaled by the same factor — otherwise
+   moved elements drift toward the origin at 1/scale (the vector demo's
+   fanned lines and chevron shapes then overlap, unlike the desktop
+   reference). Desktop builds have HiDPIScaleFactor = 1 → unchanged. }
+ tat.Construct(x * HiDPIScaleFactor ,y * HiDPIScaleFactor );
 
  m_transform.multiply(@tat );
 
@@ -2855,7 +2990,7 @@ begin
  while i < numRays do
   begin
    x:=Cos(a ) * r2 + cx;
-   y:=-Sin(a ) * r2 + cy;
+   y:={-}Sin(a ) * r2 + cy;
 
    if i <> 0 then
     m_path.line_to(x ,y )
@@ -2864,7 +2999,7 @@ begin
 
    a:=a + da;
 
-   m_path.line_to(Cos(a ) * r1 + cx ,-Sin(a ) * r1 + cy );
+   m_path.line_to(Cos(a ) * r1 + cx ,{-}Sin(a ) * r1 + cy );
 
    a:=a + da;
 
@@ -2919,10 +3054,20 @@ begin
 
 end;
 
+{ Convert an AggPas rgba8 color to fpGUI's AARRGGBB TfpgColor. }
+function AggColorToFpg(const c: TAggColor): TfpgColor;
+begin
+  Result := (Cardinal(c.a) shl 24) or (Cardinal(c.r) shl 16) or
+            (Cardinal(c.g) shl 8) or Cardinal(c.b);
+end;
+
 procedure TAgg2D.FlipText(const flip : boolean );
 begin
   {$IFNDEF AGG2D_NO_FONT}
   m_fontEngine.flip_y_(not flip );
+  {$ENDIF}
+  {$IFDEF AGG2D_NO_FONT}
+  FTextFlip := flip;
   {$ENDIF}
 end;
 
@@ -2937,6 +3082,12 @@ var
  b : int;
  tm : TEXTMETRIC;
 {$ENDIF}
+{$IFDEF AGG2D_USE_FREETYPE}
+ {$IFDEF AGG_OHOS}
+var
+ fontFile : AnsiString;
+ {$ENDIF}
+{$ENDIF}
 begin
  { Skip expensive FreeType operations if font parameters match current engine state.
    The font engine signature already encodes all parameters (name, height, rendering
@@ -2949,23 +3100,72 @@ begin
     (cache = FLastFontCache) and (angle = m_textAngle) then
    exit;
 
+{$IFDEF AGG2D_USE_FREETYPE}
+ {$IFDEF AGG_OHOS}
+ { Resolve relative font names ('times.ttf' etc.) against the app's font
+   search directories. When the file cannot be found, fall back to the
+   canvas font instead of changing the engine state: load_font() clears
+   m_cur_face on failure, leaving the old glyph font active while
+   m_fontCacheType/height/angle already point at the missing font — which
+   would render un-scaled, un-rotated mixed-mode text. }
+ fontFile := OhosResolveAggFontFile(fileName);
+ if not FileExists(fontFile) then
+ begin
+   if Assigned(FFont) then
+     DoSetFontRes(FFont);
+   exit;
+ end;
+ {$ENDIF}
+{$ENDIF}
+
  m_textAngle    :=angle;
  m_fontHeight   :=height;
  m_fontCacheType:=cache;
 
 {$IFDEF AGG2D_USE_FREETYPE }
+ {$IFDEF AGG_OHOS}
+ if cache = AGG_VectorFontCache then
+  m_fontEngine.load_font(PChar(fontFile) ,0 ,glyph_ren_outline )
+ else
+  m_fontEngine.load_font(PChar(fontFile) ,0 ,glyph_ren_agg_gray8 );
+ {$ELSE}
  if cache = AGG_VectorFontCache then
   m_fontEngine.load_font(PChar(fileName) ,0 ,glyph_ren_outline )
  else
   m_fontEngine.load_font(PChar(fileName) ,0 ,glyph_ren_agg_gray8 );
+ {$ENDIF}
 
+ { Synthetic styling: FreeType has no weight/italic parameter — when no
+   dedicated bold/italic face is loaded the engine emboldens/oblices each
+   glyph (FT_GlyphSlot_Embolden/Oblique). Desktop builds with real bold
+   faces simply don't need it. }
+ m_fontEngine.bold_(bold);
+ m_fontEngine.italic_(italic);
  m_fontEngine.hinting_(m_textHints );
 
- m_fontEngine.height_(height * fpgApplication.Screen_dpi {screen dpi} / 72 {font dpi});
+ { Raster glyphs (AGG_RasterFontCache, used by fpGUI's DrawString) are
+   composited at WorldToScreen'd positions — i.e. PHYSICAL pixels — so
+   their bitmaps must be rasterised at PHYSICAL pixel size when a HiDPI
+   base scale is present (OHOS display scale). Vector outlines are
+   transformed by m_transform at draw time and must stay in LOGICAL
+   units. Desktop builds have HiDPIScaleFactor = 1 → unchanged. }
+ if cache = AGG_VectorFontCache then
+  m_fontEngine.height_(height * fpgApplication.Screen_dpi {screen dpi} / 72 {font dpi})
+ else
+  m_fontEngine.height_(height * fpgApplication.Screen_dpi {screen dpi} / 72 {font dpi} * HiDPIScaleFactor);
 
- // Populate ascent/descent metrics from FreeType
- m_fontAscent := m_fontEngine._ascender;
- m_fontDescent := abs(m_fontEngine._descender);  // descent is typically negative, make positive
+ // Populate ascent/descent metrics from FreeType (report LOGICAL units for
+ // both cache types — the raster engine height above is physical).
+ if cache = AGG_VectorFontCache then
+ begin
+  m_fontAscent := m_fontEngine._ascender;
+  m_fontDescent := abs(m_fontEngine._descender);  // descent is typically negative, make positive
+ end
+ else
+ begin
+  m_fontAscent := m_fontEngine._ascender / HiDPIScaleFactor;
+  m_fontDescent := abs(m_fontEngine._descender) / HiDPIScaleFactor;
+ end;
 {$ENDIF}
 {$IFDEF AGG2D_USE_WINFONTS}
  m_fontEngine.hinting_(m_textHints );
@@ -2987,6 +3187,26 @@ begin
    m_fontDescent := tm.tmDescent;
  end;
 {$ENDIF }
+
+{$IFDEF AGG2D_NO_FONT}
+ { Platform font engine absent (OHOS, etc.) — propagate the requested
+   pt size to fpGUI's font resource so DrawTextToBuffer and metrics
+   (GetAscent/GetTextWidth) match what the caller expects. Without
+   this FFont would stay at the app-default size regardless of what
+   ac.Font('xxx', 45) requests. }
+ if Assigned(FFont) then
+  begin
+    FFont.SetTextSize(Round(height));
+    { Also switch the font face (TTF file or family name). The OHOS
+      resource loads a real TTF when present, otherwise maps the name
+      to the closest system family (e.g. 'times.ttf' → 'Times New Roman'). }
+    FFont.SetFontFace(fileName);
+    { Keep the public metrics in sync with the platform font resource,
+      mirroring what the FreeType/WinFonts branches do. }
+    m_fontAscent  := FFont.GetAscent;
+    m_fontDescent := FFont.GetDescent;
+  end;
+{$ENDIF}
 
  { Update cache so identical calls are skipped next time }
  FLastFontName   := fileName;
@@ -3033,7 +3253,12 @@ end;
 function TAgg2D.TextWidth(str : AnsiString ) : double;
 {$IFDEF AGG2D_NO_FONT}
 begin
-  Result := 0;
+  { No AggPas font engine (OHOS): measure via the platform font resource.
+    Returns LOGICAL units, matching the desktop vector-font result. }
+  if Assigned(FFont) then
+    Result := FFont.GetTextWidth(str)
+  else
+    Result := 0;
 end;
 {$ELSE}
 var
@@ -3085,8 +3310,76 @@ procedure TAgg2D.Text(
            ddx : double = 0.0;
            ddy : double = 0.0 );
 {$IFDEF AGG2D_NO_FONT}
+var
+  dx ,dy ,asc ,start_x ,start_y : double;
+  cb: TAggRectD;
 begin
+ { No AggPas font engine on this platform — forward to the platform
+   font resource (TfpgOhosAggFontResource.DrawTextToBuffer) which has
+   its own native text rasterizer. }
+ if Str = '' then exit;
+ if not Assigned(FFont) then exit;
+ if m_rbuf.m_buf = nil then exit;
 
+ dx:=0.0;
+ dy:=0.0;
+
+ { Horizontal alignment — use the platform font resource's text width
+   (AggPas TextWidth returns 0 under AGG2D_NO_FONT). }
+ case m_textAlignX of
+  AGG_AlignCenter :
+   dx:=-FFont.GetTextWidth(str ) * 0.5;
+
+  AGG_AlignRight :
+   dx:=-FFont.GetTextWidth(str );
+ end;
+
+asc :=FFont.GetAscent;
+
+  { Vertical alignment → baseline offset (AGG anchor semantics):
+    AlignBottom: y IS the baseline (offset 0);
+    AlignCenter: baseline = center + asc/2 (glyph block straddles y);
+    AlignTop:    baseline = top + asc. }
+  case m_textAlignY of
+   AGG_AlignCenter :
+    dy:= asc * 0.5;
+
+   AGG_AlignTop :
+    dy:= asc;
+  end;
+
+  { Mirror the AggPas engine flip semantics: with FlipText(true) the
+    glyphs are mirrored about the baseline, so vertical alignment
+    offsets are negated. }
+  if FTextFlip then
+   dy:=-dy;
+
+  start_x:=x + dx;
+  start_y:=y + dy;
+
+  if roundOff then
+  begin
+   start_x:=Trunc(start_x );
+   start_y:=Trunc(start_y );
+  end;
+
+  start_x:=start_x + ddx;
+  start_y:=start_y + ddy;
+
+  { Vector-text semantics like the AggPas engine: glyphs are filled with
+    FillColor and stroked with LineColor/LineWidth, optionally rotated
+    (m_textAngle, radians, PIVOTED AT THE ORIGINAL (x,y) ANCHOR exactly
+    like the desktop engine's T(-x,-y)·R·T(x,y)) and flipped (FlipText).
+    start_y IS the baseline (AGG semantics, matching the desktop engine);
+    the fpGUI "top + ascent" convention is only used by DoDrawString. }
+  cb := ClipBox;
+  FFont.DrawTextExtToBuffer(PByte(m_rbuf.m_buf), m_rbuf.m_stride,
+    m_rbuf.m_width, m_rbuf.m_height,
+    Round(start_x), Round(start_y), str,
+    AggColorToFpg(m_fillColor), AggColorToFpg(m_lineColor), m_lineWidth,
+    m_textAngle, FTextFlip, x, y,
+    Trunc(cb.x1 / HiDPIScaleFactor), Trunc(cb.y1 / HiDPIScaleFactor),
+    Trunc(cb.x2 / HiDPIScaleFactor), Trunc(cb.y2 / HiDPIScaleFactor));
 end;
 {$ELSE}
 var
@@ -3987,6 +4280,8 @@ var
   px, py: TfpgCoord;
   pixel: TfpgColor;
   xorMask: TfpgColor;
+  physL, physT, physW, physH: integer;
+  targetImg: TfpgImage;
 begin
   if FPaintCaret then
   begin
@@ -3996,15 +4291,33 @@ begin
     r.Width := w;
     r.Height := h;
     FCaretPos.SetPoint(x, y);
-    FCaretImg := TAgg2D(FCanvasTarget).FImg.ImageFromRect(r);
+
+    targetImg := TAgg2D(FCanvasTarget).FImg;
+
+    if HiDPIScaleFactor <> 1.0 then
+    begin
+      { The shared backing image is in physical pixels. Capture and XOR
+        the physical caret rectangle. }
+      physL := Round(r.Left * HiDPIScaleFactor);
+      physT := Round(r.Top * HiDPIScaleFactor);
+      physW := Round(r.Width * HiDPIScaleFactor);
+      physH := Round(r.Height * HiDPIScaleFactor);
+      r.SetRect(physL, physT, physW, physH);
+    end;
+
+    { Guard against a leaked capture from a previous paint (FPaintCaret
+      set twice without an intervening restore). }
+    if Assigned(FCaretImg) then
+      FreeAndNil(FCaretImg);
+    FCaretImg := targetImg.ImageFromRect(r);
     { Perform true bitwise XOR on pixel data, matching X11's GXxor behaviour.
       This ensures the caret is always visible regardless of background colour. }
     xorMask := col or $FF000000;
     for py := r.Top to r.Top + r.Height - 1 do
       for px := r.Left to r.Left + r.Width - 1 do
       begin
-        pixel := TAgg2D(FCanvasTarget).FImg.Colors[px, py];
-        TAgg2D(FCanvasTarget).FImg.Colors[px, py] := pixel xor xorMask;
+        pixel := targetImg.Colors[px, py];
+        targetImg.Colors[px, py] := pixel xor xorMask;
       end;
     FPaintCaret := False
   end
@@ -4013,7 +4326,17 @@ begin
     if Assigned(FCaretImg) then
     begin
       if (FCaretPos.x = x) and (FCaretPos.y = y) then
-        DrawImage(x, y, FCaretImg);
+      begin
+        if HiDPIScaleFactor <> 1.0 then
+          { FCaretImg holds PHYSICAL pixels. Map it onto the logical caret
+            rectangle and let the Attach() HiDPI transform scale it back
+            1:1 onto the physical buffer. Plain DrawImage() would use the
+            image's physical size as the destination and get scaled twice. }
+          TransformImage(FCaretImg, 0, 0, FCaretImg.Width, FCaretImg.Height,
+            x, y, x + w, y + h)
+        else
+          DrawImage(x, y, FCaretImg);
+      end;
       FreeAndNil(FCaretImg);
     end;
     FPaintCaret := True
@@ -4060,9 +4383,48 @@ begin
 end;
 
 procedure TAgg2D.DoDrawString(x, y: TfpgCoord; const txt: string);
+{$IFDEF AGG2D_NO_FONT}
+var
+  cb: TAggRectD;
 begin
   if Length(txt) < 1 then
     Exit; //==>
+  if not Assigned(FFont) then
+    Exit; //==>
+
+  { No AggPas font engine on this platform (OHOS). Render directly into
+    the currently ATTACHED buffer via the platform font resource
+    (TfpgOhosAggFontResource.DrawTextToBuffer). m_rbuf is valid both for
+    the top-level canvas (attached to FImg) and an alien widget canvas
+    (attached to a sub-region of the parent buffer in DoBeginDraw).
+    AX/AY and the clip box are passed in LOGICAL coordinates; the font
+    resource multiplies them by its HiDPI scale factor internally. }
+  if m_rbuf.m_buf = nil then
+    Exit; //==>
+
+  cb := ClipBox;
+  // AY is the baseline: top-of-line Y + ascent (matches the X11 backend).
+  FFont.DrawTextToBuffer(PByte(m_rbuf.m_buf), m_rbuf.m_stride,
+    m_rbuf.m_width, m_rbuf.m_height,
+    x, y + FFont.GetAscent, txt, FTextColor,
+    Trunc(cb.x1 / HiDPIScaleFactor), Trunc(cb.y1 / HiDPIScaleFactor),
+    Trunc(cb.x2 / HiDPIScaleFactor), Trunc(cb.y2 / HiDPIScaleFactor));
+end;
+{$ELSE}
+begin
+  if Length(txt) < 1 then
+    Exit; //==>
+
+  { fpGUI text must be drawn with the CANVAS font. Agg2D.Font() calls made
+    by the application (vector cache, other faces/sizes) change the shared
+    font engine state; without re-syncing here the string would be rendered
+    with the leftover engine state (wrong face/size and — for vector cache —
+    un-scaled position handling). DoSetFontRes is cheap on repeat calls (the
+    Font() cache skips identical parameters). }
+  {$IFDEF AGG2D_USE_FREETYPE}
+  if Assigned(FFont) then
+    DoSetFontRes(FFont);
+  {$ENDIF}
 
   DoSetTextColor(FTextColor);
   NoLine;
@@ -4073,16 +4435,22 @@ begin
   TextAlignment(AGG_AlignLeft, AGG_AlignBottom);
   Text(x, y + FFont.GetAscent, txt);
 end;
+{$ENDIF}
 
 procedure TAgg2D.DoSetClipRect(const ARect: TfpgRect);
 begin
-  ClipBox(ARect.Left, ARect.Top, ARect.Right+1, ARect.Bottom+1);
+  { ClipBox operates in the attached (physical) buffer space, while
+    ARect is in logical drawing coordinates. }
+  ClipBox(ARect.Left * HiDPIScaleFactor, ARect.Top * HiDPIScaleFactor,
+          (ARect.Right + 1) * HiDPIScaleFactor, (ARect.Bottom + 1) * HiDPIScaleFactor);
   m_rasterizer.m_clipping := True;
 end;
 
 function TAgg2D.DoGetClipRect: TfpgRect;
 begin
-  Result.SetRect(Round(ClipBox.x1), Round(ClipBox.y1), Round(ClipBox.x2 - ClipBox.x1), Round(ClipBox.y2 - ClipBox.y1));
+  Result.SetRect(Round(ClipBox.x1 / HiDPIScaleFactor), Round(ClipBox.y1 / HiDPIScaleFactor),
+    Round((ClipBox.x2 - ClipBox.x1) / HiDPIScaleFactor),
+    Round((ClipBox.y2 - ClipBox.y1) / HiDPIScaleFactor));
 end;
 
 procedure TAgg2D.DoAddClipRect(const ARect: TfpgRect);
@@ -4099,7 +4467,9 @@ begin
   m_renBaseComp.reset_clipping   (true );
   m_renBasePre.reset_clipping    (true );
   m_renBaseCompPre.reset_clipping(true );
-  ClipBox(0, 0, FWidget.ActualWidth, FWidget.ActualHeight);
+  { Reset to the full physical extent of the widget in the attached buffer. }
+  ClipBox(0, 0, Round(FWidget.ActualWidth * HiDPIScaleFactor),
+          Round(FWidget.ActualHeight * HiDPIScaleFactor));
 
   //we have to do clipping still if we are an alien widget.
   m_rasterizer.m_clipping := not WeAreTopLevelCanvas;
@@ -4111,9 +4481,32 @@ var
 begin
   if CanvasTarget <> Self then
   begin
-    // let this TAgg2D attach to the Native Window's Canvas.FImg
+    { Alien widget: attach to a sub-region of the parent's buffer.
+      AttachPartialImage→Attach already does ResetTransformations+Scale
+      for us. }
     R := GetWidgetWindowRect;
     AttachPartialImage(TAgg2D(CanvasTarget).FImg, R);
+  end
+  else
+  begin
+    { Top-level: re-apply the coordinate transform every frame so
+      DrawPath sees logical→physical scaling regardless of whether
+      Attach was called (FImg already existed) or something reset
+      m_transform between frames. ResetTransformations installs the
+      HiDPI base scale. }
+    ResetTransformations;
+
+    {$IFDEF AGG2D_USE_FREETYPE}
+    { Re-sync the AggPas font engine with the canvas font at the start of
+      every paint. Application Agg2D.Font() calls (vector cache, other
+      faces/sizes) during the previous paint would otherwise leak into this
+      frame's fpGUI DrawString text, which must use the canvas font
+      resource (raster cache, physical glyph size) — otherwise the text
+      is rendered with the leftover engine state and lands at wrong
+      positions. DoSetFontRes is a no-op for non-Agg font resources. }
+    if Assigned(FFont) then
+      DoSetFontRes(FFont);
+    {$ENDIF}
   end;
 end;
 
@@ -4125,11 +4518,22 @@ end;
 function TAgg2D.GetPixel(X, Y: integer): TfpgColor;
 var
   R: TfpgRect;
+  px, py: Integer;
 begin
   if Assigned(FImg) then
-    Result := FImg.Colors[x, y]
+  begin
+    { FImg is a physical-pixel backing store; X/Y are logical. }
+    px := Round(X * HiDPIScaleFactor);
+    py := Round(Y * HiDPIScaleFactor);
+    if (px >= 0) and (py >= 0) and (px < FImg.Width) and (py < FImg.Height) then
+      Result := FImg.Colors[px, py]
+    else
+      Result := 0;
+  end
   else if Assigned(FCanvasTarget) then
   begin
+    { Alien widget: forward in LOGICAL window coordinates; the target
+      canvas converts to physical when it touches its own FImg. }
     R := GetWidgetWindowRect;
     Result := TAgg2D(FCanvasTarget).GetPixel(R.Left + x, R.Top + y);
   end
@@ -4140,9 +4544,17 @@ end;
 procedure TAgg2D.SetPixel(X, Y: integer; const AValue: TfpgColor);
 var
   R: TfpgRect;
+  px, py: Integer;
 begin
   if Assigned(FImg) then
-    FImg.Colors[x, y] := AValue
+  begin
+    { Logical -> physical, bounds-checked. Force alpha opaque so single
+      pixels are not blended as "transparent" on the HiDPI platform. }
+    px := Round(X * HiDPIScaleFactor);
+    py := Round(Y * HiDPIScaleFactor);
+    if (px >= 0) and (py >= 0) and (px < FImg.Width) and (py < FImg.Height) then
+      FImg.Colors[px, py] := AValue or $FF000000;
+  end
   else if Assigned(FCanvasTarget) then
   begin
     R := GetWidgetWindowRect;
@@ -4172,8 +4584,9 @@ begin
   path.Construct;
   center_x := x + (w/2);
   center_y := y + (h/2);
-  xd := x;
-  xd := y;
+  { vertex() out-params — explicit init to keep the compiler happy }
+  xd := 0;
+  yd := 0;
 
   // 1. Move to the center of the circle
   path.move_to(center_x, center_y);
@@ -4248,9 +4661,9 @@ begin
     Result := Assigned(FImg);
     if Result then
     begin
-      { if the window was resized }
-      if (FImg.Width < FWidget.ActualWidth) or (FImg.Height < FWidget.ActualHeight) then
-//      if (abs(FImg.Width - FWidget.ActualWidth) > g_ResizeThreshold) or (abs(FImg.Height - FWidget.ActualHeight) > g_ResizeThreshold) then
+      { if the window was resized (FImg is kept at physical size) }
+      if (FImg.Width < Round(FWidget.ActualWidth * HiDPIScaleFactor)) or
+         (FImg.Height < Round(FWidget.ActualHeight * HiDPIScaleFactor)) then
       begin
         {$IFDEF GDEBUG}
         DebugLn('img vs widget width = ' + IntToStr(FImg.Width) + ' ' + IntToStr(FWidget.ActualWidth));
@@ -4265,11 +4678,17 @@ begin
 end;
 
 procedure TAgg2D.DoAllocateBuffer;
+var
+  bufW, bufH: Integer;
 begin
   if not Assigned(FImg) then
   begin
     FImg := TfpgImage.Create;
-    FImg.AllocateImage(32, FWidget.ActualWidth + g_ResizeThreshold, FWidget.ActualHeight + g_ResizeThreshold);
+    { Backing store is allocated in PHYSICAL pixels when HiDPI scaling is
+      active; Attach() installs the matching coordinate transform. }
+    bufW := Round(FWidget.ActualWidth * HiDPIScaleFactor) + g_ResizeThreshold;
+    bufH := Round(FWidget.ActualHeight * HiDPIScaleFactor) + g_ResizeThreshold;
+    FImg.AllocateImage(32, bufW, bufH);
     Attach(FImg);
   end;
 end;
@@ -4300,7 +4719,13 @@ end;
 
 initialization
   {$IFDEF AGGCANVAS}
+  {$IFNDEF AGG2D_NO_FONT}
+  { On OHOS (AGG2D_NO_FONT), TfpgAgg2DFontResource has no font engine and
+    would always return HandleIsValid=False. The OHOS-specific
+    TfpgOhosAggFontResource (registered in fpg_interface.pas) must be used
+    instead. Skip registration here so it doesn't override the OHOS one. }
   AggFontResourceClass := TfpgAgg2DFontResource;
+  {$ENDIF}
   {$ENDIF}
 
 
