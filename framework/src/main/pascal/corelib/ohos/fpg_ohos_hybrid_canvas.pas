@@ -823,7 +823,7 @@ procedure TOhosHybridCanvas.SetPixel(X, Y: integer; const AValue: TfpgColor);
 var
   px: PByte;
   rgb: TfpgColor;
-  drawX, drawY: Integer;
+  drawX, drawY, cellW, cellH, pxx, pyy: Integer;
 begin
   drawX := X + FDeltaX;
   drawY := Y + FDeltaY;
@@ -836,20 +836,34 @@ begin
      (drawX >= FBufWidth) or (drawY >= FBufHeight) then
     Exit;
   rgb := fpgColorToRGB(AValue);
-  px := PByte(FBufData) + drawY * FBufStride + drawX * 4;
-  {$ifdef OHOS}
-  { OHOS：缓冲实为 RGBA 字节序 [R,G,B,A]（fpgColorToAgg swap 所致，
-    见 :149-156）→ 按 R,G,B 写入，与绘制路径/显示一致。 }
-  px[0] := (rgb shr 16) and $FF;  { R }
-  px[1] := (rgb shr 8) and $FF;   { G }
-  px[2] := rgb and $FF;           { B }
-  {$else}
-  { TfpgColor ($AARRGGBB) to BGRA }
-  px[0] := rgb and $FF;           { B }
-  px[1] := (rgb shr 8) and $FF;   { G }
-  px[2] := (rgb shr 16) and $FF;  { R }
-  {$endif}
-  px[3] := 255;                   { A = fully opaque }
+  { FPG: 逻辑像素 = 物理像元——HiDPI 下逐像素绘制只写单点会呈稀疏点阵
+    （VT 背景 BitBlt 垫片路径 → Speed 页背景发糊）；填满 scale 对应的整格，
+    与画布矩阵对填充矩形的缩放语义一致。与 fpg_ohos.pas 同款修复。 }
+  cellW := Round(gHiDPIScaleFactor);
+  if cellW < 1 then cellW := 1;
+  cellH := cellW;
+  for pyy := drawY to drawY + cellH - 1 do
+  begin
+    if (pyy < 0) or (pyy >= FBufHeight) then Continue;
+    for pxx := drawX to drawX + cellW - 1 do
+    begin
+      if (pxx < 0) or (pxx >= FBufWidth) then Continue;
+      px := PByte(FBufData) + pyy * FBufStride + pxx * 4;
+      {$ifdef OHOS}
+      { OHOS：缓冲实为 RGBA 字节序 [R,G,B,A]（fpgColorToAgg swap 所致，
+        见 :149-156）→ 按 R,G,B 写入，与绘制路径/显示一致。 }
+      px[0] := (rgb shr 16) and $FF;  { R }
+      px[1] := (rgb shr 8) and $FF;   { G }
+      px[2] := rgb and $FF;           { B }
+      {$else}
+      { TfpgColor ($AARRGGBB) to BGRA }
+      px[0] := rgb and $FF;           { B }
+      px[1] := (rgb shr 8) and $FF;   { G }
+      px[2] := (rgb shr 16) and $FF;  { R }
+      {$endif}
+      px[3] := 255;                   { A = fully opaque }
+    end;
+  end;
 end;
 
 procedure TOhosHybridCanvas.GradientFill(ARect: TfpgRect; AStart, AStop: TfpgColor; ADirection: TGradientDirection);

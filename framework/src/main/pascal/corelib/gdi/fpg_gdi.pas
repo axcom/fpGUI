@@ -1744,8 +1744,14 @@ constructor TfpgGDIApplication.Create(const AParams: string);
 var
   coll: TMonitorCollector;
 begin
-  inherited Create(AParams);
+  { FPG fix（弹窗偏右下根因）: DPI 感知声明必须早于任何 user32 调用。
+    基类构造里的 fpgInitMsgQueue(PeekMessage 等) 会锁定进程 DPI 感知状态，
+    之后再调 SetProcessDpiAwareness 会失败（返回值原被忽略、静默失效）→ 进程
+    保持 UNAWARE：SetWindowPos 坐标被系统按缩放虚拟化（175% 下 ×1.75），而
+    显示器枚举 GetMonitorInfoW 恒返回物理值 → 两个坐标空间混用，按物理屏幕
+    算出的居中位置整体 ×1.75 偏移。 }
   DeclareDPIAwareness;
+  inherited Create(AParams);
   FDisplay        := Windows.GetDC(0);
   FEffectiveDPI   := DetectEffectiveDPI(FDisplay);
 
@@ -1842,14 +1848,17 @@ var
   timeoutval: DWORD;
   DummyHandle: THandle;
 begin
-  if (atimeoutms >= 0) and (not MessagesPending) then
+  if not MessagesPending then
   begin
     if Assigned(FOnIdle) then
       OnIdle(self);
 
-    // Wait for messages or timeout (whichever comes first)
+    // FPG fix: fpgClosestTimer 在"2s 视界内无到期定时器"时返回 -1。
+    // 原实现 (atimeoutms >= 0) 会整段跳过等待 → 消息泵退化成 100% CPU 忙循环
+    // （实测：空闲即满载一个核，任务管理器显示 ~15%；Windows GDI 后端）。
+    // -1 语义 = "没有近期定时器"，应按标准 2000ms 心跳阻塞等待。
     if atimeoutms < 0 then
-      timeoutval := INFINITE
+      timeoutval := 2000
     else
       timeoutval := DWORD(atimeoutms);
 
@@ -3717,6 +3726,12 @@ begin
   {$IFDEF DND_DEBUG}
   DebugLn('TfpgGDIDrag.Destroy ');
   {$ENDIF}
+  { FPG: 清除应用层引用（与 X11 TX11Drag.Destroy 同型）。wapplication.SetDrag
+    在换新时会 Free 旧值；若调用方先行 Free（如 VT 端口 DragAndDrop 的
+    Drag.Free），残留的 FDrag 即成悬垂指针 → 下一次起拖 SetDrag 二次 Free
+    → "首次拖拽后每次起拖都异常"（win64 实测 AV）。 }
+  if (wapplication <> nil) and (wapplication.FDrag = Self) then
+    wapplication.FDrag := nil;
   inherited Destroy;
 end;
 

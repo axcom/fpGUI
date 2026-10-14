@@ -136,10 +136,10 @@ const
 
 var
   {$IFDEF WINDOWS}
-  FPG_DEFAULT_FONT_DESC: string = 'Arial-8:antialias=true';
+  FPG_DEFAULT_FONT_DESC: string = 'Arial-10:antialias=true';
   FPG_DEFAULT_SANS: string = 'Arial';
   FPG_DEFAULT_FIXED: string = 'Courier New';
-  FPG_DEFAULT_FIXED_FONT_DESC: string = 'Courier New-10';
+  FPG_DEFAULT_FIXED_FONT_DESC: string = 'Courier New-12';
   {$ELSE}
     {$IFDEF OHOS}
     FPG_DEFAULT_FONT_DESC: string = 'HarmonyOS Sans-12:antialias=true';
@@ -157,10 +157,10 @@ var
       FPG_DEFAULT_FIXED_FONT_DESC: string = 'Droid Sans Mono-12';
       {$ELSE}
       {$IFDEF UNIX}
-      FPG_DEFAULT_FONT_DESC: string = 'Liberation Sans-10:antialias=true';
+      FPG_DEFAULT_FONT_DESC: string = 'Liberation Sans-12:antialias=true';
       FPG_DEFAULT_SANS: string = 'Liberation Sans';
       FPG_DEFAULT_FIXED: string = 'Liberation Mono';
-      FPG_DEFAULT_FIXED_FONT_DESC: string = 'Liberation Mono-10';
+      FPG_DEFAULT_FIXED_FONT_DESC: string = 'Liberation Mono-12';
       {$ENDIF}
       {$ENDIF}
     {$ENDIF}

@@ -626,6 +626,27 @@ begin
       FBufStride := THybridCanvas(CanvasTarget).FBufStride;
       FBufWidth := awidget.ActualWidth;
       FBufHeight := awidget.ActualHeight;
+
+      { FPG fix (越界写防护): 子控件可以合法地只部分位于父容器内（滚动内容、
+        布局缺陷等），但绘制绝不能写出父缓冲区。把子区域裁剪到父缓冲边界；
+        若起点在父缓冲之外（负偏移/完全在外）则不绘制。此缺陷曾在 HiDPI
+        二次缩放几何错误时表现为 FillDword 越界写 AV（闪退）。 }
+      if (FDeltaX < 0) or (FDeltaY < 0) or
+         (FDeltaX >= THybridCanvas(CanvasTarget).FBufWidth) or
+         (FDeltaY >= THybridCanvas(CanvasTarget).FBufHeight) then
+      begin
+        FBufData := nil;
+        FBufWidth := 0;
+        FBufHeight := 0;
+        FDeltaX := 0;
+        FDeltaY := 0;
+        Exit;
+      end;
+      if FBufWidth > THybridCanvas(CanvasTarget).FBufWidth - FDeltaX then
+        FBufWidth := THybridCanvas(CanvasTarget).FBufWidth - FDeltaX;
+      if FBufHeight > THybridCanvas(CanvasTarget).FBufHeight - FDeltaY then
+        FBufHeight := THybridCanvas(CanvasTarget).FBufHeight - FDeltaY;
+
       { Calculate byte offset into parent's buffer so position (0,0) maps
         to the widget's top-left pixel. Both FAgg and FBufData must use
         this same offset pointer so the glyph cache renders into the

@@ -54,6 +54,24 @@ begin
   if Control is TfpgWidget then
   begin
     widget := TfpgWidget(Control);
+
+    { FPG fix (HiDPI 下闪退/布局越界的根因):
+      必须先缩放子树、最后缩放控件自身。
+      对已显示窗口的 Width/Height 赋值会同步触发 WM_SIZE → 应用的
+      OnResize/Relayout，让子控件按"已放大"的父容器重新布局；若之后再
+      递归放小子控件，几何就被二次放大。实测 StateForm 组面板
+      471x514 → 824x900 @ (14,970) 越出 1925x1085 窗口，
+      离屏画布越界写 → FillDword AV（闪退）。
+      先缩放子树后，容器级的 WM_SIZE 重排最后执行并覆盖为自洽布局。 }
+    if widget.ComponentCount > 0 then
+    begin
+      for n := 0 to widget.ComponentCount-1 do
+      begin
+        if widget.Components[n] is TfpgWidget then
+          ScaleDPI(widget.Components[n], FromDPI);
+      end;
+    end;
+
     TfpgWidgetFriend(widget).Loading;
     with widget do
     begin
@@ -91,14 +109,6 @@ begin
     end;
     TfpgWidgetFriend(widget).Loaded;
 
-    if widget.ComponentCount > 0 then
-    begin
-      for n := 0 to widget.ComponentCount-1 do
-      begin
-        if widget.Components[n] is TfpgWidget then
-          ScaleDPI(widget.Components[n], FromDPI);
-      end;
-    end;
     widget.UpdatePosition;
   end; { if Control }
 end;

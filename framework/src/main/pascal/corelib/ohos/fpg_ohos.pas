@@ -850,6 +850,9 @@ uses
 { 前向声明（TfpgOhosApplication.Create 启动期调用，定义在文件后部）}
 procedure DumpFontFamilies; forward;
 procedure OhosLoadSystemFontConfig; forward;
+{ 字体路径/字体名扫描（字体选择对话框列表用；定义在文件后部）}
+function OhosAppFontDirs: TStringList; forward;
+function OhosScanAppFontNames: TStringList; forward;
 
 { 文本绘制诊断标志（首例 TextBlob 创建结果打印一次）}
 var
@@ -2073,7 +2076,11 @@ begin
   FColorValue := cl;
   if FPen = nil then FPen := OH_Drawing_PenCreate();
   OH_Drawing_PenSetColor(FPen, ColorToNative(rgb));
-  OH_Drawing_PenSetWidth(FPen, FLineWidth);
+  { FPG: 0 宽笔不描边——未设置过线宽时按 1px（X11 语义） }
+  if FLineWidth < 1 then
+    OH_Drawing_PenSetWidth(FPen, 1)
+  else
+    OH_Drawing_PenSetWidth(FPen, FLineWidth);
   if FBrush = nil then FBrush := OH_Drawing_BrushCreate();
   OH_Drawing_BrushSetColor(FBrush, ColorToNative(rgb));
 end;
@@ -2084,6 +2091,10 @@ var
   lw: Single;
   n: Integer;
 begin
+  { FPG: X11 语义——线宽 0 视为 1px 细线。原生 OH_Drawing 的 0 宽笔不描边，
+    曾导致所有 w=0 描边（VT 复选框边框/对勾、点线框等）在 OHOS 上不可见。 }
+  if awidth < 1 then
+    awidth := 1;
   FLineWidth := awidth;
   FLineStyle := astyle;
   if FPen = nil then FPen := OH_Drawing_PenCreate();
@@ -2959,15 +2970,18 @@ var
   px: Pointer;
   stride: UInt32;
   v: UInt32;
-  sx, sy: Integer;
+  sx, sy, bw, bh: Integer;
 begin
   Result := 0;
   if FBitmap = nil then Exit;
   px := OH_Drawing_BitmapGetPixels(FBitmap);
   if px = nil then Exit;
+  bw := OH_Drawing_BitmapGetWidth(FBitmap);
+  bh := OH_Drawing_BitmapGetHeight(FBitmap);
   sx := Round((X + FDeltaX) * gScaleFactorX);
   sy := Round((Y + FDeltaY) * gScaleFactorY);
-  stride := OH_Drawing_BitmapGetWidth(FBitmap) * 4;
+  if (sx < 0) or (sy < 0) or (sx >= bw) or (sy >= bh) then Exit;
+  stride := bw * 4;
   v := PLongWord(PByte(px) + sy * stride + sx * 4)^;
   // RGBA_8888 → fpGUI AARRGGBB: swap R↔B
   Result := (v and $FF00FF00) or ((v shr 16) and $FF) or ((v shl 16) and $FF0000);
@@ -2978,7 +2992,7 @@ var
   px: Pointer;
   stride: UInt32;
   v: UInt32;
-  sx, sy: Integer;
+  sx, sy, cellW, cellH, pxx, pyy: Integer;
   bw, bh: Integer;
 begin
   if FBitmap = nil then Exit;
@@ -2996,7 +3010,22 @@ begin
   { fpGUI $AARRGGBB → RGBA_8888 (swap R↔B); force alpha=0xFF: SetPixel is opaque
     by convention across backends, and the interpolation engine emits alpha=0. }
   v := (AValue and $0000FF00) or ((AValue shr 16) and $FF) or ((AValue shl 16) and $FF0000) or $FF000000;
-  PLongWord(PByte(px) + sy * stride + sx * 4)^ := v;
+  { FPG: 逻辑像素 = 物理像元——HiDPI 下 1 个逻辑像素应覆盖整格（与画布矩阵对
+    填充矩形的缩放语义一致）。只写单点会让逐像素绘制（VT 背景 BitBlt 垫片、
+    点线框、拉伸回退等）在 2x 屏上呈稀疏点阵（Speed 页背景发糊）。 }
+  cellW := Round(gScaleFactorX);
+  if cellW < 1 then cellW := 1;
+  cellH := Round(gScaleFactorY);
+  if cellH < 1 then cellH := 1;
+  for pyy := sy to sy + cellH - 1 do
+  begin
+    if (pyy < 0) or (pyy >= bh) then Continue;
+    for pxx := sx to sx + cellW - 1 do
+    begin
+      if (pxx < 0) or (pxx >= bw) then Continue;
+      PLongWord(PByte(px) + pyy * stride + pxx * 4)^ := v;
+    end;
+  end;
 end;
 
 procedure TfpgOhosCanvas.CopyRect(ADest_x, ADest_y: TfpgCoord; ASrcCanvas: TfpgCanvasBase;
@@ -3341,7 +3370,7 @@ fpGUI原框架：主窗口创建时 ScaleDPI 尚未跑（而弹窗及子窗体�
   修正后写两个空间：
     widget.Left/FPosition  ← 物理值（DoUpdateWindowPosition 直接用；ScaleDPI 后被 widget.Left 覆盖为同值）
     widget.Left  ← 设计值 physX/gScaleFactor（ScaleDPI 放大后 = physX，闭环一致）}
-if (FWindowType in [wtWindow, wtModalForm]) and (gScaleFactor <> 1.0) and
+{if (FWindowType in [wtWindow, wtModalForm]) and (gScaleFactor <> 1.0) and
    (Owner is TfpgWidget) then
 begin
   pm := fpgApplication.Desktop.AvailableGeometry(fpgApplication.Desktop.PrimaryScreen);
@@ -3369,13 +3398,13 @@ begin
     FPosition.X := physX;                          // 物理值：创建后 DoUpdateWindowPosition 直接用
     FPosition.Y := physY;
   end;
-end;
+end;}
 { 位置 clamp（逻辑空间）：对话框居中计算混合空间可能产生偏右下的 FPosition，
   加标题栏后总高超出屏幕 → 底部 OK/Cancel 不可见。收进逻辑屏幕内。
   Y 预留标题栏逻辑高度：优先精确查询主窗口装饰 decH（vp，ETS setMainWindowDec
   上报 → C++ 缓存）。
   尺寸用 widget 实际值（创建时 FSize 可能未同步为 0）。 }
-if (FWindowType in [wtWindow, wtModalForm]) and (gOhosScreenW > 0) then
+{if (FWindowType in [wtWindow, wtModalForm]) and (gOhosScreenW > 0) then
 begin
   if (Owner is TfpgWidget) then
   begin
@@ -3403,7 +3432,7 @@ begin
 	  fpGUI_Hilog(LOG_INFO, format('clamp-after pos=(%d,%d)', [FPosition.X, FPosition.Y]));
     end;
   end;
-end;
+end;}
 opts.left := Round(FPosition.X * gScaleFactorX);   // 原式不变，FPosition 已修正
 opts.top  := Round(FPosition.Y * gScaleFactorY);  
 // 嵌入模式：
@@ -3894,13 +3923,6 @@ begin
   begin
     WakeChannel.Close;
     WakeChannel := nil;
-  end;
-  { Clean up touch event queue }
-  if FEventQueue <> nil then
-  begin
-    for i := 0 to FEventQueue.Count - 1 do
-      Dispose(PfpgOhosTouchEvent(FEventQueue[i]));
-    FEventQueue.Free;
   end;
   { Clean up key event queue }
   if FKeyEventQueue <> nil then
@@ -6677,6 +6699,7 @@ var
   mgr: POH_Drawing_FontMgr;
   cnt, i: Int32;
   fname: PChar;
+  fl: TStringList;
 begin
   Result := TStringList.Create;
   mgr := OH_Drawing_FontMgrCreate;
@@ -6708,6 +6731,17 @@ begin
     if (Pos('SC', Result[i]) > 0) or (Pos('CJK', Result[i]) > 0) or
        (Pos('HarmonyOS', Result[i]) > 0) or (Pos('Noto Sans', Result[i]) > 0) then
       Result.Move(i, 0);
+  end;
+  { 应用字体路径（resfile/filesDir/libs）中的 ttf/ttc 置顶列出：这些字体由
+    TryLoadTypeface 的应用字体分支按文件名（基名）直接加载，列表项即 FontDesc
+    的字体名；与系统家族重名时不重复列出（IndexOf 默认大小写不敏感）。 }
+  fl := OhosScanAppFontNames;
+  try
+    for i := fl.Count - 1 downto 0 do
+      if Result.IndexOf(fl[i]) < 0 then
+        Result.Insert(0, fl[i]);
+  finally
+    fl.Free;
   end;
 end;
 
@@ -7267,6 +7301,8 @@ begin
   m := TfpgOhosDrag(gDragSession.DragRef).GetMimeData;
   if m = nil then Exit;
   sl := m.Formats;
+  { 同 OhosMimeDataToJson：Formats 空时返回 nil（fpg_base.pas:4898）}
+  if sl = nil then Exit;
   try
     for i := 0 to sl.Count - 1 do
     begin
@@ -7453,17 +7489,20 @@ begin
     Result := Result + '],';
   end;
   sl := AMimeData.Formats;
+  Result := Result + '"types":[';
+  { Formats 在 Count=0 时返回 nil（TfpgMimeDataBase.Formats，fpg_base.pas:4898），
+    直接 sl.Count 会 SIGSEGV@0（实测：树未启用 ClipboardFormats 时拖拽即崩）}
+  if sl <> nil then
   try
-    Result := Result + '"types":[';
     for i := 0 to sl.Count - 1 do
     begin
       if i > 0 then Result := Result + ',';
       Result := Result + '"' + OhosJsonEscape(sl[i]) + '"';
     end;
-    Result := Result + ']';
   finally
     sl.Free;
   end;
+  Result := Result + ']';
   Result := Result + '}';
 end;
 
@@ -8242,6 +8281,83 @@ begin
   Result := gAppFontDirs;
 end;
 
+{ 应用字体路径下可用的字体基名列表（*.ttf/*.ttc，去扩展名）：字体选择对话框
+  列出路径字体用（resfile/filesDir/libs）。目录与 OhosFindFontFile 探测路径
+  一致（OhosAppFontDirs 各项 + 各自 fonts/ 子目录）。跳过含 '-' 的名字——
+  FontDesc 的 '-' 是字号分隔符，无法表达，选中也无法加载。 }
+function OhosScanAppFontNames: TStringList;
+var
+  dirs: TStringList;
+  seen: TStringList;
+  d: string;
+  i: Integer;
+
+  procedure ScanOne(const APattern: string);
+  var
+    sr: TSearchRec;
+    base: string;
+  begin
+    if FindFirst(APattern, faAnyFile, sr) = 0 then
+    begin
+      try
+        repeat
+          if (sr.Attr and faDirectory) = 0 then
+          begin
+            base := ChangeFileExt(sr.Name, '');
+            if (base <> '') and (Pos('-', base) = 0) and
+               (Result.IndexOf(base) < 0) then
+              Result.Add(base);
+          end;
+        until FindNext(sr) <> 0;
+      finally
+        FindClose(sr);
+      end;
+    end;
+  end;
+
+begin
+  Result := TStringList.Create;
+  dirs := OhosAppFontDirs;
+  seen := TStringList.Create;
+  try
+    for i := 0 to dirs.Count - 1 do
+    begin
+      d := dirs[i];
+      if seen.IndexOf(d) >= 0 then Continue;
+      seen.Add(d);
+      ScanOne(d + '*.ttf');
+      ScanOne(d + '*.ttc');
+      ScanOne(d + 'fonts' + PathDelim + '*.ttf');
+      ScanOne(d + 'fonts' + PathDelim + '*.ttc');
+    end;
+  finally
+    seen.Free;
+  end;
+end;
+
+{ 大小写不敏感查找单目录内的文件名：精确探测全败后的回退——候选名经
+  TfpgFontDefinition 规范化会改变大小写，混合大小写文件（如
+  HarmonyOS_Sans_SC.ttf）只有经此回退才能被候选名命中。仅回退路径调用，
+  不做缓存（开销可忽略，文件清单实时）。 }
+function OhosFindFileCI(const ADir, AName: string): string;
+var
+  sr: TSearchRec;
+begin
+  Result := '';
+  if AName = '' then Exit;
+  if FindFirst(ADir + '*', faAnyFile, sr) = 0 then
+  begin
+    try
+      repeat
+        if ((sr.Attr and faDirectory) = 0) and SameText(sr.Name, AName) then
+          Exit(ADir + sr.Name);
+      until FindNext(sr) <> 0;
+    finally
+      FindClose(sr);
+    end;
+  end;
+end;
+
 function OhosFindFontFile(const AName: string): string;
 var
   dirs: TStringList;
@@ -8268,6 +8384,19 @@ begin
     begin
       cand := dirs[i] + 'fonts' + PathDelim + AName;
       if OhosFontExists(cand) then
+        Exit(cand);
+    end;
+  end;
+  { 大小写不敏感回退（精确名全败后）：见 OhosFindFileCI 注释 }
+  for i := 0 to dirs.Count - 1 do
+  begin
+    cand := OhosFindFileCI(dirs[i], AName);
+    if cand <> '' then
+      Exit(cand);
+    if Pos(PathDelim, AName) = 0 then
+    begin
+      cand := OhosFindFileCI(dirs[i] + 'fonts' + PathDelim, AName);
+      if cand <> '' then
         Exit(cand);
     end;
   end;

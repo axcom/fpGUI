@@ -56,6 +56,10 @@ type
     FModalResult: TfpgModalResult;
     FParentForm: TfpgBaseForm;
     FWindowPosition: TWindowPosition;
+    { FPG(R2): 本窗体几何已缩放到的 Screen_dpi 值（0=从未缩放）。
+      ScaleDPI 幂等化：同一窗体重复 Show 不再累积缩放（模态对话框复用、
+      重复 Show 曾导致 ×SF 逐次累积、位置越漂越远）。 }
+    FScaleDPIApplied: Integer;
     FWindowTitle: string;
     FSizeable: boolean;
     procedure   SetWindowTitle(const ATitle: string); override;
@@ -72,6 +76,9 @@ type
     function    DoOnHelp(AHelpType: THelpType; AHelpContext: THelpContext; const AHelpKeyword: String; const AHelpFile: String; var AHandled: Boolean): Boolean; virtual;
     procedure   DoKeyShortcut(const AOrigin: TfpgWidget; const keycode: word; const shiftstate: TShiftState; var consumed: boolean; const IsChildOfOrigin: boolean = False); override;
     procedure   DoAllocateWindowHandle; override;
+    { FPG(R1): 按 WindowPosition 居中类模式计算 Left/Top（抽出复用：
+      DoAllocateWindowHandle 创建前 + HandleShow 缩放后各调一次）。 }
+    procedure   ApplyWindowPosition;
     { -- properties -- }
     property    IconName: string read FIconName write FIconName;
     property    Sizeable: boolean read FSizeable write FSizeable;
@@ -277,6 +284,7 @@ constructor TfpgBaseForm.Create(AOwner: TComponent);
 begin
   inherited Create(AOwner);
   FWindowPosition  := wpAuto;
+  FScaleDPIApplied := 0;   // FPG(R2): 尚未做 DPI 缩放
   FWindowTitle     := fpgApplication.AppTitle;
   FIconName        := fpgApplication.AppIcon;
   FSizeable        := True;
@@ -322,7 +330,22 @@ begin
   // do we actually need to do any scaling?
   if AFromDPI = fpgApplication.Screen_dpi then
     Exit; //==>
-  fpg_toolbox.ScaleDPI(self, AFromDPI);
+  { FPG fix: 弹出型窗口（Hint/Shadow 等）在运行时按屏幕坐标定位、尺寸由字体
+    度量得出；若在 Show 时再做 DPI 缩放，位置/尺寸会被二次放大（实测 175%
+    缩放下 Hint 位置 238,228 被放大到 417,399）。与 TfpgPopupWindow（不调用
+    ScaleDPI）保持一致，弹出窗口跳过缩放。 }
+  if WindowAllocated and (Window.WindowType = wtPopup) then
+    Exit; //==>
+  { FPG(R2): 幂等保护——本窗体几何已缩放到当前 Screen_dpi 则不再重复缩放
+    （否则每次 Show 都会再乘一次 SF：模态对话框复用、重复 Show 会累积放大、
+    位置逐次漂移甚至出屏）。若运行中 DPI 发生变化，则从上次 DPI 做增量缩放。 }
+  if FScaleDPIApplied = fpgApplication.Screen_dpi then
+    Exit; //==>
+  if FScaleDPIApplied = 0 then
+    fpg_toolbox.ScaleDPI(self, AFromDPI)
+  else
+    fpg_toolbox.ScaleDPI(self, FScaleDPIApplied);
+  FScaleDPIApplied := fpgApplication.Screen_dpi;
 end;
 
 procedure TfpgBaseForm.Show;
@@ -390,8 +413,20 @@ end;
 
 procedure TfpgBaseForm.HandleShow;
 begin
+  //ScaleDPI; // ← 提前：创建前完成布局缩放（Width 变为放大值）- 修正AGG模式bug
   inherited HandleShow;
-  ScaleDPI;
+  ScaleDPI; //时序：HandleShow → inherited（AllocateWindowHandle → DoAllocateWindowHandle 居中计算）
+  //→ ScaleDPI（fpg_form.pas:391-394）→ 居中计算时 Width 还是设计值（419），而 pm.Width 已是物理/逻辑空间值（3120）：
+  { FPG(R1): 修复"设计尺寸居中 + 随后位置被乘 SF"的混合空间偏移——HiDPI 下
+    DoAllocateWindowHandle 先用设计尺寸对屏幕居中，ScaleDPI 又把 Left/Top 乘
+    SF，导致居中位置二次偏移（175% 实测：640 宽对话框应居中于 1360，实际
+    2800，几乎出屏）。缩放后用最终尺寸按同一公式重新居中。
+    仅在发生了 DPI 缩放的平台生效（OHOS Screen_dpi=96 不触发，其子窗启发式
+    补丁保持原状）；弹窗由运行时定位逻辑负责，跳过。 }
+  if (fpgApplication.Screen_dpi <> fpgApplication.DesignedDPI) and
+     (FWindowPosition in [wpScreenCenter, wpOneThirdDown, wpVirtualScreenCenter, wpMainFormCenter]) and
+     not (WindowAllocated and (Window.WindowType = wtPopup)) then
+    ApplyWindowPosition;
   HandleAlignments(0, 0);
 
   if Assigned(FOnShow) then
@@ -520,12 +555,13 @@ begin
   end;
 end;
 
-procedure TfpgBaseForm.DoAllocateWindowHandle;
+procedure TfpgBaseForm.ApplyWindowPosition;
+{ FPG(R1): 居中类 WindowPosition 的 Left/Top 计算（创建前与缩放后复用）。
+  调用时以当前 Width/Height 与屏幕几何为准；HiDPI 下应在 ScaleDPI 之后调用，
+  此时尺寸/位置均为缩放后的最终值，计算结果与屏幕同空间。 }
 var
   pm: TfpgRect;
 begin
-  { Calculate window position before the native window is created, so that
-    Left/Top flow through to the backend via the UpdatePosition chain. }
   case FWindowPosition of
     wpScreenCenter:
       begin
@@ -553,6 +589,18 @@ begin
         end;
       end;
   end;
+  { 窗口已分配时必须显式应用新位置——Left/Top 的赋值只更新内部
+    状态，不会同步到原生窗口（对比 fpg_toolbox.ScaleDPI 末尾的 UpdatePosition；
+    缺这一步会出现"框架值已居中、物理窗口仍停在缩放后位置"的现象。 }
+  if WindowAllocated then
+    UpdatePosition;
+end;
+
+procedure TfpgBaseForm.DoAllocateWindowHandle;
+begin
+  { Calculate window position before the native window is created, so that
+    Left/Top flow through to the backend via the UpdatePosition chain. }
+  ApplyWindowPosition;
 
   inherited DoAllocateWindowHandle;
   AdjustWindowStyle;

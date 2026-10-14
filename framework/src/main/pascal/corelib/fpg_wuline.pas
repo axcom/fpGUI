@@ -45,8 +45,8 @@ var
   LBack, LNew: TRGBTriple;
   LMinusRatio: Double;
 begin
-  if (X < 0) or (X > TCanvasHack(ACanvas).FWidget.Width - 1) or (Y < 0) or
-     (Y > TCanvasHack(ACanvas).FWidget.Height - 1) then
+  if (X < 0) or (X > TCanvasHack(ACanvas).FWidget.ActualWidth - 1) or (Y < 0) or
+     (Y > TCanvasHack(ACanvas).FWidget.ActualHeight - 1) then
     Exit; // clipping
 
   LMinusRatio := 1 - ARatio;
