@@ -51,6 +51,19 @@ type
     FCacheH: Integer;   // 缓存位图高度
     { 字符 fallback 字体链（缺 glyph 时备用） }
     FFallbackTypefaces: array of POH_Drawing_Typeface;
+    { 离屏专用：96-DPI 逻辑字号字体，只用于度量（宽度/字形步进），
+      保证同一字体在不同导出 DPI 下度量完全一致（与 native 对齐）。}
+    FLogicalFont: POH_Drawing_Font;
+    FLogicalAscent: Integer;
+    FLogicalDescent: Integer;
+    FFakeBold: Boolean;
+    FPointSize: Double;        { 原始 point size（不含任何 DPI 缩放）}
+    FRenderScale: Double;      { 默认 1.0；离屏时 = ADPI/96 }
+    FOffscreen: Boolean;       { False = 原 UI 路径；True = 离屏统一契约 }
+    procedure   EnsureLogicalFont;
+    procedure   RefreshLogicalMetrics;
+    function    MeasureLogicalChar(const ch: string): Single;
+    function    EffectiveSF: Double; inline;   { 唯一的缩放取值点 }
     procedure   RefreshMetrics;
     procedure   BuildFallbackTypefaces;
     function    LoadTypefaceForName(const APathOrFamily: string): POH_Drawing_Typeface;
@@ -72,6 +85,8 @@ type
       AClipX1, AClipY1, AClipX2, AClipY2: Integer); override;
     procedure   SetFontFace(const APathOrFamily: string); override;
     procedure   SetTextSize(APtSize: Integer); override;
+    procedure   SetRenderScale(AValue: Double);
+    property    RenderScale: Double read FRenderScale write SetRenderScale;
   end;
 
 
@@ -260,6 +275,13 @@ begin
     if FIsBold then
       OH_Drawing_FontSetFakeBoldText(FNativeFont, True);
   end;
+  if FLogicalFont <> nil then
+  begin
+    OH_Drawing_FontSetTypeface(FLogicalFont, FNativeTypeface);
+    if FIsBold then
+      OH_Drawing_FontSetFakeBoldText(FLogicalFont, True);
+    RefreshLogicalMetrics;
+  end;
   RefreshMetrics;
   { 失效渲染缓存（位图尺寸依赖新字体的 ascent/descent） }
   FCacheW := 0;
@@ -268,6 +290,93 @@ end;
 
 
 { TfpgOhosAggFontResource }
+
+procedure TfpgOhosAggFontResource.EnsureLogicalFont;
+begin
+  if FLogicalFont <> nil then Exit;
+  FLogicalFont := OH_Drawing_FontCreate();
+  if FLogicalFont = nil then Exit;
+  if FNativeTypeface <> nil then
+    OH_Drawing_FontSetTypeface(FLogicalFont, FNativeTypeface);
+  OH_Drawing_FontSetTextSize(FLogicalFont, Round(FPointSize * 96 / 72));
+  if FFakeBold then
+    OH_Drawing_FontSetFakeBoldText(FLogicalFont, True);
+end;
+
+procedure TfpgOhosAggFontResource.RefreshLogicalMetrics;
+var
+  lm: TOH_Drawing_FontMetrics;
+  lh: Integer;
+begin
+  FLogicalAscent := 0;
+  FLogicalDescent := 0;
+  if (FLogicalFont <> nil) and (FNativeTypeface <> nil) and
+     (OH_Drawing_FontGetMetrics(FLogicalFont, @lm) <> 0) then
+  begin
+    FLogicalAscent := Round(-lm.fAscent);
+    FLogicalDescent := Round(lm.fDescent);
+  end
+  else
+  begin
+    lh := Round(FPointSize * 96 / 72);
+    if lh < 1 then lh := 1;
+    FLogicalAscent := lh * 3 div 4;
+    FLogicalDescent := lh div 4;
+  end;
+end;
+
+function TfpgOhosAggFontResource.MeasureLogicalChar(const ch: string): Single;
+var
+  w: Single;
+begin
+  w := 0;
+  if FLogicalFont <> nil then
+    OH_Drawing_FontMeasureText(FLogicalFont, PChar(ch), Length(ch),
+      TEXT_ENCODING_UTF8, nil, @w);
+  Result := w;
+end;
+
+function TfpgOhosAggFontResource.EffectiveSF: Double; inline;
+begin
+  if FOffscreen and (FRenderScale > 0) then
+    Result := FRenderScale
+  else
+    Result := gHiDPIScaleFactor;
+  if Result <= 0 then
+    Result := 1.0;                 { 仅除零保护；允许 0 < sf < 1 }
+end;
+
+procedure TfpgOhosAggFontResource.SetRenderScale(AValue: Double);
+begin
+  if AValue <= 0 then
+    AValue := 1.0;                 { 允许 72/60 DPI（0.75/0.625）}
+  if FOffscreen and (FRenderScale = AValue) then
+    Exit;
+
+  FRenderScale := AValue;
+  FOffscreen := True;
+
+  { Physical pixel height. Logical metrics = physical / FRenderScale. }
+  FHeight := Round(FPointSize * 96 / 72 * FRenderScale);
+  if FHeight < 1 then FHeight := 1;   { 极小字号兜底 }
+  FAscent := FHeight * 3 div 4;
+  FDescent := FHeight div 4;
+
+  if FNativeFont <> nil then
+    OH_Drawing_FontSetTextSize(FNativeFont, FHeight);
+
+  { 离屏度量字体：固定 96-DPI 逻辑字号，跨 DPI 度量保持一致 }
+  EnsureLogicalFont;
+  if FLogicalFont <> nil then
+    OH_Drawing_FontSetTextSize(FLogicalFont, Round(FPointSize * 96 / 72));
+  RefreshLogicalMetrics;
+
+  { Invalidate the text cache; next DrawTextToBuffer will rebuild it. }
+  FCacheW := 0;
+  FCacheH := 0;
+
+  RefreshMetrics;
+end;
 
 constructor TfpgOhosAggFontResource.Create(const AFontDesc: string);
 var
@@ -284,8 +393,15 @@ begin
       returns the logical value the layout engine expects.
       NOTE: the old '160/96 * gZoomScale' term was an Android-dpi leftover
       that made fonts ~12% smaller than the design height. }
+    FPointSize := fd.Size;
+    FRenderScale := 1.0;
+    FOffscreen := False;
     FHeight := Round(fd.Size * 96 / 72 * gScaleFactor * gHiDPIScaleFactor);
     FIsBold := fpgFontBold in fd.Attributes;
+    FFakeBold := FIsBold and (Pos('FontMgr:', dummy) = 0);
+    FLogicalFont := nil;
+    FLogicalAscent := 0;
+    FLogicalDescent := 0;
 
     FNativeTypeface := TryLoadTypeface(dummy, fpgFontBold in fd.Attributes,
       fpgFontItalic in fd.Attributes, fd.FaceName);
@@ -296,7 +412,7 @@ begin
         OH_Drawing_FontSetTypeface(FNativeFont, FNativeTypeface);
       OH_Drawing_FontSetTextSize(FNativeFont, FHeight);
       { 合成粗体：系统无独立 Bold 文件；FontMgr 命中真实粗体 style 时不叠加 }
-      if FIsBold and (Pos('FontMgr:', dummy) = 0) then
+      if FFakeBold then
         OH_Drawing_FontSetFakeBoldText(FNativeFont, True);
     end;
 
@@ -333,6 +449,8 @@ begin
     OH_Drawing_CanvasDestroy(FCacheCanvas);
   if FCacheBmp <> nil then
     OH_Drawing_BitmapDestroy(FCacheBmp);
+  if FLogicalFont <> nil then
+    OH_Drawing_FontDestroy(FLogicalFont);
   if FNativeFont <> nil then
     OH_Drawing_FontDestroy(FNativeFont);
   if FNativeTypeface <> nil then
@@ -405,11 +523,17 @@ function TfpgOhosAggFontResource.GetAscent: integer;
 var
   sf: Double;
 begin
+  if FOffscreen then
+  begin
+    { 逻辑字体（96 DPI）的度量，跨导出 DPI 完全一致 }
+    Result := FLogicalAscent;
+    Exit;
+  end;
   Result := FAscent;
   { Convert from physical px to logical Agg2D coordinates.
     The Agg2D canvas applies gHiDPIScaleFactor to logical→physical,
     so GetAscent must return logical units to match. }
-  sf := gHiDPIScaleFactor;
+  sf := EffectiveSF;
   if sf <> 1.0 then
     Result := Round(FAscent / sf);
 end;
@@ -418,7 +542,12 @@ function TfpgOhosAggFontResource.GetDescent: integer;
 var
   sf: Double;
 begin
-  sf := gHiDPIScaleFactor;
+  if FOffscreen then
+  begin
+    Result := FLogicalDescent;
+    Exit;
+  end;
+  sf := EffectiveSF;
   if sf <> 1.0 then
     Result := Round(FDescent / sf)
   else
@@ -427,10 +556,16 @@ end;
 
 function TfpgOhosAggFontResource.GetHeight: integer;
 begin
-  if FMetricsValid then
+  if FOffscreen then
+  begin
+    { 与 native 一致：设计高度（pt*96/72），不随导出 DPI 抖动 }
+    Result := Round(FPointSize * 96 / 72);
+    if Result < 1 then Result := 1;
+  end
+  else if FMetricsValid then
     Result := GetAscent + GetDescent
   else
-    Result := Round(FHeight / gHiDPIScaleFactor);
+    Result := Round(FHeight / EffectiveSF);
 //fpGUI_Hilog(LOG_WARN, 'GetHeight=' + IntToStr(Result) + ' gHiDPI=' + FloatToStr(gHiDPIScaleFactor) + ' FHeight=' + IntToStr(FHeight));
 end;
 
@@ -443,8 +578,7 @@ var
   sf: Double;
 begin
   if txt = '' then Exit(0);
-  sf := gHiDPIScaleFactor;
-  if sf < 1.0 then sf := 1.0;
+  sf := EffectiveSF;
   { 逐字符 Round 累加（物理宽 ÷sf 取整后累加）：与渲染步进
     （DrawTextToBuffer 内 Round(chW/sf)*sf）及 fpg_edit 光标/滚动
     定位口径一致，避免整串测量与逐字符定位的累计偏差。 }
@@ -458,17 +592,29 @@ begin
     ch := Copy(txt, i, clen);
 
     textWidth := 0;
-    if FNativeFont <> nil then
+    if FOffscreen then
     begin
-      ret := OH_Drawing_FontMeasureText(FNativeFont, PChar(ch), Length(ch),
-        TEXT_ENCODING_UTF8, nil, @textWidth);
-      if (ret <> 0) or (textWidth <= 0) then
-        textWidth := FHeight * 3 div 5;
+      { 用逻辑字体度量：不同导出 DPI 下结果完全一致；
+        绘制步进为 Round(chW)*sf，除以 sf 后与本累加严格相等。 }
+      textWidth := MeasureLogicalChar(ch);
+      if textWidth <= 0 then
+        textWidth := Round(FPointSize * 96 / 72) * 3 div 5;
+      total := total + Round(textWidth);
     end
     else
-      textWidth := FHeight * 3 div 5;
+    begin
+      if FNativeFont <> nil then
+      begin
+        ret := OH_Drawing_FontMeasureText(FNativeFont, PChar(ch), Length(ch),
+          TEXT_ENCODING_UTF8, nil, @textWidth);
+        if (ret <> 0) or (textWidth <= 0) then
+          textWidth := FHeight * 3 div 5;
+      end
+      else
+        textWidth := FHeight * 3 div 5;
 
-    total := total + Round(textWidth / sf);
+      total := total + Round(textWidth / sf);
+    end;
     Inc(i, clen);
   end;
   Result := total;
@@ -505,8 +651,7 @@ begin
     but the Agg2D canvas uses gHiDPIScaleFactor (= gFontScaleX = dpi/96)
     for coordinate transformation. These differ on OHOS because the window
     creation also uses gFontScaleX (see DoAllocateWindowHandle). }
-  sf := gHiDPIScaleFactor;
-  if sf < 1.0 then sf := 1.0;
+  sf := EffectiveSF;
   physX   := Round(AX * sf);
   physY   := Round(AY * sf);
   physCX1 := Round(AClipX1 * sf);
@@ -525,10 +670,20 @@ begin
     if clen < 1 then clen := 1;
     if i + clen - 1 > Length(AText) then clen := Length(AText) - i + 1;
     ch := Copy(AText, i, clen);
-    chW := 0;
-    OH_Drawing_FontMeasureText(FNativeFont, PChar(ch), Length(ch),
-      TEXT_ENCODING_UTF8, nil, @chW);
-    textW := textW + chW;
+    if FOffscreen then
+    begin
+      chW := MeasureLogicalChar(ch);
+      if chW <= 0 then
+        chW := Round(FPointSize * 96 / 72) * 0.6;
+      textW := textW + Round(chW) * sf;
+    end
+    else
+    begin
+      chW := 0;
+      OH_Drawing_FontMeasureText(FNativeFont, PChar(ch), Length(ch),
+        TEXT_ENCODING_UTF8, nil, @chW);
+      textW := textW + chW;
+    end;
     Inc(i, clen);
   end;
   if (textW <= 0) then
@@ -598,12 +753,17 @@ begin
       end;
 
       chW := 0;
-      OH_Drawing_FontMeasureText(FNativeFont, PChar(ch), Length(ch),
-        TEXT_ENCODING_UTF8, nil, @chW);
-      { Step in physical pixels by the logical per-char width (rounded),
-        exactly matching fpGUI's caret math: it accumulates
-        Round(measure_phys / sf) per char, then the canvas scales by sf. }
-      curX := curX + Round(chW / sf) * sf;
+      if FOffscreen then
+        chW := MeasureLogicalChar(ch)
+      else
+        OH_Drawing_FontMeasureText(FNativeFont, PChar(ch), Length(ch),
+          TEXT_ENCODING_UTF8, nil, @chW);
+      { Step in physical pixels. Offscreen uses the logical width (integer),
+        exactly matching GetTextWidth (sum of Round(chWlogical)). }
+      if FOffscreen then
+        curX := curX + Round(chW) * sf
+      else
+        curX := curX + Round(chW / sf) * sf;
       Inc(i, clen);
     end;
 
@@ -744,8 +904,7 @@ begin
     Exit;
   end;
 
-  sf := gHiDPIScaleFactor;
-  if sf < 1.0 then sf := 1.0;
+  sf := EffectiveSF;
   { B = 文字块基线起点（缓存内基点）；P = AGG 锚点（旋转中心，
     与桌面引擎 T(-x,-y)·R(θ)·T(x,y) 的 (x,y) 一致）。 }
   physBX := Round(AX * sf);
@@ -779,9 +938,19 @@ begin
     if i + clen - 1 > Length(AText) then clen := Length(AText) - i + 1;
     ch := Copy(AText, i, clen);
     chW := 0;
-    OH_Drawing_FontMeasureText(FNativeFont, PChar(ch), Length(ch),
-      TEXT_ENCODING_UTF8, nil, @chW);
-    textW := textW + chW;
+    if FOffscreen then
+    begin
+      chW := MeasureLogicalChar(ch);
+      if chW <= 0 then
+        chW := Round(FPointSize * 96 / 72) * 0.6;
+      textW := textW + Round(chW) * sf;
+    end
+    else
+    begin
+      OH_Drawing_FontMeasureText(FNativeFont, PChar(ch), Length(ch),
+        TEXT_ENCODING_UTF8, nil, @chW);
+      textW := textW + chW;
+    end;
     Inc(i, clen);
   end;
   if textW <= 0 then textW := Length(AText) * FHeight * 0.6;
@@ -870,9 +1039,15 @@ begin
     end;
 
     chW := 0;
-    OH_Drawing_FontMeasureText(FNativeFont, PChar(ch), Length(ch),
-      TEXT_ENCODING_UTF8, nil, @chW);
-    curX := curX + Round(chW / sf) * sf;
+    if FOffscreen then
+      chW := MeasureLogicalChar(ch)
+    else
+      OH_Drawing_FontMeasureText(FNativeFont, PChar(ch), Length(ch),
+        TEXT_ENCODING_UTF8, nil, @chW);
+    if FOffscreen then
+      curX := curX + Round(chW) * sf
+    else
+      curX := curX + Round(chW / sf) * sf;
     Inc(i, clen);
   end;
 
@@ -992,8 +1167,22 @@ begin
     physical px = logical * gScaleFactor * gHiDPIScaleFactor.
     This mirrors what FreeType/WinFonts paths do via m_fontEngine.height_()
     and keeps FHeight, FAscent, FDescent in sync with the new native font size. }
-  physH := Round(APtSize * 96 / 72 * gScaleFactor * gHiDPIScaleFactor);
+  FPointSize := APtSize;
+  if FOffscreen then
+    physH := Round(FPointSize * 96 / 72 * FRenderScale)
+  else
+    physH := Round(FPointSize * 96 / 72 * gScaleFactor * gHiDPIScaleFactor);
   if physH < 6 then physH := 6;
+
+  { 逻辑度量字体随 point size 更新（离屏才存在） }
+  if FOffscreen then
+  begin
+    EnsureLogicalFont;
+    if FLogicalFont <> nil then
+      OH_Drawing_FontSetTextSize(FLogicalFont, Round(FPointSize * 96 / 72));
+    RefreshLogicalMetrics;
+  end;
+
   if physH = FHeight then Exit;   { no-op if already at this size }
 
   FHeight := physH;

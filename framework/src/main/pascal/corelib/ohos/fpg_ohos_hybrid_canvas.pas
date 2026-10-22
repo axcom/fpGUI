@@ -243,7 +243,7 @@ begin
   if winRect.Height < 1 then winRect.Height := 300;
 
   scale := gHiDPIScaleFactor;
-  if scale < 1.0 then scale := 1.0;
+  if scale <= 0 then scale := 1.0;
 
   { 用窗口实际物理尺寸（resize 反馈更新）作分配依据：GetClientRect 在反馈
     处理后可能滞后 → AllocW/H 偏小 → buffer 停在旧尺寸 → 窗口拖大后扩大部分

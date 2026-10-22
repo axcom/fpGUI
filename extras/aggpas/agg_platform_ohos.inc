@@ -43,76 +43,32 @@ type
 
 
 { Resolve an Agg2D font request ('times.ttf' etc.) to a readable file path
-  on OHOS. Probe order: as-given (absolute or cwd-relative), the system
-  fonts directory, the HAP bundle libs directories (all ABI layouts), the
-  app sandbox files directories, and the HAP 'resfile' directories (their
-  contents are decompressed into the sandbox at install time, e.g.
-  /data/storage/el1/bundle/<moduleName>/resources/resfile/). Returns
-  AFileName unchanged when no candidate matched. }
+  on OHOS. Delegates to the fpGUI canonical resolver (same policy as
+  fpg_ohos.pas and fpg_ohos_agg_fontresource.pas):
+
+    - probes CWD, Context.resourceDir (resfile), Context.filesDir(+fonts)
+      and bundleCodeDir/libs/<abi>(+fonts);
+    - exact match, then a 'fonts/' sub-directory, then case-insensitive
+      fallback;
+    - absolute paths are probed as given.
+
+  System font directories are intentionally NOT probed by bare name
+  (fpGUI reaches system fonts through FontMgr); passing an absolute
+  /system/fonts/... path still works. Cross-module resfile scanning was
+  removed: maps are installed under the ability module's resourceDir.
+
+  Returns AFileName unchanged when nothing matched, so the caller can
+  keep its FileExists() check and fall back to the canvas font. }
 function OhosResolveAggFontFile(const AFileName: string): string;
-const
-  OhosAggFontProbeDirs: array[0..11-5] of string = (
-    '',
-    '/system/fonts/',
-//    '/data/storage/el1/bundle/libs/x86_64/',
-//    '/data/storage/el1/bundle/libs/arm64-v8a/',
-//    '/data/storage/el1/bundle/libs/arm64/',
-    '/data/storage/el2/base/files/',
-    '/data/storage/el2/base/haps/entry/files/',
-//    '/data/storage/el1/bundle/fp_bridge/resources/resfile/',
-//    '/data/storage/el1/bundle/fp_bridge/resources/resfile/fonts/',
-    '/data/storage/el1/bundle/entry/resources/resfile/',
-    '/data/storage/el1/bundle/entry/resources/resfile/fonts/',
-    '/data/storage/el1/bundle/resources/resfile/'
-  );
 var
-  lName: string;
-  i: Integer;
-  lCand: string;
-  lRes: TSearchRec;
-  lBase: string;
+  p: string;
 begin
   Result := AFileName;
   if AFileName = '' then
     Exit;
-  lName := ExtractFileName(AFileName);
-  if lName = '' then
-    Exit;
-  for i := Low(OhosAggFontProbeDirs) to High(OhosAggFontProbeDirs) do
-  begin
-    lCand := OhosAggFontProbeDirs[i] + lName;
-    if FileExists(lCand) then
-    begin
-      Result := lCand;
-      Exit;
-    end;
-  end;
-  { Module name is not known at compile time: scan the bundle sandbox for
-    '<module>/resources/resfile[/fonts]/<name>' as well. }
-  if FindFirst('/data/storage/el1/bundle/*', faDirectory, lRes) = 0 then
-  begin
-    try
-      repeat
-        if (lRes.Name <> '.') and (lRes.Name <> '..') and
-           ((lRes.Attr and faDirectory) <> 0) then
-        begin
-          lBase := '/data/storage/el1/bundle/' + lRes.Name + '/resources/resfile/';
-          if FileExists(lBase + lName) then
-          begin
-            Result := lBase + lName;
-            Exit;
-          end;
-          if FileExists(lBase + 'fonts/' + lName) then
-          begin
-            Result := lBase + 'fonts/' + lName;
-            Exit;
-          end;
-        end;
-      until FindNext(lRes) <> 0;
-    finally
-      FindClose(lRes);
-    end;
-  end;
+  p := OhosFindFontFile(AFileName);
+  if p <> '' then
+    Result := p;
 end;
 
 
@@ -246,7 +202,7 @@ begin
     is in physical pixels). gHiDPIScaleFactor is set from gScaleFactorX
     in ohos_set_screen_size. }
   scale := gHiDPIScaleFactor;
-  if scale < 1.0 then
+  if scale <= 0 then
     scale := 1.0;
   physX := Round(x * scale);
   physY := Round(y * scale);

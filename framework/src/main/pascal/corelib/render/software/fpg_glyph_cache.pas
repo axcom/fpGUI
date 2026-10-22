@@ -207,7 +207,7 @@ end;
 
 procedure TGlyphCache.SetScale(AValue: Double);
 begin
-  if AValue < 1.0 then
+  if AValue <= 0 then
     AValue := 1.0;
   if FScale = AValue then
     Exit;

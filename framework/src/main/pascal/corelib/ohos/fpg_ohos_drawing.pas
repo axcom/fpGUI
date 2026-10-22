@@ -73,7 +73,7 @@ type
   POH_Drawing_TextBlob = type Pointer;
   POH_Drawing_Matrix = type Pointer;
   POH_Drawing_Image = type Pointer;
-  POH_Drawing_Image_Info = type Pointer;
+  POH_Drawing_Image_Info = ^TOH_Drawing_Image_Info;
   POH_Drawing_SamplingOptions = type Pointer;
   POH_Drawing_PixelMap = type Pointer;
   POH_Drawing_Typeface = type Pointer;
@@ -99,6 +99,15 @@ type
     ALPHA_FORMAT_PREMUL,
     ALPHA_FORMAT_UNPREMUL
   );
+
+  { Matches OH_Drawing_Image_Info (drawing_types.h):
+    width, height, colorType, alphaType (each 4 bytes, C layout). }
+  TOH_Drawing_Image_Info = record
+    width: Int32;
+    height: Int32;
+    colorType: TOH_Drawing_ColorFormat;
+    alphaType: TOH_Drawing_AlphaFormat;
+  end;
 
   TOH_Drawing_BitmapFormat = record
     colorFormat: TOH_Drawing_ColorFormat;
@@ -203,6 +212,10 @@ function OH_Drawing_BitmapGetPixels(bitmap: POH_Drawing_Bitmap): Pointer; cdecl;
 function OH_Drawing_BitmapGetWidth(bitmap: POH_Drawing_Bitmap): UInt32; cdecl; external LIB_DRAWING;
 function OH_Drawing_BitmapGetHeight(bitmap: POH_Drawing_Bitmap): UInt32; cdecl; external LIB_DRAWING;
 function OH_Drawing_BitmapGetRowBytes(bitmap: POH_Drawing_Bitmap): UInt32; cdecl; external LIB_DRAWING;
+{ API 12: reads pixels (supports stride and GPU-backed bitmaps). }
+function OH_Drawing_BitmapReadPixels(bitmap: POH_Drawing_Bitmap;
+  const dstInfo: POH_Drawing_Image_Info; dstPixels: Pointer;
+  dstRowBytes: PtrUInt; srcX, srcY: Int32): Boolean; cdecl; external LIB_DRAWING;
 
 { Pen API }
 function OH_Drawing_PenCreate: POH_Drawing_Pen; cdecl; external LIB_DRAWING;

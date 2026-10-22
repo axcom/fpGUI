@@ -248,7 +248,7 @@ begin
   end;
 *)
   scale := gHiDPIScaleFactor;
-  if scale < 1.0 then scale := 1.0;
+  if scale <= 0 then scale := 1.0;
   physX := Round(x * scale);
   physY := Round(y * scale);
   physW := Round(w * scale);

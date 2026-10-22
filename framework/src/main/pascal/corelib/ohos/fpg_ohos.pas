@@ -98,6 +98,9 @@ type
     FMetrics: TOH_Drawing_FontMetrics;
     FFallbackTypefaces: array of POH_Drawing_Typeface;  { CJK 兜底 + emoji }
     FFallbackFonts: array of POH_Drawing_Font;          { 平行于 typefaces（同 FHeight）}
+    FPointSize: Double;        { 原始 point size（不含任何 DPI 缩放）}
+    FRenderScale: Double;      { 默认 1.0；离屏时 = ADPI/96 }
+    FOffscreen: Boolean;       { False = 原 UI 路径；True = 离屏统一契约 }
     procedure   BuildFallbackChain;       { 探测构建 fallback 字体链 }
     function    ResolveFallbackWidth(const ch: string; var AWidth: Single): Boolean;
     function    ResolveFallbackFont(const ch: string;
@@ -111,6 +114,8 @@ type
     function  GetHeight: Integer; override;
     function  GetTextWidth(const txt: string): Integer; override;
     function  HandleIsValid: boolean; override;
+    procedure SetRenderScale(AValue: Double);
+    property  RenderScale: Double read FRenderScale write SetRenderScale;
     property  NativeFont: POH_Drawing_Font read FNativeFont;
     property  IsBold: Boolean read FIsBold;
     property  IsItalic: Boolean read FIsItalic;
@@ -199,6 +204,11 @@ type
     { 首帧已上屏标志：第一次 DoPutBufferToScreen 成功 FlushBuffer 后置位，
       并向 ETS 发 NATIVE_CMD_FIRST_FRAME 打开 XComponent 显示门（防黑屏闪现）}
     FFirstFrameSent: Boolean;
+    { 离屏模式（frfpg 报表导出）：尺寸只存物理请求值，逻辑尺寸/尺度由 DPI 派生 }
+    FOffscreen: Boolean;
+    FOffscreenWidth: Integer;    // physical pixels (requested)
+    FOffscreenHeight: Integer;   // physical pixels (requested)
+    FOffscreenDPI: Integer;      // ADPI; scale = DPI / 96
     procedure   DoSetFontRes(fntres: TfpgFontResourceBase); override;
     procedure   DoSetTextColor(cl: TfpgColor); override;
     procedure   DoSetColor(cl: TfpgColor); override;
@@ -216,6 +226,11 @@ type
     function    DoGetClipRect: TfpgRect; override;
     procedure   DoAddClipRect(const ARect: TfpgRect); override;
     procedure   DoClearClipRect; override;
+    procedure   DoGetWinRect(out r: TfpgRect); override;
+    function    OffscreenScale: Single; inline;
+    function    OffscreenLogicalRect: TfpgRect;
+    function    ScaleX: Single; inline;
+    function    ScaleY: Single; inline;
     procedure   DoBeginDraw(awidget: TfpgWidgetBase; CanvasTarget: TfpgCanvasBase); override;
     procedure   DoPutBufferToScreen(x, y, w, h: TfpgCoord); override;
     procedure   DoEndDraw; override;
@@ -230,6 +245,10 @@ type
     function    GetBitmapWidth: Integer;
     function    GetBitmapHeight: Integer;
     function    GetBitmapPixels: Pointer;
+    procedure   CreateOffscreen(AWidth, AHeight, ADPI: Integer);
+    procedure   ReleaseOffscreen;
+    procedure   ReadPixelsBGRA(ADest: PByte; ADestStride: Integer;
+      AUnpremultiply: Boolean = True);
     procedure   DrawString(x, y: TfpgCoord; const txt: string); override;
     procedure   CopyRect(ADest_x, ADest_y: TfpgCoord; ASrcCanvas: TfpgCanvasBase; var ASrcRect: TfpgRect); override;
     procedure   GradientFill(ARect: TfpgRect; AStart, AStop: TfpgColor; ADirection: TGradientDirection); override;
@@ -1672,6 +1691,33 @@ begin
   end;
 end;
 
+procedure TfpgOhosFontResource.SetRenderScale(AValue: Double);
+var
+  i: Integer;
+begin
+  if AValue <= 0 then
+    AValue := 1.0;                 { 允许 72/60 DPI（0.75/0.625）}
+  if FOffscreen and (FRenderScale = AValue) then
+    Exit;
+
+  FRenderScale := AValue;
+  FOffscreen := True;
+
+  { Native text is rendered through the OHOS canvas transform. Keep the
+    native font at 96-DPI logical size; CanvasScale=ADPI/96 maps it to
+    physical pixels. Metrics therefore stay logical. }
+  FHeight := Round(FPointSize * 96 / 72);
+
+  if FNativeFont <> nil then
+    OH_Drawing_FontSetTextSize(FNativeFont, FHeight);
+
+  for i := 0 to High(FFallbackFonts) do
+    if FFallbackFonts[i] <> nil then
+      OH_Drawing_FontSetTextSize(FFallbackFonts[i], FHeight);
+
+  RefreshMetrics;
+end;
+
 constructor TfpgOhosFontResource.Create(const afontdesc: string);
 var
   fd: TfpgFontDefinition;
@@ -1682,6 +1728,9 @@ begin
   try
     { Font height in LOGICAL units. Canvas has CanvasScale(gScaleFactor)
       applied, so the font renders at fd.Size * gScaleFactor physical pixels. }
+    FPointSize := fd.Size;
+    FRenderScale := 1.0;
+    FOffscreen := False;
     FHeight := Round(fd.Size * 96 / 72 * gScaleFactor);
     //FHeight := fd.Size;
     FIsBold := fpgFontBold in fd.Attributes;
@@ -2017,6 +2066,207 @@ end;
   TfpgOhosCanvas
   --------------------------------------------------------------------- }
 
+function TfpgOhosCanvas.OffscreenScale: Single; inline;
+begin
+  if FOffscreenDPI > 0 then
+    Result := FOffscreenDPI / 96
+  else
+    Result := 1.0;
+end;
+
+function TfpgOhosCanvas.OffscreenLogicalRect: TfpgRect;
+begin
+  { Integer ceil, not Round: the caller computes WPhys=Round(WLog*s), so
+    dividing back can lose 1px (e.g. 100*0.625 -> 62 -> 62/0.625 = 99.2).
+    A slightly larger logical rect is harmless (canvas still clips to bitmap). }
+  if FOffscreenDPI > 0 then
+    Result.SetRect(0, 0,
+      (FOffscreenWidth * 96 + FOffscreenDPI - 1) div FOffscreenDPI,
+      (FOffscreenHeight * 96 + FOffscreenDPI - 1) div FOffscreenDPI)
+  else
+    Result.SetRect(0, 0, FOffscreenWidth, FOffscreenHeight);
+end;
+
+function TfpgOhosCanvas.ScaleX: Single; inline;
+begin
+  if FOffscreen then
+    Result := OffscreenScale
+  else
+    Result := gScaleFactorX;
+end;
+
+function TfpgOhosCanvas.ScaleY: Single; inline;
+begin
+  if FOffscreen then
+    Result := OffscreenScale
+  else
+    Result := gScaleFactorY;
+end;
+
+procedure TfpgOhosCanvas.CreateOffscreen(AWidth, AHeight, ADPI: Integer);
+var
+  fmt: TOH_Drawing_BitmapFormat;
+  scale: Single;
+begin
+  if FSaveCount <> 0 then
+    raise Exception.Create('TfpgOhosCanvas.CreateOffscreen: canvas is in use');
+
+  if AWidth < 1 then AWidth := 1;
+  if AHeight < 1 then AHeight := 1;
+  if ADPI < 1 then ADPI := 96;
+  scale := ADPI / 96;
+
+  { Recreate both objects: guarantees a clean matrix/clip/save state. }
+  if FCanvas <> nil then
+  begin
+    OH_Drawing_CanvasDestroy(FCanvas);
+    FCanvas := nil;
+  end;
+  if FBitmap <> nil then
+  begin
+    OH_Drawing_BitmapDestroy(FBitmap);
+    FBitmap := nil;
+  end;
+
+  FCanvas := OH_Drawing_CanvasCreate();
+  FBitmap := OH_Drawing_BitmapCreate();
+  if (FCanvas = nil) or (FBitmap = nil) then
+    raise Exception.Create('TfpgOhosCanvas.CreateOffscreen: allocation failed');
+
+  fmt.colorFormat := COLOR_FORMAT_RGBA_8888;
+  fmt.alphaFormat := ALPHA_FORMAT_PREMUL;
+  OH_Drawing_BitmapBuild(FBitmap, AWidth, AHeight, @fmt);
+  OH_Drawing_CanvasBind(FCanvas, FBitmap);
+
+  { Logical coordinate system: same as 96-DPI design coordinates.
+    CanvasScale maps logical -> physical; matches font RenderScale. }
+  OH_Drawing_CanvasScale(FCanvas, scale, scale);
+  OH_Drawing_CanvasClear(FCanvas, $00000000);
+
+  FOffscreenWidth := AWidth;
+  FOffscreenHeight := AHeight;
+  FOffscreenDPI := ADPI;
+  FOffscreen := True;
+  FClipDepth := 0;
+  { Keep "unassigned": the base BeginDraw then goes through ClearClipRect
+    (offscreen branch) instead of dereferencing FWidget. }
+  FClipRect.Clear;
+  FDeltaX := 0;
+  FDeltaY := 0;
+end;
+
+procedure TfpgOhosCanvas.ReleaseOffscreen;
+begin
+  if not FOffscreen then
+    Exit;
+
+  FOffscreen := False;
+  FOffscreenWidth := 0;
+  FOffscreenHeight := 0;
+  FOffscreenDPI := 0;
+
+  if FCanvas <> nil then
+  begin
+    OH_Drawing_CanvasDestroy(FCanvas);
+    FCanvas := nil;
+  end;
+  if FBitmap <> nil then
+  begin
+    OH_Drawing_BitmapDestroy(FBitmap);
+    FBitmap := nil;
+  end;
+
+  FClipDepth := 0;
+  FClipRect.Clear;
+end;
+
+procedure TfpgOhosCanvas.ReadPixelsBGRA(ADest: PByte; ADestStride: Integer;
+  AUnpremultiply: Boolean);
+var
+  Info: TOH_Drawing_Image_Info;
+  Tmp: array of Byte;
+  TmpStride, BmpW, BmpH, x, y: Integer;
+  Src, SRow, DRow: PByte;
+  R, G, B, A: Byte;
+  RR, GG, BB: Cardinal;
+  SrcIsUnpremul: Boolean;
+
+  procedure CopyRow(S: PByte; D: PByte; ACount: Integer);
+  var
+    i: Integer;
+  begin
+    for i := 0 to ACount - 1 do
+    begin
+      R := S[0];
+      G := S[1];
+      B := S[2];
+      A := S[3];
+
+      if A = 0 then
+      begin
+        R := 0;
+        G := 0;
+        B := 0;
+      end
+      else if (not SrcIsUnpremul) and AUnpremultiply and (A < 255) then
+      begin
+        RR := (Cardinal(R) * 255 + A div 2) div A;
+        GG := (Cardinal(G) * 255 + A div 2) div A;
+        BB := (Cardinal(B) * 255 + A div 2) div A;
+        if RR > 255 then RR := 255;
+        if GG > 255 then GG := 255;
+        if BB > 255 then BB := 255;
+        R := Byte(RR);
+        G := Byte(GG);
+        B := Byte(BB);
+      end;
+
+      { RGBA_8888 -> fpGUI/TfpgImage BGRA byte order. }
+      D[0] := B;
+      D[1] := G;
+      D[2] := R;
+      D[3] := A;
+
+      Inc(S, 4);
+      Inc(D, 4);
+    end;
+  end;
+
+begin
+  if (ADest = nil) or (FBitmap = nil) then
+    Exit;
+
+  BmpW := Integer(OH_Drawing_BitmapGetWidth(FBitmap));
+  BmpH := Integer(OH_Drawing_BitmapGetHeight(FBitmap));
+  if (BmpW <= 0) or (BmpH <= 0) then
+    Exit;
+
+  if ADestStride = 0 then
+    ADestStride := BmpW * 4;
+
+  SrcIsUnpremul := True;
+  TmpStride := BmpW * 4;
+  SetLength(Tmp, TmpStride * BmpH);
+  Info.width := BmpW;
+  Info.height := BmpH;
+  Info.colorType := COLOR_FORMAT_RGBA_8888;
+  Info.alphaType := ALPHA_FORMAT_UNPREMUL;
+
+  { Path 1 only: OH_Drawing_BitmapReadPixels (API 12) handles stride and
+    GPU-backed bitmaps. GetPixels+GetRowBytes is NOT used (GetRowBytes is
+    API 26 and our compatible SDK is 20). }
+  if not OH_Drawing_BitmapReadPixels(FBitmap, @Info, @Tmp[0], TmpStride, 0, 0) then
+    Exit;
+  Src := @Tmp[0];
+
+  for y := 0 to BmpH - 1 do
+  begin
+    SRow := Src + y * TmpStride;
+    DRow := ADest + y * ADestStride;
+    CopyRow(SRow, DRow, BmpW);
+  end;
+end;
+
 constructor TfpgOhosCanvas.Create(awidget: TfpgWidgetBase);
 begin
   inherited Create(awidget);
@@ -2032,6 +2282,12 @@ begin
   FColorValue := $FF000000;
   FBaseChildSaveCount := 0;
   FHasChildPainted := False;
+  FOffscreen := False;
+  FOffscreenWidth := 0;
+  FOffscreenHeight := 0;
+  FOffscreenDPI := 0;
+  FDeltaX := 0;
+  FDeltaY := 0;
 end;
 
 
@@ -2168,10 +2424,10 @@ begin
   stride := bw * 4;
 
   { Logical rect (incl. canvas offset) → physical bitmap pixels. }
-  x0 := Round((x + FDeltaX) * gScaleFactorX);
-  y0 := Round((y + FDeltaY) * gScaleFactorY);
-  x1 := Round((x + FDeltaX + w) * gScaleFactorX) - 1;
-  y1 := Round((y + FDeltaY + h) * gScaleFactorY) - 1;
+  x0 := Round((x + FDeltaX) * ScaleX);
+  y0 := Round((y + FDeltaY) * ScaleY);
+  x1 := Round((x + FDeltaX + w) * ScaleX) - 1;
+  y1 := Round((y + FDeltaY + h) * ScaleY) - 1;
   if x0 < 0 then x0 := 0;
   if y0 < 0 then y0 := 0;
   if x1 >= Integer(bw) then x1 := Integer(bw) - 1;
@@ -2442,7 +2698,10 @@ begin
     their parent, and for tab labels that exceed the control width). }
   native := ARect;
   native.OffsetRect(FDeltaX, FDeltaY);
-  wRect := GetWidgetWindowRect;
+  if FOffscreen then
+    wRect := OffscreenLogicalRect
+  else
+    wRect := GetWidgetWindowRect;
   native.IntersectRect(native, wRect);
   { SetClipRect = REPLACE semantics: drop any active clip saves first }
   if FClipDepth > 0 then
@@ -2487,8 +2746,19 @@ begin
   { Match X11 behavior: ClearClipRect resets clip to widget bounds
     instead of removing all clipping. This prevents tab labels and
     other child drawings from overflowing beyond the control area. }
-  r.SetRect(0, 0, FWidget.ActualWidth, FWidget.ActualHeight);
+  if FOffscreen then
+    r := OffscreenLogicalRect
+  else
+    r.SetRect(0, 0, FWidget.ActualWidth, FWidget.ActualHeight);
   DoSetClipRectInternal(r);
+end;
+
+procedure TfpgOhosCanvas.DoGetWinRect(out r: TfpgRect);
+begin
+  if FOffscreen then
+    r := OffscreenLogicalRect
+  else
+    inherited DoGetWinRect(r);
 end;
 
 procedure TfpgOhosCanvas.DoBeginDraw(awidget: TfpgWidgetBase; CanvasTarget: TfpgCanvasBase);
@@ -2500,6 +2770,13 @@ var
   ohosTarget: TfpgOhosCanvas;
   curW,curH,needW,needH: integer;
 begin
+  if FOffscreen then
+  begin
+    if FBitmap = nil then
+      CreateOffscreen(FOffscreenWidth, FOffscreenHeight, FOffscreenDPI);
+    Exit;
+  end;
+
   { Child widget: share parent canvas/bitmap with offset }
   if (CanvasTarget <> nil) and (CanvasTarget <> Self) then
   begin
@@ -2689,6 +2966,7 @@ var
   dx, dy: TfpgCoord;
   widgetX, widgetY, widgetW, widgetH: Integer; }
 begin
+  if FOffscreen then Exit;
   if (FWidget = nil) or (FBitmap = nil) then Exit;
   ohosWin := TfpgOhosWindow(FWidget.Window);
   if ohosWin = nil then Exit;
@@ -2891,6 +3169,7 @@ end;
 procedure TfpgOhosCanvas.DoEndDraw;
 var n: Integer;
 begin
+  if FOffscreen then Exit;
   if FSaveCount <> 0 then
   begin
    // 恢复原生画布状态
@@ -2978,8 +3257,8 @@ begin
   if px = nil then Exit;
   bw := OH_Drawing_BitmapGetWidth(FBitmap);
   bh := OH_Drawing_BitmapGetHeight(FBitmap);
-  sx := Round((X + FDeltaX) * gScaleFactorX);
-  sy := Round((Y + FDeltaY) * gScaleFactorY);
+  sx := Round((X + FDeltaX) * ScaleX);
+  sy := Round((Y + FDeltaY) * ScaleY);
   if (sx < 0) or (sy < 0) or (sx >= bw) or (sy >= bh) then Exit;
   stride := bw * 4;
   v := PLongWord(PByte(px) + sy * stride + sx * 4)^;
@@ -3000,8 +3279,8 @@ begin
   if px = nil then Exit;
   bw := OH_Drawing_BitmapGetWidth(FBitmap);
   bh := OH_Drawing_BitmapGetHeight(FBitmap);
-  sx := Round((X + FDeltaX) * gScaleFactorX);
-  sy := Round((Y + FDeltaY) * gScaleFactorY);
+  sx := Round((X + FDeltaX) * ScaleX);
+  sy := Round((Y + FDeltaY) * ScaleY);
   { Bounds check: negative or oversized coordinates must not write outside
     the bitmap (unlike the hybrid canvas this one had no guard). }
   if (sx < 0) or (sy < 0) or (sx >= bw) or (sy >= bh) then Exit;
@@ -3013,9 +3292,9 @@ begin
   { FPG: 逻辑像素 = 物理像元——HiDPI 下 1 个逻辑像素应覆盖整格（与画布矩阵对
     填充矩形的缩放语义一致）。只写单点会让逐像素绘制（VT 背景 BitBlt 垫片、
     点线框、拉伸回退等）在 2x 屏上呈稀疏点阵（Speed 页背景发糊）。 }
-  cellW := Round(gScaleFactorX);
+  cellW := Round(ScaleX);
   if cellW < 1 then cellW := 1;
-  cellH := Round(gScaleFactorY);
+  cellH := Round(ScaleY);
   if cellH < 1 then cellH := 1;
   for pyy := sy to sy + cellH - 1 do
   begin
@@ -3054,10 +3333,11 @@ begin
   srcBmp := src.FBitmap;
   if srcBmp = nil then Exit;
 
-  { Source rect is in source bitmap pixel space (physical, ×gScaleFactor).
-    Dest rect is logical: the target canvas carries the gScaleFactor transform. }
-  sRect := OH_Drawing_RectCreate(ASrcRect.Left * gScaleFactorX, ASrcRect.Top * gScaleFactorY,
-    (ASrcRect.Right + 1) * gScaleFactorX, (ASrcRect.Bottom + 1) * gScaleFactorY);
+  { Source rect is in the SOURCE canvas bitmap pixel space; use the source
+    canvas scale (which may differ from ours across DPI). Dest rect is
+    logical: this canvas carries its own CanvasScale transform. }
+  sRect := OH_Drawing_RectCreate(ASrcRect.Left * src.ScaleX, ASrcRect.Top * src.ScaleY,
+    (ASrcRect.Right + 1) * src.ScaleX, (ASrcRect.Bottom + 1) * src.ScaleY);
   dRect := OH_Drawing_RectCreate(ADest_x, ADest_y, ADest_x + w, ADest_y + h);
   OH_Drawing_CanvasDrawBitmapRect(FCanvas, srcBmp, sRect, dRect, nil);
   OH_Drawing_RectDestroy(dRect);
@@ -3083,10 +3363,10 @@ begin
   stride := bw * 4;
 
   { Logical rect (incl. canvas offset) → physical bitmap pixels. }
-  x0 := Round((ARect.Left   + FDeltaX) * gScaleFactorX);
-  y0 := Round((ARect.Top    + FDeltaY) * gScaleFactorY);
-  x1 := Round((ARect.Right  + 1 + FDeltaX) * gScaleFactorX) - 1;
-  y1 := Round((ARect.Bottom + 1 + FDeltaY) * gScaleFactorY) - 1;
+  x0 := Round((ARect.Left   + FDeltaX) * ScaleX);
+  y0 := Round((ARect.Top    + FDeltaY) * ScaleY);
+  x1 := Round((ARect.Right  + 1 + FDeltaX) * ScaleX) - 1;
+  y1 := Round((ARect.Bottom + 1 + FDeltaY) * ScaleY) - 1;
   if x0 < 0 then x0 := 0;
   if y0 < 0 then y0 := 0;
   if x1 >= Integer(bw) then x1 := Integer(bw) - 1;
@@ -3183,6 +3463,15 @@ var
   winRect: TfpgRect;
   fmt: TOH_Drawing_BitmapFormat;
 begin
+  if FOffscreen then
+  begin
+    if (FBitmap = nil) or
+       (Integer(OH_Drawing_BitmapGetWidth(FBitmap)) <> FOffscreenWidth) or
+       (Integer(OH_Drawing_BitmapGetHeight(FBitmap)) <> FOffscreenHeight) then
+      CreateOffscreen(FOffscreenWidth, FOffscreenHeight, FOffscreenDPI);
+    Exit;
+  end;
+
   if FCanvas <> nil then begin OH_Drawing_CanvasDestroy(FCanvas); FCanvas := nil; end;
   if FBitmap <> nil then begin OH_Drawing_BitmapDestroy(FBitmap); FBitmap := nil; end;
   FCanvas := OH_Drawing_CanvasCreate();
@@ -5342,7 +5631,7 @@ var
   sf, baseBackend: Single;
 begin
   sf := den;
-  if sf < 1.0 then sf := 1.0;
+  if sf <= 0 then sf := 1.0;
 
 {
 | 参数                                      	| （非框架缩放方案:96）          	| （框架缩放方案:96*density）	|

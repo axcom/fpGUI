@@ -384,7 +384,7 @@ begin
   if not TfpgWidget(AMgr.FWindow.PrimaryWidget).Visible then
     Exit;
   sf := gHiDPIScaleFactor;
-  if sf < 1.0 then
+  if sf <= 0 then
     sf := 1.0;
   dstX := Round(AMgr.FWindow.Left * sf);
   dstY := Round(AMgr.FWindow.Top * sf);
@@ -418,7 +418,7 @@ begin
   if (aw.SubWindowId <= 0) or (AMgr.FBuffer = nil) then
     Exit;
   sf := gHiDPIScaleFactor;
-  if sf < 1.0 then
+  if sf <= 0 then
     sf := 1.0;
   w := Round(aw.Width * sf);
   h := Round(aw.Height * sf);
