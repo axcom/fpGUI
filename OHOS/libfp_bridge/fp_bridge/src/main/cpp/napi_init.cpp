@@ -1941,7 +1941,10 @@ static void* PascalThread(void* arg) {
         pro();  // 阻塞：内部 fp_bridge_init + 事件循环
     } else {
         typedef int (*RunFunc)(int, char**);
-        RunFunc run = (RunFunc)dlsym(h, "main");
+        RunFunc run = (RunFunc)dlsym(h, "PascalMain");
+        if (!run){
+            run =  (RunFunc)dlsym(h, "main");
+        }
         if (run) {
             OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "fpGUI",
                 "Starting Pascal app main(argc, argv)");

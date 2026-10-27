@@ -374,6 +374,133 @@ type
   TIntegerList = specialize TFPGList<Integer>;
   TTabstopsList = specialize TFPGObjectList<TIntegerList>;
 
+function IsFullWidthChar(UCS: Cardinal): Boolean;
+begin
+  Result :=
+    ((UCS >= $2E80)  and (UCS <= $9FFF))  or  // CJK radicals, Kangxi, Ideographs
+    ((UCS >= $F900)  and (UCS <= $FAFF))  or  // CJK Compatibility Ideographs
+    ((UCS >= $FE30)  and (UCS <= $FE4F))  or  // CJK Compatibility Forms
+    ((UCS >= $FF01)  and (UCS <= $FF60))  or  // Fullwidth ASCII variants, Halfwidth CJK
+    ((UCS >= $FFE0)  and (UCS <= $FFE6))  or  // Fullwidth currency symbols
+    ((UCS >= $20000) and (UCS <= $2FA1F)) or  // CJK Unified Ideographs Extension B-F
+    ((UCS >= $3000)  and (UCS <= $303F))  or  // CJK Symbols and Punctuation
+    ((UCS >= $3040)  and (UCS <= $309F))  or  // Hiragana
+    ((UCS >= $30A0)  and (UCS <= $30FF))  or  // Katakana
+    ((UCS >= $3100)  and (UCS <= $312F))  or  // Bopomofo
+    ((UCS >= $AC00)  and (UCS <= $D7AF));     // Hangul Syllables
+end;
+
+function CharDisplayWidth(const AChar: TfpgChar; AHalfWidth: Integer): Integer;
+var
+  p: PChar;
+  CharLen: longint;
+  UCS: Cardinal;
+begin
+  if Length(AChar) = 0 then
+    Exit(AHalfWidth);
+  p := PChar(@AChar[1]);
+  UCS := UTF8CharToUnicode(p, CharLen);
+  if IsFullWidthChar(UCS) then
+    Result := AHalfWidth * 2
+  else
+    Result := AHalfWidth;
+end;
+
+function StringDisplayWidth(const S: TfpgString; AHalfWidth: Integer): Integer;
+var
+  I, Len, CharLen: Integer;
+  p: PChar;
+  UCS: Cardinal;
+begin
+  Result := 0;
+  I := 1;
+  Len := Length(S);
+  while I <= Len do
+  begin
+    p := PChar(@S[I]);
+    UCS := UTF8CharToUnicode(p, CharLen);
+    if IsFullWidthChar(UCS) then
+      Inc(Result, AHalfWidth * 2)
+    else
+      Inc(Result, AHalfWidth);
+    Inc(I, CharLen);
+  end;
+end;
+
+function PixelXToCol(const S: TfpgString; PixelX: Integer; AHalfWidth: Integer): Integer;
+var
+  I, Len, Col, CharLen, CharPixW: Integer;
+  p: PChar;
+  UCS: Cardinal;
+begin
+  Result := 0;
+  I := 1;
+  Len := Length(S);
+  Col := 0;
+  while I <= Len do
+  begin
+    p := PChar(@S[I]);
+    UCS := UTF8CharToUnicode(p, CharLen);
+    if IsFullWidthChar(UCS) then
+      CharPixW := AHalfWidth * 2
+    else
+      CharPixW := AHalfWidth;
+    if (Col + CharPixW) > PixelX then
+    begin
+      { Click is within this character }
+      if (PixelX - Col) > (CharPixW div 2) then
+        Result := Col + (CharPixW div AHalfWidth)
+      else
+        Result := Col;
+      Exit;
+    end;
+    Inc(Col, CharPixW div AHalfWidth);
+    Inc(I, CharLen);
+  end;
+  Result := Col;
+end;
+
+function ColToPixelX(const S: TfpgString; Col: Integer; AHalfWidth: Integer): Integer;
+var
+  I, Len, PixelX, CurCol, CharLen, CharCols, CharPixW: Integer;
+  p: PChar;
+  UCS: Cardinal;
+begin
+  Result := 0;
+  I := 1;
+  Len := Length(S);
+  PixelX := 0;
+  CurCol := 0;
+  while (I <= Len) and (CurCol < Col) do
+  begin
+    p := PChar(@S[I]);
+    UCS := UTF8CharToUnicode(p, CharLen);
+    if IsFullWidthChar(UCS) then
+    begin
+      CharCols := 2;
+      CharPixW := AHalfWidth * 2;
+    end
+    else
+    begin
+      CharCols := 1;
+      CharPixW := AHalfWidth;
+    end;
+    if (CurCol + CharCols) > Col then
+    begin
+      { Partial character: only some columns of this char are before Col }
+      Inc(PixelX, (Col - CurCol) * AHalfWidth);
+      CurCol := Col;
+    end
+    else
+    begin
+      Inc(PixelX, CharPixW);
+      Inc(CurCol, CharCols);
+    end;
+    Inc(I, CharLen);
+  end;
+  Result := PixelX;
+end;
+
 
 function GetNextWord(SLine: TfpgString; var PosX: Integer): Boolean;
 const
@@ -1479,7 +1606,7 @@ begin
           if not (ssCtrl in ShiftState) and not (ssShift in ShiftState) then
           begin
             if CaretPos.Y <= pred(FLines.Count) then
-              CaretPos.X := Length(GetLineText(CaretPos.Y))
+              CaretPos.X := UTF8Length(GetLineText(CaretPos.Y))
             else
               CaretPos.X := 0;
           end;
@@ -1493,12 +1620,12 @@ begin
                 FSelected := True;
               end;
               SetCaretPosV( pred(FLines.Count));
-              CaretPos.X := Length(GetLineText(CaretPos.Y));
-              FSelection.EndPos := fpgPoint(Length(GetLineText(CaretPos.Y)), pred(FLines.Count));
+              CaretPos.X := UTF8Length(GetLineText(CaretPos.Y));
+              FSelection.EndPos := fpgPoint(UTF8Length(GetLineText(CaretPos.Y)), pred(FLines.Count));
             end else
             begin
               SetCaretPosV(pred(FLines.Count));
-              CaretPos.X := Length(GetLineText(CaretPos.Y));
+              CaretPos.X := UTF8Length(GetLineText(CaretPos.Y));
             end;
             ScrollPos_V := CaretPos.Y - FVisLines;
             UpdateScrollBars;
@@ -1509,13 +1636,13 @@ begin
             if not FSelected then
             begin
               if CaretPos.Y <= pred(FLines.Count) then
-                if CaretPos.X > Length(GetLineText(CaretPos.Y)) then
-                  CaretPos.X := Length(GetLineText(CaretPos.Y));
+                if CaretPos.X > UTF8Length(GetLineText(CaretPos.Y)) then
+                  CaretPos.X := UTF8Length(GetLineText(CaretPos.Y));
               FSelection.StartPos := CaretPos;
               FSelected := True;
             end;
             if CaretPos.Y <= pred(FLines.Count) then
-              CaretPos.X := Length(GetLineText(CaretPos.Y))
+              CaretPos.X := UTF8Length(GetLineText(CaretPos.Y))
             else
               CaretPos.X := 0;
             FSelection.EndPos := CaretPos;
@@ -1908,8 +2035,9 @@ begin
         begin
           ScrollX := 0;
           ScrollY := FTopLine * FChrH;
-          if ((FindPos.x + Length(SrcWord)) * FChrW) - FChrW > GetClientRect.Width then
-            ScrollX := (FindPos.x * FChrW) - 2 * FChrW;
+          Canvas.SetFont(Font);
+          if Canvas.Font.GetTextWidth(UTF8Copy(SLine, 1, FindPos.x + Length(SrcWord) - 1)) > GetClientRect.Width then
+            ScrollX := Canvas.Font.GetTextWidth(UTF8Copy(SLine, 1, FindPos.x - 1)) - 2 * FChrW;
           if (I < FTopLine) or (I > (FTopLine + FVisLines - 2)) then
             ScrollY := (I-10) * FChrH;  // move selection into view
           ScrollTo(ScrollX, ScrollY);
@@ -1988,8 +2116,9 @@ begin
         begin
           ScrollX := 0;
           ScrollY := FTopLine * FChrH;
-          if ((FindPos.x + Length(SrcWord)) * FChrW) - FChrW > GetClientRect.Width then
-            ScrollX := (FindPos.x * FChrW) - (2 * FChrW);
+          Canvas.SetFont(Font);
+          if Canvas.Font.GetTextWidth(UTF8Copy(SLine, 1, FindPos.x + Length(SrcWord) - 1)) > GetClientRect.Width then
+            ScrollX := Canvas.Font.GetTextWidth(UTF8Copy(SLine, 1, FindPos.x - 1)) - (2 * FChrW);
           if (I < FTopLine) or (I > (FTopLine + FVisLines - 2)) then
             ScrollY := (I-10) * FChrH;  // move selection into view
           ScrollTo(ScrollX, ScrollY);
@@ -2108,6 +2237,8 @@ var
   lStrLen: PtrInt;
   X: Integer;
   CaretScroll: Boolean;
+  CaretPixelX: Integer;
+  VisibleW: Integer;
   lIndentOffset: integer;
   UndoAction: TUndoAction;
 begin
@@ -2361,10 +2492,21 @@ begin
 
   if CaretScroll then
   begin
-    if CaretPos.X > HPos + FVisCols then
-      ScrollPos_H := CaretPos.X - FVisCols
-    else if CaretPos.X < HPos then
-      ScrollPos_H := CaretPos.X;
+    if CaretPos.Y <= pred(FLines.Count) then
+    begin
+      SLine := GetLineText(CaretPos.Y);
+      CaretPixelX := Font.GetTextWidth(UTF8Copy(SLine, 1, CaretPos.X));
+    end
+    else
+      CaretPixelX := 0;
+    if FChrW > 0 then
+    begin
+      VisibleW := FVisCols * FChrW;
+      if CaretPixelX > (HPos * FChrW) + VisibleW then
+        ScrollPos_H := (CaretPixelX - VisibleW + FChrW - 1) div FChrW
+      else if CaretPixelX < HPos * FChrW then
+        ScrollPos_H := CaretPixelX div FChrW;
+    end;
 
     if CaretPos.Y < (FTopLine+1) then
       ScrollPos_V := CaretPos.Y
@@ -2387,6 +2529,7 @@ var
   InsertText: string;
   PadLen: Integer;
   Action: TInsertTextAction;
+  X: Integer;
 begin
   if not consumed then
   begin
@@ -2404,6 +2547,14 @@ begin
     // UTF-8 characters beyond ANSI range are supposed to be printable
     if ((Ord(AText[1]) > 31) and (Ord(AText[1]) < 127)) or (Length(AText) > 1) then
     begin
+      if CaretPos.Y >= FLines.Count then
+        while FLines.Count <= CaretPos.Y do
+        begin
+          FLines.Add('');
+          if FVScrollBar <> nil then
+            FVScrollBar.Max := FVScrollBar.Max + 1;
+        end;
+
       SLine := GetLineText(CaretPos.Y);
 
       { cursor was somewhere in whitespace, so we need to fill up the spaces }
@@ -2426,6 +2577,15 @@ begin
       Action.CaretAfter := CaretPos;
       FSelection.StartPos := CaretPos;
       consumed := True;
+
+      { Auto-scroll horizontally to keep caret visible after typing }
+      if CaretPos.Y <= pred(FLines.Count) then
+      begin
+        SLine := GetLineText(CaretPos.Y);
+        X := Font.GetTextWidth(UTF8Copy(SLine, 1, CaretPos.X));
+        if (FChrW > 0) and (X > (HPos * FChrW) + (FVisCols * FChrW)) then
+          ScrollPos_H := (X - (FVisCols * FChrW) + FChrW - 1) div FChrW;
+      end;
     end;
   end;
 
@@ -2629,7 +2789,8 @@ begin
   end; { if }
 
   { start drawing formatted text }
-  R.SetRect(X, Y, UTF8Length(S) * FChrW, FChrH);
+  Canvas.SetFont(Font);
+  R.SetRect(X, Y, Canvas.Font.GetTextWidth(S), FChrH);
   AllowDraw := True;
 
   { end-user can hook in here to do syntax highlighting and other custom drawing }
@@ -2647,7 +2808,7 @@ begin
   begin
     if (ALineIndex > StartNo) and (ALineIndex < EndNo) then     // whole line is selected
     begin
-      R.SetRect(X, Y, UTF8Length(S) * FChrW, FChrH);
+      R.SetRect(X, Y, Canvas.Font.GetTextWidth(S), FChrH);
       Canvas.TextColor := FSelectionTextColor;
       Canvas.Color := fpgColorToRGB(FSelectionColor);
       Canvas.FillRectangle(R);
@@ -2664,7 +2825,7 @@ begin
           SS := UTF8Copy(S, Si + 1, UTF8Length(S) - Si)
         else
           SS := UTF8Copy(S, Si + 1, Ei - Si);
-        R.SetRect(X+(Si * FChrW), Y, (UTF8Length(SS) * FChrW), FChrH);
+        R.SetRect(X+Canvas.Font.GetTextWidth(UTF8Copy(S, 1, Si)), Y, Canvas.Font.GetTextWidth(SS), FChrH);
         Canvas.TextColor := FSelectionTextColor;
         Canvas.Color := fpgColorToRGB(FSelectionColor);
         Canvas.FillRectangle(R);
@@ -2675,7 +2836,7 @@ begin
         if (ALineIndex = StartNo) and (ALineIndex < EndNo) then
         begin
           SS := UTF8Copy(S, Si + 1, UTF8Length(S) - Si);
-          R.SetRect(X+(Si * FChrW), Y, (UTF8Length(SS) * FChrW), FChrH);
+          R.SetRect(X+Canvas.Font.GetTextWidth(UTF8Copy(S, 1, Si)), Y, Canvas.Font.GetTextWidth(SS), FChrH);
           Canvas.TextColor := FSelectionTextColor;
           Canvas.Color := fpgColorToRGB(FSelectionColor);
           Canvas.FillRectangle(R);
@@ -2688,7 +2849,7 @@ begin
             if Ei > UTF8Length(S) then
               Ei := UTF8Length(S);
             SS := UTF8Copy(S, 1, Ei);
-            R.SetRect(X, Y, (UTF8Length(SS) * FChrW), FChrH);
+            R.SetRect(X, Y, Canvas.Font.GetTextWidth(SS), FChrH);
             Canvas.TextColor := FSelectionTextColor;
             Canvas.Color := fpgColorToRGB(FSelectionColor);
             Canvas.FillRectangle(R);
@@ -2699,9 +2860,9 @@ begin
     end;
   end; { if FSelected... }
 
-  if UTF8Length(S) > FMaxScrollH then
+  if (FChrW > 0) and ((Canvas.Font.GetTextWidth(S) + FChrW - 1) div FChrW > FMaxScrollH) then
   begin
-    FMaxScrollH := UTF8Length(S);
+    FMaxScrollH := (Canvas.Font.GetTextWidth(S) + FChrW - 1) div FChrW;
     UpdateScrollBars;
   end;
 end;
@@ -2709,6 +2870,8 @@ end;
 procedure TfpgBaseTextEdit.DrawCaret(const X, Y: Integer);
 var
   Xp, Yp: Integer;
+  S: TfpgString;
+  SubStr: TfpgString;
 begin
   if csDesigning in ComponentState then
     Exit; //==>
@@ -2723,7 +2886,14 @@ begin
     Exit;  //==>
   end;
   Yp := ((Y - FTopLine) * FChrH) + 1;
-  Xp := ((X - HPos) * FChrW) + GetClientRect.Left;
+  S := GetLineText(Y);
+  Canvas.SetFont(Font);
+  { Use font's actual text width to match DrawString positioning }
+  if X > 0 then
+    SubStr := UTF8Copy(S, 1, X)
+  else
+    SubStr := '';
+  Xp := Canvas.Font.GetTextWidth(SubStr) - Canvas.Font.GetTextWidth(UTF8Copy(S, 1, HPos)) + GetClientRect.Left;
 
   if FGutterPan.Visible then
     Xp := Xp + FGutterPan.Width;
@@ -2904,8 +3074,11 @@ end;
 
 procedure TfpgBaseTextEdit.GetRowColAtPos(const X, Y: Integer; out Row, Col: Integer);
 var
-  Fine: Integer;
   lX: Integer;
+  S: TfpgString;
+  I, Len, CharLen, CumWidth, CharW: Integer;
+  p: PChar;
+  Prefix: TfpgString;
 begin
   Row := Y div FChrH;
   if Row > Flines.Count then
@@ -2916,18 +3089,45 @@ begin
   begin
     if lX < FGutterPan.Width then
       lX := FGutterPan.Width;
-    Col   := (lX - FGutterPan.Width) div FChrW;
-    Fine  := (lX - FGutterPan.Width) mod FChrW;
+    lX := lX - FGutterPan.Width;
   end
   else
   begin
     if lX < 0 then
       lX := 0;
-    Col   := lX div FChrW;
-    Fine  := lX mod FChrW;
   end;
-  if Fine > (FChrW div 2) - 1 then
-    Col := Col + 1;
+  if lX < 0 then
+    lX := 0;
+
+  S := GetLineText(Row);
+  if Length(S) = 0 then
+  begin
+    Col := 0;
+    Exit;
+  end;
+  Canvas.SetFont(Font);
+  Col := 0;
+  Prefix := '';
+  CumWidth := 0;
+  I := 1;
+  Len := Length(S);
+  while I <= Len do
+  begin
+    p := PChar(@S[I]);
+    CharLen := UTF8CharacterLength(p);
+    Prefix := Copy(S, 1, I + CharLen - 1);
+    CharW := Canvas.Font.GetTextWidth(Prefix);
+    if CharW > lX then
+    begin
+      { Click is within or before this character }
+      if (lX - CumWidth) > (CharW - CumWidth) div 2 then
+        Inc(Col);
+      Exit;
+    end;
+    CumWidth := CharW;
+    Inc(Col);
+    Inc(I, CharLen);
+  end;
 end;
 
 procedure TfpgBaseTextEdit.Clear;

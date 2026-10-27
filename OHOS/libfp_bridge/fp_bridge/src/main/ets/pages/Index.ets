@@ -1,8 +1,9 @@
-import fpbridge from 'libfp_bridge.so';
+﻿import fpbridge from 'libfp_bridge.so';
 import { window, display, LevelOrder, dragController } from '@kit.ArkUI';
 import { unifiedDataChannel } from '@kit.ArkData';
 import { common, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { BusinessError } from '@kit.BasicServicesKit';
 import { getWindowStage, getMainWindow, terminateAbility, getLaunchPayload, getMergedArgs } from '../fp_bridgeability/Fp_bridgeAbility';
 import { APP_LIB_NAME } from '../common/FpAppConfig';
 import { FpgSurface, FpgSurfaceCtrl, notifyFirstFrame, registerWindowPositionSync, unregisterWindowPositionSync } from '../common/FpgSurface';
@@ -51,10 +52,33 @@ interface DragExtraParams {
 const DOMAIN = 0x0000;
 const TAG = 'page-Index';
 
+// 兼容模式判定：主窗真实显示区域与 layout rect 不一致（存在 compat scale）。
+// 原始比例：getGlobalRect 与 windowRect 同尺寸；
+// 18:9/2:3 等兼容比例：存在缩放，子窗 moveWindowTo 以父窗左上角为原点。
+export function isCompatScaled(win: window.Window | null): boolean {
+  if (win === null) return false;
+  try {
+    const p: window.WindowProperties = win.getWindowProperties();
+    const g: window.Rect = win.getGlobalRect();
+    if (p.windowRect.width > 0 && g.width > 0 &&
+      Math.abs(g.width / p.windowRect.width - 1.0) > 0.0005) {
+      return true;
+    }
+    if (p.windowRect.height > 0 && g.height > 0 &&
+      Math.abs(g.height / p.windowRect.height - 1.0) > 0.0005) {
+      return true;
+    }
+  } catch (_e) {}
+  return false;
+}
+
 @Entry
 @Component
 struct Index {
   private subWinMap: Map<number, window.Window> = new Map();
+  private popupReqIds: Set<number> = new Set<number>();
+  // 弹出菜单 moveWindowTo 原点语义：0=未知 1=屏幕绝对 2=父窗口相对
+  private popupMoveMode: number = 0;
   private imeCtrl: FpgSurfaceCtrl = new FpgSurfaceCtrl();  // 主窗 FpgSurface（XComponent/IME/事件）控制桥
   private hiddenInputCtrl: TextInputController = new TextInputController();  // 隐藏 TextInput 控制器（数字键捕获）
   // 修饰键状态追踪（hidden TextInput 全键转发用）
@@ -78,6 +102,15 @@ struct Index {
   private lastMainSizeW: number = 0;
   private lastMainSizeH: number = 0;
   private lastSubSize: Map<number, [number, number]> = new Map();
+  // 主窗按键捕获焦点状态：没有输入控件时也保持隐藏 TextInput 聚焦，
+  // 这样 KEYPRESS 仍能到达 TfpgForm.DoKeyShortcut（主菜单快捷键）。
+  private mainWindowActive: boolean = true;
+  private mainFocusTimer: number = -1;
+  private creatingSubWinCount: number = 0;
+  private mainKbdFocused: boolean = false;
+  private mainFocusRetryToken: number = 0;
+  private mainFocusRetryStep: number = 0;
+  private imeNeedsReattach: boolean = false;
 
   aboutToAppear(): void {
     fpbridge.setEtsReady();
@@ -350,9 +383,16 @@ struct Index {
         data: unified,
         extraParams: JSON.stringify(extra)
       };
+      hilog.info(DOMAIN, TAG, 'executeDrag invoke: sid=%{public}d textLen=%{public}d htmlLen=%{public}d uris=%{public}d',
+        sessionId, data.text ? data.text.length : 0, data.html ? data.html.length : 0, data.uris ? data.uris.length : 0);
       this.getUIContext().getDragController().executeDrag(() => {
         this.DragPreviewBuilder();
       }, info, (err, res) => {
+        if (err) {
+          const be = err as BusinessError;
+          hilog.error(DOMAIN, TAG, 'executeDrag cb err: code=%{public}d msg=%{public}s',
+            be.code ? be.code : -1, be.message ? be.message : '');
+        }
         let result = DragResult.DRAG_CANCELED;
         if (!err && res?.event) {
           result = res.event.getResult();
@@ -360,7 +400,9 @@ struct Index {
         fpbridge.onDragEnd(sessionId, this.dragResultToCode(result));
       });
     } catch (e) {
-      hilog.error(DOMAIN, TAG, 'startSystemDrag failed: %{public}s', JSON.stringify(e));
+      const be = e as BusinessError;
+      hilog.error(DOMAIN, TAG, 'startSystemDrag failed: code=%{public}d msg=%{public}s raw=%{public}s',
+        be.code ? be.code : -1, be.message ? be.message : '', JSON.stringify(e));
       fpbridge.onDragEnd(sessionId, 2);   // CANCELED：保证 Pascal Execute 不卡 60s
     }
   }
@@ -426,6 +468,8 @@ struct Index {
     const borderless = (attrs & ATTR_BORDERLESS) !== 0;
     const mainWin = getMainWindow();
     if (mainWin === null) return;
+    // 主窗句柄缓存：FpgSurface 首次事件前读取 windowRect 原点（兼容缩放/移动）
+    try { AppStorage.setOrCreate<window.Window>('winHandle_1', mainWin); } catch (_e) {}
     try {
       // 主窗 windowId 上报（OH_Input_SetPointerStyle 需要真实窗口 id；
       // 此前缺失导致系统光标样式不切换）。主窗重建路径也走本函数 → 自动重报。
@@ -461,11 +505,11 @@ struct Index {
         // 补偿/resize 必须按实际装饰（borderless→0）处理，否则偏移一个标题栏高。
         const decW = borderless ? 0 : props.windowRect.width  - props.drawableRect.width;
         const decH = borderless ? 0 : props.windowRect.height - props.drawableRect.height;
-        // 标题栏高度（触摸补偿用）：统一存 AppStorage('decH_1')。
-        // 注意单位：触摸坐标 displayX/Y 为 vp → 存 vp 值（÷densityPixels）
+        // 标题栏高度（拖拽/装饰补偿用）：统一存 AppStorage('decH_1')。
+        // 注意单位：存 vp 值（÷densityPixels），与窗口本地坐标空间一致
         const densityPx: number = display.getDefaultDisplaySync().densityPixels;
         AppStorage.setOrCreate<number>('decH_1', decH / densityPx);
-        // 左边框 vp（左右对称 decW/2）：onMouse X 补偿 + 标题栏真高（decH-下边框）计算
+        // 左边框 vp（左右对称 decW/2）：拖拽 X 补偿 + 标题栏真高（decH-下边框）计算
         AppStorage.setOrCreate<number>('decW_1', decW / 2 / densityPx);
         // 上报 C++（Pascal 弹窗定位补偿）：逻辑值（÷densityPx，与 Pascal 逻辑坐标空间一致；
         // ETS 本地 resize 仍用 px 原值 decW/decH）
@@ -577,6 +621,18 @@ struct Index {
               hilog.info(DOMAIN, TAG, 'MainWindow destroyed by system');
               fpbridge.onWindowClosed(1);
               terminateAbility();
+            } else if (t === 2) {   // WINDOW_ACTIVE：主窗重新激活 → 恢复隐藏 TextInput
+              this.mainWindowActive = true;
+              this.imeNeedsReattach = true;
+              hilog.info(DOMAIN, TAG, 'MainWindow event: active, IME reattach scheduled');
+              this.scheduleMainFocusRestore(80);
+              setTimeout(() => {
+                this.reattachMainIme('window active');
+              }, 200);
+            } else if (t === 3) {   // WINDOW_INACTIVE：让出捕获焦点，避免后台抢键
+              this.mainWindowActive = false;
+              this.imeNeedsReattach = true;
+              hilog.info(DOMAIN, TAG, 'MainWindow event: inactive, IME reattach pending');
             }
           });
         } catch (_e) {}
@@ -634,6 +690,7 @@ struct Index {
     // fpGUI TWindowType：0=wtChild, 1=wtWindow, 2=wtModalForm, 3=wtPopup
     // 弹出菜单/下拉（wtPopup）恒无标题栏；wtWindow/wtModalForm 按 waBorderless
     const isPopup = (wtype === 3);
+    if (isPopup) this.popupReqIds.add(reqId);
     let decorEnabled = isPopup ? false : !hasBL;
     // fpGUI 期望系统装饰（非 popup 非 borderless）：legacy 回退丢装饰时
     // 用自绘标题栏（FpgSurface）替代——平时隐藏，需要时按主窗标题栏高展示。
@@ -755,10 +812,10 @@ struct Index {
         }
       }
 
-      // 标题栏高度（触摸补偿用）：统一存 AppStorage('decH_' + reqId)。
-      // 注意单位：触摸坐标 displayX/Y 为 vp → 存 vp 值（÷densityPixels）
+      // 标题栏高度（拖拽/装饰补偿用）：统一存 AppStorage('decH_' + reqId)。
+      // 注意单位：存 vp 值（÷densityPixels），与窗口本地坐标空间一致
       AppStorage.setOrCreate<number>('decH_' + reqId, decH / densityPx);
-      // 左边框 vp（左右对称 decW/2）：子窗 X 方向触摸补偿（与主窗 decW_1 同语义）
+      // 左边框 vp（左右对称 decW/2）：子窗拖拽 X 补偿（与主窗 decW_1 同语义）
       AppStorage.setOrCreate<number>('decW_' + reqId, decW / 2 / densityPx);
       // 期望客户区尺寸（px）：WindowSurface/FpgSurface 首帧显示门用——
       // 创建阶段 drawable=客户区-dec（压缩），area 达到客户区后再显示内容，
@@ -769,14 +826,13 @@ struct Index {
       fpbridge.setWindowDec(reqId, Math.round(decW / densityPx), Math.round(decH / densityPx));
 
       // ── 自绘标题栏存储（FpgSurface aboutToAppear 读取，须在 setUIContent 之前）──
-      // 仅"期望装饰但创建失败（OpenHarmony legacy 回退）"时开启；HarmonyOS
-      // 成功路径自带系统标题栏不开启。decH/decW 仍存真实装饰值（原补偿路线不变），
-      // 标题栏高由 FpgSurface 在补偿基础上附加。winTitle/winHandle 供标题/关闭/拖动。
+      // 窗口句柄对所有子窗都缓存：FpgSurface 首次事件前读取 windowRect 原点
+      // （兼容缩放/窗口移动）；标题栏相关项仅回退路径开启。
+      AppStorage.setOrCreate<window.Window>('winHandle_' + reqId, win);
       if (titleBar) {
         AppStorage.setOrCreate<number>('titleBar_' + reqId, 1);
         AppStorage.setOrCreate<string>('winTitle_' + reqId,
           (winTitle && winTitle.length > 0) ? winTitle : 'fpGUI');
-        AppStorage.setOrCreate<window.Window>('winHandle_' + reqId, win);
         // 自绘标题栏高（vp）上报 C++ g_winDec → Pascal 懒查询 FDecTop →
         // DoWindowToScreen 菜单/弹窗锚点补偿（系统装饰=0，标题栏=32vp，否则
         // 弹出位置偏上=标题栏高）。与系统装饰同一单位（vp）。
@@ -791,7 +847,7 @@ struct Index {
       if (posX !== 0 || posY !== 0) {
         const postRect = win.getWindowProperties().windowRect;
         if (postRect.left !== posX || postRect.top !== posY) {
-          await win.moveWindowTo(posX, posY);
+          await this.movePopupTo(win, isPopup, posX, posY, false);
         } else {
           hilog.info(DOMAIN, TAG,
             'createSubWin move skipped (req=%{public}d): already at (%{public}d,%{public}d)',
@@ -850,7 +906,7 @@ struct Index {
             'Sub-window %d corrected: resize to %{public}dx%{public}d', reqId, totalW2, totalH2);
           // resize 可能改变窗口位置 → 重新定位（保持弹窗/菜单在正确屏幕位置）
           if (posX !== 0 || posY !== 0) {
-            try { await win.moveWindowTo(posX, posY); } catch (_e) {}
+            try { await this.movePopupTo(win, isPopup, posX, posY, true); } catch (_e) {}
           }
           // 装饰值若有变化，更新存储（触摸 vp）与 C++（定位逻辑值）
           // （原补偿路线不变：decH/decW 恒存真实装饰值）
@@ -957,6 +1013,16 @@ struct Index {
           const can: number = fpbridge.queryCanClose(reqId);
           hilog.info(DOMAIN, TAG,
             'Window %{public}d windowWillClose: canClose=%{public}d', reqId, can);
+          if (can !== 0) {
+            // 右键菜单/popup 关闭时可能不触发 windowEvent t=7：提前清理并恢复主窗焦点
+            this.imeNeedsReattach = true;
+            setTimeout(() => {
+              this.subWinMap.delete(reqId);
+              this.lastSubSize.delete(reqId);
+              unregisterWindowPositionSync(reqId);
+              if (!this.hasLiveSubWindow()) this.forceMainKeyFocus();
+            }, 120);
+          }
           return can === 0;   // true=阻止关闭（CanClose=false 时窗口保持）
         });
       } catch (_e) {}
@@ -975,6 +1041,11 @@ struct Index {
             unregisterWindowPositionSync(reqId);
             this.subWinMap.delete(reqId);
             this.lastSubSize.delete(reqId);
+            this.imeNeedsReattach = true;
+            // 系统关闭子窗后主窗可能未获得焦点：延迟强制恢复
+            setTimeout(() => {
+              if (!this.hasLiveSubWindow()) this.forceMainKeyFocus();
+            }, 120);
           }
         });
       } catch (_e) {}
@@ -1064,6 +1135,15 @@ struct Index {
         this.imeCtrl.focusHiddenInput = (): void => {
           this.focusHiddenInput();
         };
+        // hideIme 后是否保留按键捕获焦点：子窗活动/创建中/主窗非激活时让出
+        this.imeCtrl.shouldKeepKeyFocus = (): boolean => {
+          return this.mainWindowActive && this.creatingSubWinCount === 0
+            && !this.hasLiveSubWindow();
+        };
+        // 主窗点击 / popup 关闭后的强制焦点恢复入口（供 FpgSurface 调用）
+        this.imeCtrl.forceKeyFocus = (): void => {
+          this.forceMainKeyFocus();
+        };
         // 延迟聚焦隐藏 TextInput（等 build 完成后生效）
         setTimeout(() => {
           this.focusHiddenInput();
@@ -1072,9 +1152,15 @@ struct Index {
       }
 
       // 其它窗口：系统子窗口（createSubWindowWithOptions，独立窗口/系统标题栏）
-      if (!(await this.createSubWin(reqId, xcId, width, height, posX, posY, attrs, wtype, title))) {
-        hilog.warn(DOMAIN, TAG,
-          'createSubWin failed for req %{public}d (no fallback inline window)', reqId);
+      this.imeNeedsReattach = true;
+      this.creatingSubWinCount += 1;
+      try {
+        if (!(await this.createSubWin(reqId, xcId, width, height, posX, posY, attrs, wtype, title))) {
+          hilog.warn(DOMAIN, TAG,
+            'createSubWin failed for req %{public}d (no fallback inline window)', reqId);
+        }
+      } finally {
+        this.creatingSubWinCount -= 1;
       }
   }
 
@@ -1083,6 +1169,7 @@ struct Index {
     try {
       this.winPointerIds.delete(reqId);
     } catch (_e) {}
+    this.popupReqIds.delete(reqId);
     unregisterWindowPositionSync(reqId);
     // 清理自绘标题栏存储（句柄/标志，防复用错配）
     AppStorage.delete('titleBar_' + reqId);
@@ -1104,8 +1191,13 @@ struct Index {
         terminateAbility();
       }
       else {
-        // 子窗口销毁后恢复主窗口焦点（键盘事件继续路由到主窗口）
-        try { if (this.imeCtrl.focus) this.imeCtrl.focus(); } catch (_e) {}
+        // 子窗口销毁后恢复主窗口焦点（键盘事件继续路由到主窗口）。
+        // 立即 requestFocus 常在窗口尚未激活时失败；延迟到销毁完成后再试。
+        this.imeNeedsReattach = true;
+        setTimeout(() => {
+          if (this.hasLiveSubWindow()) return;
+          this.forceMainKeyFocus();
+        }, 120);
       }
       return;
     }
@@ -1142,10 +1234,87 @@ struct Index {
     }
   }
 
+  private isNear(a: number, b: number): boolean {
+    return Math.abs(a - b) <= 2;
+  }
+
+  private async applyPopupMove(win: window.Window, relative: boolean,
+      x: number, y: number, left: number, top: number): Promise<void> {
+    if (relative) {
+      await win.moveWindowTo(x - left, y - top);
+    } else {
+      await win.moveWindowTo(x, y);
+    }
+  }
+
+  // 弹出菜单/下拉（wtPopup）：兼容缩放下 moveWindowTo 以父窗左上角为原点，
+  // 原始比例用屏幕绝对坐标。首次 show 后按实际 windowRect 校准并缓存模式。
+  private async movePopupTo(win: window.Window, isPopup: boolean,
+      x: number, y: number, verify: boolean): Promise<void> {
+    if (!isPopup) {
+      try { await win.moveWindowTo(x, y); } catch (_e) {}
+      return;
+    }
+    const main = getMainWindow();
+    let left: number = 0;
+    let top: number = 0;
+    if (main !== null) {
+      try {
+        const mp: window.WindowProperties = main.getWindowProperties();
+        left = mp.windowRect.left;
+        top = mp.windowRect.top;
+      } catch (_e) {}
+    }
+    let mode: number = this.popupMoveMode;
+    if (mode === 0) {
+      mode = isCompatScaled(main) ? 2 : 1;
+    }
+    let relative: boolean = (mode === 2);
+    try {
+      await this.applyPopupMove(win, relative, x, y, left, top);
+    } catch (_e) {
+      try { await win.moveWindowTo(x, y); } catch (_e) {}
+      return;
+    }
+    if (!verify) return;
+
+    let px: number = 0;
+    let py: number = 0;
+    try {
+      const p: window.WindowProperties = win.getWindowProperties();
+      px = p.windowRect.left;
+      py = p.windowRect.top;
+    } catch (_e) {
+      return;
+    }
+    if (this.isNear(px, x) && this.isNear(py, y)) {
+      this.popupMoveMode = relative ? 2 : 1;
+      return;
+    }
+    relative = !relative;
+    try {
+      await this.applyPopupMove(win, relative, x, y, left, top);
+    } catch (_e) {
+      return;
+    }
+    try {
+      const p2: window.WindowProperties = win.getWindowProperties();
+      if (this.isNear(p2.windowRect.left, x) && this.isNear(p2.windowRect.top, y)) {
+        this.popupMoveMode = relative ? 2 : 1;
+        return;
+      }
+    } catch (_e) {}
+    hilog.warn(DOMAIN, TAG,
+      'popup move mismatch want=(%{public}d,%{public}d) relative=%{public}d got=(%{public}d,%{public}d)',
+      Math.round(x), Math.round(y), relative ? 1 : 0, Math.round(px), Math.round(py));
+  }
+
   private async moveWindow(reqId: number, x: number, y: number): Promise<void> {
     const win = this.subWinMap.get(reqId);
     if (win !== undefined) {
-      try { await win.moveWindowTo(x, y); } catch (_e) {}
+      try {
+        await this.movePopupTo(win, this.popupReqIds.has(reqId), x, y, true);
+      } catch (_e) {}
     }
   }
 
@@ -1240,10 +1409,94 @@ struct Index {
     }
   }
 
+  // 清理已销毁但未收到 windowEvent t=7 的子窗记录（右键菜单/popup 常见）。
+  private pruneStaleSubWindows(): void {
+    if (this.subWinMap.size === 0) return;
+    const dead: number[] = [];
+    this.subWinMap.forEach((win: window.Window, reqId: number) => {
+      let showing: boolean = true;
+      try {
+        showing = win.isWindowShowing();
+      } catch (_e) {
+        showing = false;
+      }
+      if (!showing) dead.push(reqId);
+    });
+    for (let i = 0; i < dead.length; i++) {
+      const id: number = dead[i];
+      this.subWinMap.delete(id);
+      this.lastSubSize.delete(id);
+      unregisterWindowPositionSync(id);
+    }
+  }
+
+  private hasLiveSubWindow(): boolean {
+    this.pruneStaleSubWindows();
+    return this.subWinMap.size !== 0;
+  }
+
+  // 主窗按键捕获焦点自愈：无存活子窗/非创建子窗/主窗激活时，失焦后延迟恢复。
+  private scheduleMainFocusRestore(delay: number = 80): void {
+    if (!this.mainWindowActive) return;
+    if (this.creatingSubWinCount > 0 || this.hasLiveSubWindow()) return;
+    if (this.mainFocusTimer >= 0) clearTimeout(this.mainFocusTimer);
+    this.mainFocusTimer = setTimeout(() => {
+      this.mainFocusTimer = -1;
+      if (!this.mainWindowActive) return;
+      if (this.creatingSubWinCount > 0 || this.hasLiveSubWindow()) return;
+      this.forceMainKeyFocus();
+    }, delay);
+  }
+
+  // 主窗重新激活后强制重连 IME：仅恢复隐藏 TextInput 焦点不够，
+  // 字母键会只有 KEYUP、没有 insertText。必须 stop→attach 新会话。
+  private reattachMainIme(reason: string): void {
+    if (!this.mainWindowActive) return;
+    if (this.creatingSubWinCount > 0 || this.hasLiveSubWindow()) return;
+    if (this.imeCtrl.ensureImeAttached === undefined) return;
+    this.imeNeedsReattach = false;
+    hilog.info(DOMAIN, TAG, 'MainWindow IME reattach: %{public}s', reason);
+    this.imeCtrl.ensureImeAttached();
+  }
+
+  // 用户按下主窗时强制恢复按键捕获焦点：0/120/300ms 重试，直到 onFocus 确认。
+  private forceMainKeyFocus(): void {
+    if (this.creatingSubWinCount > 0 || this.hasLiveSubWindow()) return;
+    if (this.imeNeedsReattach) {
+      setTimeout(() => {
+        if (this.imeNeedsReattach) this.reattachMainIme('force key focus');
+      }, 60);
+    }
+    this.mainFocusRetryToken += 1;
+    this.mainFocusRetryStep = 0;
+    this.mainFocusRetryAttempt(this.mainFocusRetryToken);
+  }
+
+  private mainFocusRetryAttempt(token: number): void {
+    if (token !== this.mainFocusRetryToken) return;
+    if (this.creatingSubWinCount > 0 || this.hasLiveSubWindow()) return;
+    if (this.mainKbdFocused && this.mainFocusRetryStep > 0) return;
+    this.focusHiddenInput();
+    this.mainFocusRetryStep += 1;
+    if (this.mainFocusRetryStep < 3) {
+      const delay: number = this.mainFocusRetryStep === 1 ? 120 : 180;
+      setTimeout(() => {
+        this.mainFocusRetryAttempt(token);
+      }, delay);
+    }
+  }
+
   // 聚焦隐藏 TextInput（子窗关闭后恢复主窗键盘焦点）
   private focusHiddenInput(): void {
     try {
-      focusControl.requestFocus('hidden_digit_input');
+      const ok: boolean = focusControl.requestFocus('hidden_digit_input');
+      hilog.info(DOMAIN, TAG, 'Index focusHiddenInput: ok=%{public}d', ok ? 1 : 0);
+      if (!ok) {
+        // 窗口刚销毁/刚激活时 requestFocus 可能异步失败：延迟重试一次
+        setTimeout(() => {
+          try { focusControl.requestFocus('hidden_digit_input'); } catch (_e) {}
+        }, 100);
+      }
     } catch (_e) {
       hilog.info(DOMAIN, TAG, 'focusHiddenInput: err');
     }
@@ -1265,10 +1518,8 @@ struct Index {
       // 物理键盘数字键被 HMKeyboard 消费（isConsumedKeyDown）→ 丢失；
       // 隐藏 TextInput 获焦后 HMKeyboard 将数字键直送其 onKeyEvent，
       // 转发至 fpbridge.onKeyEvent → EnqueueKeyEvent → ProcessQueuedKeyEvents。
-      // 仅主窗（mainReady=true）时创建；弹出子窗 XComponent.onKeyEvent 正常，
-      // 无需此兜底。
-      if (this.mainReady) {
-        TextInput({ text: '', placeholder: '', controller: this.hiddenInputCtrl })
+      // 主窗始终创建（不随 mainReady 条件重建），保证按键捕获焦点生命周期稳定。
+      TextInput({ text: '', placeholder: '', controller: this.hiddenInputCtrl })
           .id('hidden_digit_input')
           .type(InputType.Normal)
           .opacity(0)
@@ -1279,6 +1530,7 @@ struct Index {
           // TextInput 自 API 10 起获焦默认弹软键盘 → 启动 200ms 后误弹。
           // 正式输入仍由 Pascal 焦点驱动 showIme 命令模式弹出。
           .enableKeyboardOnFocus(false)
+          .defaultFocus(true)
           .onKeyEvent((event: KeyEvent): boolean => {
             const kc: number = event.keyCode as number;
             const isDown: boolean = (event.type as number) === 0;
@@ -1314,9 +1566,18 @@ struct Index {
             return true;  // 消费：不让 TextInput 插入/处理任何东西
           })
           .onFocus(() => {
+            this.mainKbdFocused = true;
             hilog.info(DOMAIN, TAG, 'HiddenInput: focused');
+            if (this.imeNeedsReattach) {
+              this.reattachMainIme('hidden input focused');
+            }
           })
-      }
+          .onBlur(() => {
+            this.mainKbdFocused = false;
+            this.imeNeedsReattach = true;
+            hilog.info(DOMAIN, TAG, 'HiddenInput: blurred');
+            this.scheduleMainFocusRestore(120);
+          })
     }
     .backgroundColor('#F0F2F5')
     .width('100%').height('100%')

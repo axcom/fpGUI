@@ -83,6 +83,7 @@ const LONGPRESS_SLOP: number = 20;
 let gImeCtl: inputMethod.InputMethodController | null = null;
 let gImeAttached: boolean = false;
 let gImeType: number = -1;   // 当前 attach 的 TextInputType（变化时 reattach）
+let gLastImeReattachAt: number = 0;   // popup/子窗关闭后强制重连的节流时间戳
 // 命令回调已注册标志：attach 成功后注册一次（提前注册不生效——insertText
 // 回传丢失导致字母/中文无法录入；重复注册则监听叠加——输入字数递增）
 let gImeListenersRegistered: boolean = false;
@@ -167,6 +168,27 @@ function imeEnsureAttached(kbType: number): void {
   }
 }
 
+// popup/子窗关闭后 IME 会话可能仍挂在已销毁窗口上：stop → attach 重连到主窗。
+function imeForceReattach(kbType: number): void {
+  const now: number = Date.now();
+  if (now - gLastImeReattachAt < 400) return;
+  gLastImeReattachAt = now;
+  try {
+    if (gImeCtl === null) gImeCtl = inputMethod.getController();
+    const ctl: inputMethod.InputMethodController = gImeCtl;
+    ctl.stopInputSession().then(() => {
+      gImeAttached = false;
+      imeEnsureAttached(kbType);
+    }).catch(() => {
+      gImeAttached = false;
+      imeEnsureAttached(kbType);
+    });
+  } catch (_e) {
+    gImeAttached = false;
+    imeEnsureAttached(kbType);
+  }
+}
+
 // 光标跟随：编辑框内触摸 DOWN → IME 候选框跟随光标（物理屏幕 px）
 function imeUpdateCursor(xVp: number, yVp: number, density: number): void {
   if (!gImeCtl) return;
@@ -203,6 +225,8 @@ class PositionSync {
   unregister(reqId: number): void {
     this.wins.delete(reqId);
     this.cache.delete(reqId);
+    AppStorage.delete('winRectLeft_' + reqId);
+    AppStorage.delete('winRectTop_' + reqId);
   }
 
   private ensureTimer(): void {
@@ -227,6 +251,8 @@ class PositionSync {
           // （弹窗锚点窗口位置停在初始值 → 子菜单/二次弹出错位）
           fpbridge.onWindowMoved(reqId, x, y);
           this.cache.set(reqId, [x, y]);
+          AppStorage.setOrCreate<number>('winRectLeft_' + reqId, x);
+          AppStorage.setOrCreate<number>('winRectTop_' + reqId, y);
         }
       } catch (_e) {}
     });
@@ -260,6 +286,9 @@ export class FpgSurfaceCtrl {
   hideIme?: () => void;
   focus?: () => void;                   // 子窗销毁后恢复本窗口键盘焦点
   focusHiddenInput?: () => void;        // 主窗隐藏 TextInput 焦点恢复（XComponent.onKeyEvent 不触发兜底）
+  forceKeyFocus?: () => void;           // 主窗强力恢复（带延迟重试，popup/右键菜单关闭后）
+  ensureImeAttached?: () => void;       // popup/子窗关闭后强制重连主窗 IME 会话
+  shouldKeepKeyFocus?: () => boolean;   // hideIme 后是否保留按键捕获焦点（子窗活动时让出）
   setExpectClientSize?: (w: number, h: number) => void;  // 首帧显示门：期望客户区尺寸（主窗）
 }
 
@@ -322,6 +351,15 @@ export struct FpgSurface {
       this.titleBarWin = AppStorage.get<window.Window>('winHandle_' + this.reqId) ?? null;
     }
     this.densityPx = display.getDefaultDisplaySync().densityPixels;
+    // 窗口原点缓存初值（主窗为 0；子窗后续由 PositionSync 每 150ms 刷新）
+    const win0 = AppStorage.get<window.Window>('winHandle_' + this.reqId);
+    if (win0 !== undefined) {
+      try {
+        const p0 = win0.getWindowProperties();
+        AppStorage.setOrCreate<number>('winRectLeft_' + this.reqId, p0.windowRect.left);
+        AppStorage.setOrCreate<number>('winRectTop_' + this.reqId, p0.windowRect.top);
+      } catch (_e) {}
+    }
     // 首帧显示门注册：Pascal 首帧上屏后经 notifyFirstFrame(reqId) 回调。
     // 无期望尺寸（弹窗等）：首帧到达即放行；600ms 兜底防通知丢失永久隐藏。
     firstFrameMap.set(this.reqId, (): void => { this.onFirstFrame(); });
@@ -336,6 +374,10 @@ export struct FpgSurface {
     this.expectSetAt = Date.now();
     this.ctrl.showIme = (kbType: number): void => { this.showIme(kbType); };
     this.ctrl.hideIme = (): void => { this.hideIme(); };
+    if (this.reqId === 1) {
+      // 主窗：弹菜单/子窗关闭后由 Index 触发，确保 IME 会话重连到当前主窗
+      this.ctrl.ensureImeAttached = (): void => { imeForceReattach(1); };
+    }
     this.ctrl.focus = (): void => {
       // 主窗（reqId=1）：焦点交给 Index 隐藏 TextInput；
       // 子窗：焦点交给本窗口隐藏 TextInput（XComponent 无法持有组件焦点）。
@@ -422,7 +464,8 @@ export struct FpgSurface {
   private titleBarDragMove(offsetX: number, offsetY: number): void {
     if (this.titleBarWin === null) return;
     try {
-      this.titleBarWin.moveWindowTo(this.dragWinX + offsetX, this.dragWinY + offsetY).catch(() => {});
+      this.titleBarWin.moveWindowTo(this.dragWinX + offsetX,
+        this.dragWinY + offsetY).catch(() => {});
     } catch (_e) {}
   }
 
@@ -446,12 +489,23 @@ export struct FpgSurface {
     hilog.info(DOMAIN, TAG, 'TitleBar close: inject closed req=%d', this.reqId);
   }
 
-  // 顶部 Y 补偿（vp）：原路线取 AppStorage('decH_'+reqId)（系统装饰真实值）；
-  // 自绘标题栏窗口（OpenHarmony legacy 回退，系统 dec=0）在基础上附加标题栏高
-  // titleBarH（vp）——自绘标题栏占据客户区顶部，触摸/鼠标 displayY 同样要减。
+  // 拖拽事件仍用 window 坐标，需要装饰补偿（鼠标/触摸已改用组件本地 x/y）
   private compensateTop(): number {
     const decH: number = AppStorage.get<number>('decH_' + this.reqId) ?? 0;
     return this.showTitleBar ? decH + this.titleBarH : decH;
+  }
+
+  // 当前窗口在应用坐标系中的原点（vp）。兼容模式（18:9/1:1）下
+  // displayX/displayY 是系统变换后的屏幕坐标，不能直接减装饰当客户区坐标；
+  // 输入统一改用 XComponent 组件本地 x/y，再补这里缓存的窗口原点。
+  private winOriginX(): number {
+    const px = AppStorage.get<number>('winRectLeft_' + this.reqId) ?? 0;
+    return px / this.densityPx;
+  }
+
+  private winOriginY(): number {
+    const px = AppStorage.get<number>('winRectTop_' + this.reqId) ?? 0;
+    return px / this.densityPx;
   }
 
   private showIme(kbType: number): void {
@@ -460,6 +514,13 @@ export struct FpgSurface {
     // 隐藏 TextInput——否则子窗内无获焦组件，物理数字键被 IME 忽略后丢弃。
     if (this.reqId !== 1) {
       this.focusKbdInput();
+    } else if (this.ctrl.forceKeyFocus) {
+      // 主窗隐藏 TextInput 在 Index 页面。模态窗/弹出菜单关闭后 Pascal 会
+      // 重新发 show_keyboard(1)；forceKeyFocus 带 0/120/300ms 重试，
+      // 避免 popup 关闭瞬间把刚恢复的焦点再次夺走。
+      this.ctrl.forceKeyFocus();
+    } else if (this.ctrl.focusHiddenInput) {
+      this.ctrl.focusHiddenInput();
     }
     // IME 命令模式：attach（输入类型变化时 reattach）→ 弹软键盘
     imeEnsureAttached(kbType);
@@ -477,14 +538,29 @@ export struct FpgSurface {
 
   private hideIme(): void {
     hilog.info(DOMAIN, TAG, 'hideIme: enter');
+    const keepKeyFocus: boolean = (this.reqId !== 1) ||
+      (this.ctrl.shouldKeepKeyFocus === undefined) ||
+      this.ctrl.shouldKeepKeyFocus();
     // 隐藏软键盘（InputMethodController 命令模式，无 TextInput 组件）
     if (gImeCtl) {
       try { gImeCtl.hideTextInput().catch(() => {}); } catch (_e) {}
-      // 结束输入法会话并复位 attach 状态：hideTextInput 只隐藏面板，
-      // 会话仍占位导致下次 showIme 跳过 attach（输入法只打开一次的根因）。
-      // 下次 showIme → imeEnsureAttached 重新 attach → 会话重建 → 输入法恢复。
+      // 必须结束会话：popup/子窗销毁后 IME 会话可能绑定在已销毁窗口上，
+      // 仅保留 gImeAttached 会让主窗 showIme 跳过 attach，字母只出 KEYUP、
+      // 没有 insertText（表现为弹菜单后无法录入）。下次 showIme/恢复焦点时重连。
       try { gImeCtl.stopInputSession().catch(() => {}); } catch (_e) {}
       gImeAttached = false;
+    }
+    // 软键盘隐藏后仍保持按键捕获焦点：没有输入控件时主菜单快捷键也需要 KEYPRESS。
+    // 子窗活动时由 shouldKeepKeyFocus 让出；子窗自己保持自己的隐藏输入框焦点。
+    if (keepKeyFocus) {
+      setTimeout(() => {
+        if (this.reqId === 1) {
+          if (this.ctrl.forceKeyFocus) this.ctrl.forceKeyFocus();
+          else if (this.ctrl.focusHiddenInput) this.ctrl.focusHiddenInput();
+        } else {
+          this.focusKbdInput();
+        }
+      }, 50);
     }
     // 通知 Pascal 键盘将隐藏（对称 showIme）
     try { fpbridge.showKeyboard(0); } catch (_e) {}
@@ -494,8 +570,13 @@ export struct FpgSurface {
   // 交互即聚焦：确保本窗口持有系统键盘焦点（onKeyEvent 仅在聚焦时触发）。
   // 弹窗关闭/托盘收起恢复/窗口失焦后焦点可能丢失——任何触摸/鼠标交互即恢复。
   private ensureFocus(): void {
-    // 主窗（reqId=1）：焦点由 Index 的隐藏 TextInput 持有（focusHiddenInput 恢复）。
-    if (this.reqId === 1) return;
+    // 主窗（reqId=1）：焦点由 Index 的隐藏 TextInput 持有。点击/触摸主窗时
+    // 必须主动恢复，否则模态窗/弹出菜单关闭后物理键会一直被 ArkUI 丢弃。
+    if (this.reqId === 1) {
+      if (this.ctrl.forceKeyFocus) this.ctrl.forceKeyFocus();
+      else if (this.ctrl.focusHiddenInput) this.ctrl.focusHiddenInput();
+      return;
+    }
     this.focusKbdInput();
   }
 
@@ -798,9 +879,6 @@ export struct FpgSurface {
         }
       })
       .onTouch((event: TouchEvent) => {
-        // 交互即聚焦：点击/触摸 XComponent 时确保系统键盘焦点（onKeyEvent
-        // 仅在组件聚焦时触发）。弹窗/托盘流程后焦点可能丢失，点击即恢复。
-        this.ensureFocus();
         // 按输入来源分流：鼠标/触控板交给 onMouse（避免双通道重复）；
         // 手指/笔/未知来源走本通道（Down/Move/Up = 左键点按/拖拽）。
         if (event.source === SourceType.Mouse) {
@@ -808,14 +886,14 @@ export struct FpgSurface {
         }
         if (event.touches.length > 0) {
           const t = event.touches[0];
-          // 与 onMouse 统一坐标基准与补偿（X: decW，Y: decTop=decH-decW）。
-          // TouchObject.displayX/displayY 与 MouseEvent 同为 vp 单位。
-          const decH: number = this.compensateTop();
-          const decW: number = AppStorage.get<number>('decW_' + this.reqId) ?? 0;
-          const decTop: number = decH - decW;
-          const sx: number = (t.displayX ?? 0) - decW;
-          const sy: number = (t.displayY ?? 0) - decTop;
-          // 坐标有效性防御：设备上部分事件 displayX/Y 未填充（NaN/垃圾值）
+          // 兼容模式下 displayX/Y 是系统 GPU 变换后的屏幕坐标，直接用会随
+          // 点击位置产生缩放偏移。改用组件本地 x/y（vp），再补窗口原点，
+          // Pascal 侧仍按“全局点 − wnd.Left/Top”得到客户区坐标。
+          const sx: number = t.x;
+          const sy: number = t.y;
+          const gx: number = this.winOriginX() + sx;
+          const gy: number = this.winOriginY() + sy;
+          // 坐标有效性防御：设备上部分事件 x/y 未填充（NaN/垃圾值）
           // → 丢弃，避免 Pascal 收到无效坐标导致点击失效
           if (!Number.isFinite(sx) || !Number.isFinite(sy) ||
               Math.abs(sx) > 20000 || Math.abs(sy) > 20000) {
@@ -823,6 +901,9 @@ export struct FpgSurface {
             return;
           }
           if (event.type === TouchType.Down) {
+            // 交互即聚焦：点击/触摸 XComponent 时确保系统键盘焦点（onKeyEvent
+            // 仅在组件聚焦时触发）。弹窗/托盘流程后焦点可能丢失，点击即恢复。
+            this.ensureFocus();
             // 光标跟随（近似）：编辑框内点击位置 → IME 候选框跟随
             imeUpdateCursor(sx, sy, this.densityPx);
             // 长按模拟右键：到点即弹（不必等松手）
@@ -836,15 +917,17 @@ export struct FpgSurface {
               if (this.destroyed || this.lpDownAt <= 0 || this.lpMoved) return;
               hilog.info(DOMAIN, TAG, 'LONGPRESS right-click req=%d vp=(%d,%d)',
                 this.reqId, Math.round(this.lpDownX), Math.round(this.lpDownY));
+              const lgx: number = this.winOriginX() + this.lpDownX;
+              const lgy: number = this.winOriginY() + this.lpDownY;
               // 1) 右键 Down+Up：编辑框弹出右键菜单（手指未松）
-              fpbridge.onMouseEvent(String(this.reqId), this.lpDownX, this.lpDownY, 0, 2);
-              fpbridge.onMouseEvent(String(this.reqId), this.lpDownX, this.lpDownY, 2, 2);
+              fpbridge.onMouseEvent(String(this.reqId), lgx, lgy, 0, 2);
+              fpbridge.onMouseEvent(String(this.reqId), lgx, lgy, 2, 2);
               // 2) 补发左键 Down（button=1→MOUSE_LEFT）：右键 UP 清掉了
               //    Pascal 的左键路由/按键状态，不补则松手 UP 被丢弃
               //    （MouseCapture 不释放）；补发后 Move 仍带左键、Up 正常。
-              fpbridge.onMouseEvent(String(this.reqId), this.lpDownX, this.lpDownY, 0, 1);
+              fpbridge.onMouseEvent(String(this.reqId), lgx, lgy, 0, 1);
             }, LONGPRESS_MS);
-            fpbridge.onTouchEvent(String(this.reqId), sx, sy, 0);
+            fpbridge.onTouchEvent(String(this.reqId), gx, gy, 0);
           } else if (event.type === TouchType.Move) {
             // 位移越阈值 → 按拖拽处理：取消长按（事件照常转发，不影响拖拽）
             if (!this.lpMoved &&
@@ -852,14 +935,14 @@ export struct FpgSurface {
               this.lpMoved = true;
               this.cancelLongPress();
             }
-            fpbridge.onTouchEvent(String(this.reqId), sx, sy, 1);
+            fpbridge.onTouchEvent(String(this.reqId), gx, gy, 1);
           } else if (event.type === TouchType.Up) {
             // 左键 Up 照常转发：定时器补发的左键 Down 已恢复路由，
             // 这条 Up 仍送达原按下控件（MouseCapture 释放/点击/复选框）
             this.cancelLongPress();
             this.lpDownAt = 0;
             this.lpMoved = false;
-            fpbridge.onTouchEvent(String(this.reqId), sx, sy, 2);
+            fpbridge.onTouchEvent(String(this.reqId), gx, gy, 2);
           } else if (event.type === TouchType.Cancel) {
             this.cancelLongPress();
             this.lpDownAt = 0;
@@ -870,8 +953,6 @@ export struct FpgSurface {
       // Real mouse: 真机实测 action = Press=1/Release=2/Move=3/Hover=4
       // → 映射为 OH_TOUCH 语义（0=Down/1=Move/2=Up）。触屏走 onTouch。
       .onMouse((event: MouseEvent) => {
-        // 交互即聚焦（同 onTouch）：鼠标交互时确保系统键盘焦点
-        this.ensureFocus();
         // 模拟器（INPUT_USE_ONMOUSE=false）：onMouse 抑制（onTouch 完整承载）
         if (!INPUT_USE_ONMOUSE) {
           return;
@@ -880,28 +961,29 @@ export struct FpgSurface {
         const btn = event.button as number;
         const ma = event.action as number;
         let act = 1;   // 默认 Move（OH_TOUCH_MOVE）
-        if (ma === MOUSE_ACTION_PRESS) act = 0;          // Press → Down
+        if (ma === MOUSE_ACTION_PRESS) {
+          // 交互即聚焦（同 onTouch）：鼠标按下时确保系统键盘焦点
+          this.ensureFocus();
+          act = 0;          // Press → Down
+        }
         else if (ma === MOUSE_ACTION_RELEASE) act = 2;   // Release → Up
         else if (ma === MOUSE_ACTION_MOVE || ma === MOUSE_ACTION_HOVER) act = 1;  // Move/Hover → Move
-        // Unified SCREEN coordinate basis (displayX/displayY, no mixed-basis
-        // fallback to component-relative x/y). 减标题栏高 decH。
-        // 设备 displayY 为屏幕坐标。统一坐标系（主窗/子窗同公式）：
-        // ETS 只补偿"XComponent 在窗口内的偏移"——X：左边框（decW_'+reqId，
-        // decW/2）；Y：标题栏真高 decTop（decH_'+reqId 总装饰高 − 下边框≈左边框）。
-        // 窗口位置（windowRect.top/left）由 Pascal wnd.Left/Top 处理
-        // （主窗 pos-poll 强制同步；子窗 windowRectChange 事件）。
-        // 子窗无标题栏（OpenHarmony 回退路径）时 decH/decW=0 → 减 0 无影响；
-        // 自绘标题栏窗口：compensateTop 附加标题栏高（decH 真值 0 + titleBarH）。
-        const decH: number = this.compensateTop();
-        const decW: number = AppStorage.get<number>('decW_' + this.reqId) ?? 0;
-        const decTop: number = decH - decW;   // 标题栏真高 = 总装饰 − 下边框(≈左边框)
-        let mx: number = (event.displayX ?? 0) - decW;
-        let my: number = (event.displayY ?? 0) - decTop;
-        if (this.reqId === 1) {
+        // 兼容模式（18:9/1:1）下 displayX/Y 是系统 GPU 变换后的屏幕坐标，
+        // 直接减装饰会在窗口缩放/偏移时产生随距离增大的偏差。改用组件本地
+        // x/y（vp），再补窗口原点；Pascal 仍按“全局点 − wnd.Left/Top”得到客户区。
+        const localX: number = event.x;
+        const localY: number = event.y;
+        const ox: number = this.winOriginX();
+        const oy: number = this.winOriginY();
+        let mx: number = ox + localX;
+        let my: number = oy + localY;
+        if (this.reqId === 1 || act === 0 || act === 2) {
           hilog.info(DOMAIN, TAG,
-            'MOUSE-CALIB req=%{public}d rawX=%{public}d rawY=%{public}d decW=%{public}d decH=%{public}d decTop=%{public}d newX=%{public}d newY=%{public}d',
-            btn, Math.round(event.displayX ?? 0), Math.round(event.displayY ?? 0),
-            decW, decH, decTop, Math.round(mx), Math.round(my));
+            'MOUSE-CALIB req=%{public}d btn=%{public}d rawX=%{public}d rawY=%{public}d localX=%{public}d localY=%{public}d winX=%{public}d winY=%{public}d sendX=%{public}d sendY=%{public}d',
+            this.reqId, btn,
+            Math.round(event.displayX ?? 0), Math.round(event.displayY ?? 0),
+            Math.round(localX), Math.round(localY), Math.round(ox), Math.round(oy),
+            Math.round(mx), Math.round(my));
         }
         // 坐标有效性防御（同 onTouch）：无效坐标丢弃
         if (!Number.isFinite(mx) || !Number.isFinite(my) ||
@@ -928,12 +1010,11 @@ export struct FpgSurface {
         const now = Date.now();
         if (now - gLastWheelAt < 50) return;
         gLastWheelAt = now;
-        // 坐标：displayX/Y（屏幕 vp）与 onMouse 统一基准 + 装饰补偿
-        const decH: number = this.compensateTop();
-        const decW: number = AppStorage.get<number>('decW_' + this.reqId) ?? 0;
-        const decTop: number = decH - decW;
-        const mx: number = (event.displayX ?? event.x ?? 0) - decW;
-        const my: number = (event.displayY ?? event.y ?? 0) - decTop;
+        // 坐标：组件本地 x/y（vp）+ 窗口原点，与 onMouse 同基准
+        const localX: number = event.x;
+        const localY: number = event.y;
+        const mx: number = this.winOriginX() + localX;
+        const my: number = this.winOriginY() + localY;
         if (!Number.isFinite(mx) || !Number.isFinite(my) ||
             Math.abs(mx) > 20000 || Math.abs(my) > 20000) {
           return;
@@ -950,13 +1031,11 @@ export struct FpgSurface {
       .onHoverMove((event: HoverEvent) => {
         // SDK 15+ 才有 onHoverMove（低版本系统不触发 → onMouse Move(3) 承载 hover）
         gLastHoverMoveAt = Date.now();
-        // 与 onMouse 统一补偿：X 减左边框（decW）、Y 减标题栏真高
-        // （decTop=decH−decW；自绘标题栏窗口经 compensateTop 附加标题栏高）
-        const decH: number = this.compensateTop();
-        const decW: number = AppStorage.get<number>('decW_' + this.reqId) ?? 0;
-        const decTop: number = decH - decW;
-        const hx: number = (event.displayX ?? 0) - decW;
-        const hy: number = (event.displayY ?? 0) - decTop;
+        // 坐标：组件本地 x/y（vp）+ 窗口原点，与 onMouse 同基准
+        const localX: number = event.x ?? 0;
+        const localY: number = event.y ?? 0;
+        const hx: number = this.winOriginX() + localX;
+        const hy: number = this.winOriginY() + localY;
         hilog.info(DOMAIN, TAG, 'HOV req=%{public}d x=%{public}d y=%{public}d', this.reqId, Math.round(hx), Math.round(hy));
         fpbridge.onHoverEvent(String(this.reqId), hx, hy);
       })
@@ -1052,9 +1131,10 @@ export struct FpgSurface {
   }
 
   // 拖拽坐标：getX/getY 自 API10 废弃 → 官方等价替代 getWindowX/getWindowY
-  // （两者文档语义相同：均"相对窗口左上角"vp）——与 onMouse 同式补偿：
-// X − 左边框(decW)，Y − 标题栏真高(decTop)。补偿后为客户区 vp，
-// C++ ×density → px，Pascal ÷gfx 即客户区逻辑坐标（不再减窗口位置）。
+  // （两者文档语义相同：均"相对窗口左上角"vp）。拖拽走客户区本地坐标：
+  // X − 左边框(decW)，Y − 标题栏真高(decTop)；C++ ×density → px，
+  // Pascal ÷gfx 即客户区逻辑坐标（不再减窗口位置）。鼠标/触摸已改用
+  // 组件本地 x/y，不走本函数。
   private dragCoords(ev: DragEvent): DragPoint {
     const decH: number = this.compensateTop();
     const decW: number = AppStorage.get<number>('decW_' + this.reqId) ?? 0;
