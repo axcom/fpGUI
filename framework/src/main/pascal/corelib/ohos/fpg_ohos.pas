@@ -593,6 +593,7 @@ type
     show_file_picker: Pointer;			{ 文件选择器 }
     file_io: Pointer;
     arkts_invoke: Pointer;                { v13: function(callId,method,params: PChar): Integer; cdecl }
+    notify_timer_state: Pointer;          { v14: procedure(active: Integer); cdecl }
   end;
 
 var
@@ -1027,7 +1028,7 @@ var
    记录布局与 C++ ohos_bridge.h 严格一致（4 字节对齐、全指针字段）。
    --------------------------------------------------------------------- }
 const
-  OHOS_BRIDGE_VERSION = 13;   { 与 C++ fp_bridge.h 同步；布局或成员变更时 +1
+  OHOS_BRIDGE_VERSION = 14;   { 与 C++ fp_bridge.h 同步；布局或成员变更时 +1
                                （v5：TOHOSExportTable 增 set_launch_params 启动载荷；
                                  v6：增 dispatch 动态分发入口 + dispatch_result 回调；
                                  v7：增 dispatch_free 释放入口返回的 PChar；
@@ -1039,7 +1040,9 @@ const
                                  v12：TOHOSBridgeCallbacks 增 notify_first_frame（首帧上屏通知，
                                      消除"窗口 show → 首帧 flush 之间 XComponent 黑屏闪现"）；
                                  v13：TOHOSExportTable 增 arkts_invoke_result（Pascal→ArkTS 结果回传）；
-                                      TOHOSBridgeCallbacks 增 arkts_invoke（反向调用入口）） }
+                                      TOHOSBridgeCallbacks 增 arkts_invoke（反向调用入口）；
+                                 v14：TOHOSBridgeCallbacks 增 notify_timer_state（Pascal→ETS
+                                      定时器活动态通知，替代原先未装载的 dlsym）） }
 
   { 动态分发异步作业超时（毫秒）。设为 0 表示禁用超时处理（不做超时回收）。 }
   OHOS_DISPATCH_TIMEOUT_MS = 30000;
@@ -1252,6 +1255,11 @@ begin
 //  Pointer(_ohos_open_url)                   := cppApi.open_url;
   { v12：首帧上屏通知（Pascal FlushBuffer 成功后 → C++ NATIVE_CMD_FIRST_FRAME → ETS）}
   Pointer(_notify_first_frame)              := cppApi.notify_first_frame;
+  { v14：定时器活动态通知（Pascal → C++ NATIVE_CMD_TIMER_STATE → ETS）。
+    优先走桥接表；旧桥或空槽时再用 LibBridgeSym 兜底。 }
+  Pointer(_ohos_send_timer_state)           := cppApi.notify_timer_state;
+  if not Assigned(_ohos_send_timer_state) then
+    Pointer(_ohos_send_timer_state) := LibBridgeSym('ohos_send_timer_state');
   { 动态分发结果回传（v6）}
 //  _fpgui_dispatch_result                    := TDispatchResultFn(cppApi.dispatch_result);
 //  SetDispatchResultSink(@OhosDispatchResultSink);
@@ -5220,11 +5228,25 @@ end;
           wnd := FindWindowByHandle(gLastDownTargetWin);
           if wnd <> nil then
           begin
-            { The emulator's UP coords are unreliable (reported in yet
-              another space); reuse the DOWN position, normalised to the
-              delivery window. }
-            msg.mouse.x := gLastDownGlobX - wnd.Left;
-            msg.mouse.y := gLastDownGlobY - wnd.Top;
+            { UP 的原始坐标在多窗口/子窗口场景下可能来自另一个窗口的坐标系，
+              不能直接使用；但也不能一律退回 DOWN 点，否则拖拽松手时会丢失
+              终点（终端文本选择会退化成按下那一格）。
+              gCursorX/Y 是 DOWN/MOVE/hover 路径已经解析好的全局逻辑坐标：
+              - 普通点击：它等于 DOWN 点，行为与旧代码完全一致；
+              - 拖拽：它是最后一次 MOVE 的位置（即使该 MOVE 被后面的合并
+                节流丢弃，前面的重路由块也已经更新过 gCursor）。
+              再减去交付窗口原点，得到该窗口的客户区坐标。 }
+            if gCursorValid then
+            begin
+              msg.mouse.x := gCursorX - wnd.Left;
+              msg.mouse.y := gCursorY - wnd.Top;
+            end
+            else
+            begin
+              { 没有可用的指针位置时保持旧行为。 }
+              msg.mouse.x := gLastDownGlobX - wnd.Left;
+              msg.mouse.y := gLastDownGlobY - wnd.Top;
+            end;
             fpGUI_Hilog(LOG_INFO, 'TOUCH: UP x=' + IntToStr(msg.mouse.x) + ' y=' + IntToStr(msg.mouse.y) +
               ' toDownWin=' + IntToStr(PtrUInt(wnd)));
             fpgPostMessage(nil, wnd, FPGM_MOUSEUP, msg);
@@ -6743,6 +6765,7 @@ var
   fw: TfpgWidget;
   msg: TfpgMessageParams;
   fpgKey: word;
+  mapped: Boolean;
   ss: TShiftState;
   i, clen: Integer;
   text: string;
@@ -6891,24 +6914,52 @@ begin
         end;
     else { OHOS_EV_KEY }
       begin
-		// IME 文本中的换行符同时生成 FPGM_KEYPRESS  
-		if (ev^.UnicodeChar in [10,13]) then 
-		begin
-		    FillChar(msg, SizeOf(msg), 0);
-			msg.keyboard.keycode := keyReturn;
-			try
-			  fpgSendMessage(nil, dest, FPGM_KEYPRESS, msg);
-			except
-			  fpGUI_Hilog(LOG_INFO, 'ProcessQueuedKeyEvents ENTER dropped');
-			end;
-		end;
+        { 先统一映射 keycode；Enter 补发和下面的 raw-key 分支共用。 }
+        mapped := MapOhosKeyToFpgKey(ev^.KeyCode, fpgKey);
+
+        { Enter 补发：只补两种 raw-key 分支不会发 KEYPRESS 的情况：
+          1) DOWN 没有可映射 keycode（软键盘/IME 文本式 Enter）；
+          2) UP 且 DOWN 没有到达（HarmonyOS 6.1 下 TextInput 吞掉 DOWN，
+             只有 UP 到达，日志 act=1 uni=13）。
+          物理 DOWN 已经映射到 keyReturn 的，交给下面的 raw-key 分支，
+          这里不能再补，否则 OpenHarmony 6.0 会出现双回车。 }
+        if (ev^.UnicodeChar in [10, 13]) then
+        begin
+          if ev^.Action = OH_KEY_DOWN then
+          begin
+            if not mapped then
+            begin
+              FLastKeyDown := ev^.KeyCode;
+              FillChar(msg, SizeOf(msg), 0);
+              msg.keyboard.keycode := keyReturn;
+              try
+                fpgSendMessage(nil, dest, FPGM_KEYPRESS, msg);
+              except
+                fpGUI_Hilog(LOG_INFO, 'ProcessQueuedKeyEvents ENTER dropped');
+              end;
+            end;
+          end
+          else if (ev^.Action = OH_KEY_UP) and (FLastKeyDown <> ev^.KeyCode) then
+          begin
+            FillChar(msg, SizeOf(msg), 0);
+            msg.keyboard.keycode := keyReturn;
+            try
+              fpgSendMessage(nil, dest, FPGM_KEYPRESS, msg);
+            except
+              fpGUI_Hilog(LOG_INFO, 'ProcessQueuedKeyEvents ENTER dropped');
+            end;
+          end;
+        end;
 
         FillChar(msg, SizeOf(msg), 0);
 
         { Handle Unicode character input (from soft/hardware keyboard).
           Ctrl/Alt/Meta 组合是命令键，不产生字符输入（KEYCHAR）——否则
-          Ctrl+X/C/V 的字母被当普通字符插入（替换选中/污染粘贴）。 }
+          Ctrl+X/C/V 的字母被当普通字符插入（替换选中/污染粘贴）。
+          Enter 的 10/13 已由上面的 KEYPRESS 处理，不能再作为 KEYCHAR
+          发一次；否则 Enter unicode=10 的系统会再插入一个换行。 }
         if (ev^.UnicodeChar > 0) and (ev^.Action = OH_KEY_DOWN) and
+           (not (ev^.UnicodeChar in [10, 13])) and
            ((ev^.Modifiers and (OHOS_MODIFIER_CTRL or OHOS_MODIFIER_ALT or OHOS_MODIFIER_META)) = 0) then
         begin
           msg.keyboard.keychar := UnicodeCodepointToUTF8(ev^.UnicodeChar);
@@ -6935,7 +6986,7 @@ begin
         msg.keyboard.shiftstate := ss;
 
         { Handle raw key events }
-        if MapOhosKeyToFpgKey(ev^.KeyCode, fpgKey) then
+        if mapped then
         begin
           msg.keyboard.keycode := fpgKey;
           { DIAG: mapped keycode (dropdown keyboard debug) }
@@ -8022,15 +8073,22 @@ var
 begin
   if gTimerActiveCount < 0 then gTimerActiveCount := 0;
   active := Ord(gTimerActiveCount > 0);
+
+  { 懒加载兜底：正常情况下 ohos_bridge_connect 已从桥接表装载；
+    这里兼容旧桥/桥表空槽。 }
+  if not Assigned(_ohos_send_timer_state) then
+    Pointer(_ohos_send_timer_state) := LibBridgeSym('ohos_send_timer_state');
+
+  if not Assigned(_ohos_send_timer_state) then
+  begin
+    fpGUI_Hilog(LOG_INFO, 'Timer state notify unavailable (ohos_send_timer_state not found)');
+    Exit;   { 不要翻转 gTimerNotified，下一次启停仍可补发 }
+  end;
+
   if gTimerNotified = (active = 1) then Exit;   { 翻转才上抛 }
   gTimerNotified := not gTimerNotified;
-  if Assigned(_ohos_send_timer_state) then
-  begin
-    _ohos_send_timer_state(active);
-    fpGUI_Hilog(LOG_INFO, format('Timer state=%d (activeCount=%d)', [active, gTimerActiveCount]));
-  end
-  else
-    fpGUI_Hilog(LOG_INFO, 'Timer state notify unavailable (ohos_send_timer_state not found)');
+  _ohos_send_timer_state(active);
+  fpGUI_Hilog(LOG_INFO, format('Timer state=%d (activeCount=%d)', [active, gTimerActiveCount]));
 end;
 
 procedure TfpgOhosTimer.SetEnabled(const AValue: boolean);
