@@ -1,4 +1,4 @@
-import { AbilityConstant, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
+import { AbilityConstant, ConfigurationConstant, UIAbility, Want, abilityAccessCtrl } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
 import { settings } from '@kit.BasicServicesKit';
@@ -6,13 +6,60 @@ import fpbridge from 'libfp_bridge.so';
 import { startDispatchRelay, stopDispatchRelay } from '../common/FpDispatchRelay';
 import { bindOpenUrlContext, openUrl } from '../common/OpenUrl';
 import { APP_ARGS, WANT_PARAM_ARGS } from '../common/FpAppConfig';
-import type { Configuration } from '@kit.AbilityKit';
+import type { Configuration, Context, PermissionRequestResult, Permissions } from '@kit.AbilityKit';
 
 const DOMAIN = 0x0000;
 const TAG = 'fpbridge-Entry';
 
 let gWindowStage: window.WindowStage | null = null;
 let gAbility: UIAbility | null = null;
+
+// ── 启动时申请的 user_grant 权限 ─────────────────────────────────────
+// 启动只申请 READ_PASTEBOARD；其它 user_grant 权限先保留在数组中（注释），
+// 真正用到对应能力时取消注释即可。
+// PC/2in1：READ_PASTEBOARD 首次申请系统默认允许，不弹窗。
+// 手机/平板：会弹一次授权框，用户允许后长期有效。
+const STARTUP_PERMISSIONS: Array<Permissions> = [
+  // debug 签名包会因 grant 失败装不上；且每次启动都会弹授权框。
+  // 若将来确需系统剪贴板读取，需在 profile 里加 ACL 并在真正用到时再请求。
+  'ohos.permission.READ_PASTEBOARD', // 它是受限权限，需要 profile 的 ACL（系统签名才有）
+  // 以下按需开启：
+  // 'ohos.permission.READ_WRITE_DOCUMENTS_DIRECTORY',  // 文档目录
+  // 'ohos.permission.READ_WRITE_DOWNLOAD_DIRECTORY',   // Download (下载)
+  // 'ohos.permission.READ_WRITE_DCIM_DIRECTORY',       // DCIM (相机目录)
+  // 'ohos.permission.READ_WRITE_PICTURES_DIRECTORY',   // Pictures (图片)
+  // 'ohos.permission.READ_WRITE_VIDEOS_DIRECTORY',     // Videos (视频)
+  // 'ohos.permission.READ_WRITE_MUSIC_DIRECTORY',      // Music (音乐)
+  // 'ohos.permission.READ_WRITE_AUDIOS_DIRECTORY',     // Audios (录音/音频)
+  // 'ohos.permission.CAMERA',
+  // 'ohos.permission.MICROPHONE',
+  // 'ohos.permission.CUSTOM_SCREEN_CAPTURE',
+  // 'ohos.permission.APPROXIMATELY_LOCATION',
+  // 'ohos.permission.LOCATION',
+  // 'ohos.permission.ACCESS_BLUETOOTH'
+];
+let gStartupPermissionsRequested = false;
+
+function requestStartupPermissions(ctx: Context): void {
+  if (gStartupPermissionsRequested) return;
+  gStartupPermissionsRequested = true;
+  if (STARTUP_PERMISSIONS.length === 0) return;   // 无启动权限：不弹任何授权框
+  try {
+    const atManager = abilityAccessCtrl.createAtManager();
+    atManager.requestPermissionsFromUser(ctx, STARTUP_PERMISSIONS)
+      .then((result: PermissionRequestResult) => {
+        hilog.info(DOMAIN, TAG, 'startup permissions=%{public}s authResults=%{public}s',
+          JSON.stringify(result.permissions), JSON.stringify(result.authResults));
+      })
+      .catch((err: Error) => {
+        hilog.error(DOMAIN, TAG, 'startup permission request failed: %{public}s',
+          JSON.stringify(err));
+      });
+  } catch (err) {
+    hilog.error(DOMAIN, TAG, 'startup permission request error: %{public}s',
+      JSON.stringify(err));
+  }
+}
 
 // ── 启动载荷（want.uri/action/entities/parameters 全量 JSON）────────
 // 冷启动：Index.ets start(appLib, payload) → C++ argv[1] → RunLazarus；
@@ -273,6 +320,7 @@ export default class Fp_bridgeAbility extends UIAbility {
 
   onForeground(): void {
     hilog.info(DOMAIN, TAG, '%{public}s', 'Ability onForeground');
+    requestStartupPermissions(this.context);
   }
 
   onBackground(): void {

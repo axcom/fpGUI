@@ -20,9 +20,12 @@ target_link_libraries(fp_bridge PUBLIC
     libhilog_ndk.z.so
     libnative_window.so
     libnative_display_manager.so
+    # 系统剪贴板（Pasteboard）服务核心
     libpasteboard.so
+    # Unified Data Management (统一数据管理)
     libudmf.so
-    #libohenvironment.so
+    # ohos_get_user_dir 引用
+    libohenvironment.so
     # Binder (IPC Kit)：OH_Ability_CreateNativeChildProcess + OH_IPCRemoteProxy_*
     libchild_process.so
     libipc_capi.so)

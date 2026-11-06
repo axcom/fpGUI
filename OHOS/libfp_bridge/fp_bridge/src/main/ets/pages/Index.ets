@@ -6,7 +6,8 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { getWindowStage, getMainWindow, terminateAbility, getLaunchPayload, getMergedArgs } from '../fp_bridgeability/Fp_bridgeAbility';
 import { APP_LIB_NAME } from '../common/FpAppConfig';
-import { FpgSurface, FpgSurfaceCtrl, notifyFirstFrame, registerWindowPositionSync, unregisterWindowPositionSync } from '../common/FpgSurface';
+import { FpgSurface, FpgSurfaceCtrl, notifyFirstFrame, registerWindowPositionSync, unregisterWindowPositionSync, imeConsumedChar, imeConsumedDelete, imeTouchWindow, imeNoteWindowActive, imeNoteWindowInactive, imeSetWindowKind, imeClearWindowKind, isInputBlocked, setShakeWindowCallback, setModalStateCallback, refreshModalState } from '../common/FpgSurface';
+import { ohosKeyToUnicode } from '../common/FpKeyMap';
 import { TrayManager } from '../common/TrayManager';
 import { initTimerDaemon, startTimerTick, stopTimerTick } from '../common/TimerDaemon';
 import { initKeyboardDetector } from '../common/KeyboardDetector';
@@ -88,12 +89,16 @@ struct Index {
   private hiMetaDown: boolean = false;
   private lastShakeAt: number = 0;   // 模态抖动节流（连续 DROPPED 触发时防动画打断）
   // 位置同步统一交由 FpgSurface.PositionSync（主窗+子窗 150ms 轮询，windowRectChange 为即时通道）
-  // 主窗 XComponent 延迟创建：Pascal 创建命令（setupMainWindow resize 完成）后才渲染。
-  // XComponent surface（buffer 池）固定于创建时刻的窗口尺寸——若页面首帧就创建
-  // （窗口还是系统默认 1900x1260），surface=1900x1260 而 fpGUI buffer=期望客户区
-  // （如 1710x1045）→ 内容只画左上角，右/下黑边。延迟到窗口 resize 完成后创建
-  // → surface=期望尺寸 → buffer 1:1 填满，首帧黑边根治。
+  // 主窗 XComponent 延迟创建：Pascal 创建命令（setupMainWindow resize 完成）+
+  // 主窗 showWindow() 上树后才渲染。XComponent surface（buffer 池）固定于创建
+  // 时刻的窗口尺寸——若页面首帧就创建（窗口还是系统默认 1900x1260），
+  // surface=1900x1260 而 fpGUI buffer=期望客户区（如 1710x1045）→ 内容只画
+  // 左上角，右/下黑边。延迟到 resize+show 完成后创建 → surface=期望尺寸，
+  // buffer 1:1 填满；同时避开 KaihongOS API23 上「surface 节点父节点未上树 →
+  // AddModifierNG Invalid NodeId → InitRenderParams failed → 黑屏」的时序问题。
   @State mainReady: boolean = false;
+  // 主窗 XComponent 创建就绪定时器（-1=未布防）。等待窗口 show 后 RS 完成上树。
+  private mainReadyTimer: number = -1;
   // 光标统一 ArkTS（pointer.setPointerStyle）依赖：reqId → WindowManager windowId，
   // 与 setWindowPointerId 上报同步维护（创建 set、销毁 delete）。
   private winPointerIds: Map<number, number> = new Map();
@@ -111,6 +116,12 @@ struct Index {
   private mainFocusRetryToken: number = 0;
   private mainFocusRetryStep: number = 0;
   private imeNeedsReattach: boolean = false;
+  // 窗口状态去重：IME 开关会让 windowStatusChange 每 ~70ms 连发同一状态，
+  // 全量转发给 Pascal 会造成窗口状态风暴（表现为弹窗抖动）。
+  private lastWinStatus: Map<number, number> = new Map<number, number>();
+  // 模态窗口属性下发缓存（id → 1=可聚焦/可置顶）：只在变化时调用，避免
+  // 重复 setWindowFocusable(true) 把模态重新提到弹出菜单上面
+  private winModalFlags: Map<number, number> = new Map<number, number>();
 
   aboutToAppear(): void {
     fpbridge.setEtsReady();
@@ -151,6 +162,10 @@ struct Index {
   }
 
   aboutToDisappear(): void {
+    if (this.mainReadyTimer !== -1) {
+      clearTimeout(this.mainReadyTimer);
+      this.mainReadyTimer = -1;
+    }
     stopTimerTick();
   }
 
@@ -255,6 +270,22 @@ struct Index {
         };
         handleFileIo(fcmd);
         break;
+      case 22: {
+        // 模态窗显示 → 提到应用最前。若当前有弹出菜单/下拉存活则跳过，
+        // 防止这条异步命令晚到、把刚弹出的菜单盖住。
+        if (this.popupReqIds.size > 0) {
+          hilog.info(DOMAIN, TAG, 'raise_window req=%{public}d skipped (popup alive)', cmd.reqId);
+          break;
+        }
+        const rw = this.subWinMap.get(cmd.reqId);
+        if (rw !== undefined) {
+          rw.raiseToAppTop().catch((e: Error) => {
+            hilog.warn(DOMAIN, TAG, 'raiseToAppTop(req=%{public}d) failed: %{public}s',
+              cmd.reqId, JSON.stringify(e));
+          });
+        }
+        break;
+      }
       default:
         hilog.warn(DOMAIN, TAG, 'Unknown native command type=%{public}d', cmd.type);
     }
@@ -625,6 +656,7 @@ struct Index {
               this.mainWindowActive = true;
               this.imeNeedsReattach = true;
               hilog.info(DOMAIN, TAG, 'MainWindow event: active, IME reattach scheduled');
+              imeNoteWindowActive(1);
               this.scheduleMainFocusRestore(80);
               setTimeout(() => {
                 this.reattachMainIme('window active');
@@ -633,11 +665,14 @@ struct Index {
               this.mainWindowActive = false;
               this.imeNeedsReattach = true;
               hilog.info(DOMAIN, TAG, 'MainWindow event: inactive, IME reattach pending');
+              imeNoteWindowInactive(1);
             }
           });
         } catch (_e) {}
         try {
           mainWin.on('windowStatusChange', (status: window.WindowStatusType) => {
+            if (this.lastWinStatus.get(1) === status) return;   // 去重止抖
+            this.lastWinStatus.set(1, status);
             hilog.info(DOMAIN, TAG,
               'MainWindow statusChange: %{public}d', status);
             fpbridge.updateWindowState(1, status);
@@ -691,12 +726,17 @@ struct Index {
     // 弹出菜单/下拉（wtPopup）恒无标题栏；wtWindow/wtModalForm 按 waBorderless
     const isPopup = (wtype === 3);
     if (isPopup) this.popupReqIds.add(reqId);
+    // 登记窗口类型（模态/弹窗）供输入闸门判断
+    imeSetWindowKind(reqId, wtype);
     let decorEnabled = isPopup ? false : !hasBL;
     // fpGUI 期望系统装饰（非 popup 非 borderless）：legacy 回退丢装饰时
     // 用自绘标题栏（FpgSurface）替代——平时隐藏，需要时按主窗标题栏高展示。
     const wantedDecor = !isPopup && !hasBL;
 
     const winName: string = 'fpg_win_' + reqId;
+
+    // 记录已创建但尚未完成初始化的子窗口，失败时销毁，避免留下空白窗口
+    let createdWin: window.Window | undefined = undefined;
 
     try {
       // 创建时预估装饰高度：系统标题栏与主窗口同源（decH≈70px），总尺寸 = 客户区 + dec。
@@ -741,7 +781,22 @@ struct Index {
         hilog.info(DOMAIN, TAG, 'legacy createSubWindow OK (req=%{public}d)', reqId);
       }*/
       win = await ws.createSubWindow(winName);  //有些版本有标题栏&有些又没有，都自绘吧~
+      createdWin = win;
       decorEnabled = false;
+      // ── 激活事件必须【在 showWindow 之前】注册 ──
+      // 新子窗在 showWindow() 过程中就会收到 WINDOW_ACTIVE；而下方 windowEvent
+      // 的注册点在 setUIContent/resize/首帧等待等一串 await 之后（实测 0.5~1s），
+      // 新弹窗的首次激活会被漏掉 → 第一次打开无法录入，点一下别的窗口再回来才恢复。
+      try {
+        win.on('windowEvent', (t: number) => {
+          if (t === 2) {
+            hilog.info(DOMAIN, TAG, 'Sub-window %{public}d event: active (early)', reqId);
+            imeNoteWindowActive(reqId);
+          } else if (t === 3) {
+            imeNoteWindowInactive(reqId);
+          }
+        });
+      } catch (_e) {}
       /*/ 自绘标题栏判定：期望装饰但实际无装饰（OpenHarmony legacy 回退路径）
       const titleBar = wantedDecor && !decorEnabled;
       hilog.info(DOMAIN, TAG,
@@ -863,6 +918,21 @@ struct Index {
       // 窗口背景色兜底（部分版本 setUIContent 后才生效）
       try { win.setWindowBackgroundColor('#00000000'); } catch (_e) {}
       await win.showWindow();
+      // ── 弹出菜单/下拉（wtPopup）必须压在模态之上 ──
+      // 模态可能被 raiseToAppTop() 提到应用最前（被阻塞点击时），之后新建的子窗
+      // 会落在它下面：表现为菜单被模态盖住、点菜单项反而点到模态（抖动）。
+      if (isPopup) {
+        win.raiseToAppTop().catch((e: Error) => {
+          hilog.warn(DOMAIN, TAG, 'popup raiseToAppTop req=%{public}d failed: %{public}s',
+            reqId, JSON.stringify(e));
+        });
+      }
+      // ── 系统级模态（wtModalForm）──
+      // 注意：不要用 setSubWindowModal。实测 API 24 模拟器上它能成功，但系统级
+      // 模态会把【同级子窗】（=弹出菜单/下拉框）压到模态下面：菜单被盖住、点中
+      // 菜单项实际点到模态（抖动）。PC(KaihongOS) 上它返回 801 无效。
+      // 模态行为（输入拦截、焦点、抖动、置顶）已由 ETS 闸门 + 窗口属性完成。
+      // if (wtype === 2) { await win.setSubWindowModal(true, ModalityType.WINDOW_MODALITY); }
 
       // ── 窗口可见后二次校正尺寸 ──
       // 部分版本在窗口未显示时 resize 不生效（创建 windowRect=客户区值被当总尺寸，
@@ -1020,6 +1090,7 @@ struct Index {
               this.subWinMap.delete(reqId);
               this.lastSubSize.delete(reqId);
               unregisterWindowPositionSync(reqId);
+              imeClearWindowKind(reqId);
               if (!this.hasLiveSubWindow()) this.forceMainKeyFocus();
             }, 120);
           }
@@ -1028,6 +1099,8 @@ struct Index {
       } catch (_e) {}
       try {
         win.on('windowEvent', (t: number) => {
+          // t=2/t=3（激活/失焦）已在 showWindow 之前用“early”监听器处理，
+          // 这里只兜底 t=7，避免同一事件被处理两次（会重复 attach）。
           if (t === 7) {   // WINDOW_DESTROYED：窗口已被系统销毁
             hilog.info(DOMAIN, TAG, 'Window %{public}d destroyed by system', reqId);
             fpbridge.onWindowClosed(reqId);
@@ -1041,6 +1114,9 @@ struct Index {
             unregisterWindowPositionSync(reqId);
             this.subWinMap.delete(reqId);
             this.lastSubSize.delete(reqId);
+            this.lastWinStatus.delete(reqId);
+            this.winModalFlags.delete(reqId);
+            imeClearWindowKind(reqId);
             this.imeNeedsReattach = true;
             // 系统关闭子窗后主窗可能未获得焦点：延迟强制恢复
             setTimeout(() => {
@@ -1056,6 +1132,8 @@ struct Index {
       } catch (_e) {}
       try {
         win.on('windowStatusChange', (status: window.WindowStatusType) => {
+          if (this.lastWinStatus.get(reqId) === status) return;   // 去重止抖
+          this.lastWinStatus.set(reqId, status);
           fpbridge.updateWindowState(reqId, status);
         });
       } catch (_e) {}
@@ -1064,6 +1142,12 @@ struct Index {
         'Sub-window %{public}d created: %{public}dx%{public}d at (%{public}d,%{public}d) xcId=%{public}s',
         reqId, width, height, posX, posY, xcId);
       this.subWinMap.set(reqId, win);
+      // 新建窗口默认可聚焦/可置顶：若当前有模态，需要重新压一次属性
+      refreshModalState();
+      // 上面的属性下发可能把模态又抬起来：弹出菜单再压一次，确保在最上层
+      if (isPopup) {
+        win.raiseToAppTop().catch(() => {});
+      }
       // 位置同步（FpgSurface.PositionSync）：子窗位置变化（输入法避让/系统移动）实时上报 Pascal
       registerWindowPositionSync(reqId, () => this.subWinMap.get(reqId));
       return true;
@@ -1071,8 +1155,43 @@ struct Index {
       hilog.warn(DOMAIN, TAG,
         'createSubWin failed for req %{public}d: code=%{public}d msg=%{public}s',
         reqId, err.code, err.message || '');
+
+      // setUIContent/showWindow 失败时，子窗口可能已经创建但未登记到 subWinMap
+      if (createdWin !== undefined) {
+        try {
+          await createdWin.destroyWindow();
+          hilog.info(DOMAIN, TAG,
+            'destroyed partial sub-window req=%{public}d', reqId);
+        } catch (e) {
+          hilog.warn(DOMAIN, TAG,
+            'destroy partial sub-window req=%{public}d failed: %{public}s',
+            reqId, JSON.stringify(e));
+        }
+      }
+
+      imeClearWindowKind(reqId);
       return false;
     }
+  }
+
+  // ── 主窗 XComponent 延迟创建（showWindow 之后）────────────────────────
+  // 为什么必须由 ETS 主动 show，而不是等 Pascal 的 ShowWindow 命令：
+  //   ohos_create_window() 会阻塞等待 XComponent onLoad 上报 surfaceId；
+  //   Pascal 只有拿到窗口句柄（create 返回）后才会发 ShowWindow。
+  //   若 mainReady 一直等 Pascal 的 ShowWindow，会互锁 10s 超时 → 创建失败。
+  // 因此这里先主动 showWindow()（Pascal 之后的 ShowWindow 幂等），再延迟
+  // delayMs 让 RenderService 把窗口节点挂到 RS 树上，最后才置 mainReady
+  // 触发 FpgSurface/XComponent 创建，避免 surface 父节点 isOnTheTree_=0。
+  private scheduleMainReadyAfterShow(delayMs: number, reason: string): void {
+    if (this.mainReady || this.mainReadyTimer !== -1) return;
+    this.mainReadyTimer = setTimeout(() => {
+      this.mainReadyTimer = -1;
+      if (this.mainReady) return;
+      this.mainReady = true;
+      hilog.info(DOMAIN, TAG,
+        'mainReady=true after window show + %{public}dms (%{public}s): create FpgSurface',
+        delayMs, reason);
+    }, delayMs);
   }
 
   private async createWindowFromNative(reqId: number, xcId: string,
@@ -1129,8 +1248,23 @@ struct Index {
             }
           } catch (_e) {}
         }
-        // 窗口尺寸已到位 → 创建主窗 XComponent（onLoad 上报 surface 时=期望客户区）
-        this.mainReady = true;
+        // ── 主窗 showWindow 后再创建 XComponent（KaihongOS API23 上树时序）──
+        // 1) 主动 show 主窗（不能等 Pascal 的 ShowWindow，见 scheduleMainReadyAfterShow 注释）；
+        // 2) 留 400ms 给 RS 完成窗口节点上树/首帧事务；
+        // 3) 再置 mainReady 创建 FpgSurface/XComponent。
+        // 注意：XComponent onLoad 会上报 surfaceId 唤醒阻塞中的 ohos_create_window，
+        // 因此这 400ms 也计入 Pascal create 的等待时间（总耗时 <10s 超时）。
+        try {
+          const mw = getMainWindow();
+          if (mw !== null) {
+            try {
+              hilog.info(DOMAIN, TAG,
+                'MainWindow showWindow before XComponent (mainReady=0)');
+              await mw.showWindow();
+            } catch (_e) {}
+          }
+        } catch (_e) {}
+        this.scheduleMainReadyAfterShow(400, 'createWindow');
         // 注册隐藏 TextInput 焦点恢复回调（子窗关闭后恢复主窗键盘焦点）
         this.imeCtrl.focusHiddenInput = (): void => {
           this.focusHiddenInput();
@@ -1144,6 +1278,15 @@ struct Index {
         this.imeCtrl.forceKeyFocus = (): void => {
           this.forceMainKeyFocus();
         };
+        // 模态反馈抖动：被阻塞窗口的点击不会进 Pascal，由 ETS 直接触发同一动画
+        // （模块级回调：子窗页面有自己的 ctrl，挂 ctrl 上会失效）
+        setShakeWindowCallback((target: number, from: number): void => {
+          this.shakeWindow(target, from);
+        });
+        // 模态窗口属性：标题栏是系统装饰、不经过 ArkUI 事件，只能靠窗口属性拦
+        setModalStateCallback((top: number): void => {
+          this.applyModalWindowState(top);
+        });
         // 延迟聚焦隐藏 TextInput（等 build 完成后生效）
         setTimeout(() => {
           this.focusHiddenInput();
@@ -1158,6 +1301,15 @@ struct Index {
         if (!(await this.createSubWin(reqId, xcId, width, height, posX, posY, attrs, wtype, title))) {
           hilog.warn(DOMAIN, TAG,
             'createSubWin failed for req %{public}d (no fallback inline window)', reqId);
+
+          // 立即唤醒 C++ ohos_create_window，避免其等满 10 秒
+          try {
+            fpbridge.notifyWindowCreateFailed(reqId);
+          } catch (e) {
+            hilog.error(DOMAIN, TAG,
+              'notifyWindowCreateFailed(req=%{public}d) failed: %{public}s',
+              reqId, JSON.stringify(e));
+          }
         }
       } finally {
         this.creatingSubWinCount -= 1;
@@ -1170,6 +1322,8 @@ struct Index {
       this.winPointerIds.delete(reqId);
     } catch (_e) {}
     this.popupReqIds.delete(reqId);
+    this.winModalFlags.delete(reqId);
+    imeClearWindowKind(reqId);
     unregisterWindowPositionSync(reqId);
     // 清理自绘标题栏存储（句柄/标志，防复用错配）
     AppStorage.delete('titleBar_' + reqId);
@@ -1325,6 +1479,13 @@ struct Index {
       if (mainWin !== null) {
         try { await mainWin.showWindow(); } catch (_e) {}
       }
+      hilog.info(DOMAIN, TAG,
+        'MainWindow showWindow command: mainReady=%{public}d', this.mainReady ? 1 : 0);
+      // 兜底：创建流程异常未布防 mainReady 时，窗口已 show 也补一次延迟创建，
+      // 避免 Pascal 永远等不到 XComponent onLoad（ohos_create_window 10s 超时）。
+      if (!this.mainReady && this.mainReadyTimer === -1) {
+        this.scheduleMainReadyAfterShow(400, 'showWindow fallback');
+      }
       // 恢复后确保主窗 XComponent 系统键盘焦点（托盘收起/恢复后焦点丢失，
       // onKeyEvent 不触发 → 键盘无效；FpgSurface 交互即聚焦为兜底）
       try { if (this.imeCtrl.focus) this.imeCtrl.focus(); } catch (_e) {}
@@ -1353,15 +1514,53 @@ struct Index {
     }
   }
 
-  private async shakeWindow(reqId: number): Promise<void> {
+  // 模态窗口属性：非最上层窗口禁止聚焦 + 禁止点击置顶。
+  // 标题栏是系统装饰，点击不经过 ArkUI 事件（我们的输入闸门看不到），
+  // 只会走窗口管理器 → 不设这两个属性的话，点标题栏就能自由切换窗口。
+  // 弹窗（wtPopup）放行，否则模态内的下拉/菜单点不开。
+  private applyModalWindowState(topReqId: number): void {
+    const allowAll: boolean = topReqId <= 0;
+    // 只在状态变化时下发：重复调用 setWindowFocusable(true) 会把窗口重新提到
+    // 最前，导致刚创建的弹出菜单被模态盖住（菜单只露出一部分、点不中）。
+    const setFlags = (w: window.Window, id: number, allow: boolean): void => {
+      const key: number = allow ? 1 : 0;
+      if (this.winModalFlags.get(id) === key) return;
+      this.winModalFlags.set(id, key);
+      w.setWindowFocusable(allow).catch((e: Error) => {
+        hilog.warn(DOMAIN, TAG, 'setWindowFocusable(%{public}d,%{public}d) failed: %{public}s',
+          id, key, JSON.stringify(e));
+      });
+      w.setRaiseByClickEnabled(allow).catch((e: Error) => {
+        hilog.warn(DOMAIN, TAG, 'setRaiseByClickEnabled(%{public}d,%{public}d) failed: %{public}s',
+          id, key, JSON.stringify(e));
+      });
+    };
+    try {
+      const mw = getMainWindow();
+      if (mw !== null) {
+        setFlags(mw, 1, allowAll || topReqId === 1);
+      }
+    } catch (_e) {}
+    this.subWinMap.forEach((w: window.Window, id: number) => {
+      setFlags(w, id, allowAll || id === topReqId || this.popupReqIds.has(id));
+    });
+    hilog.info(DOMAIN, TAG, 'modal window state: top=%{public}d', topReqId);
+  }
+
+  private async shakeWindow(reqId: number, fromReqId: number = 1): Promise<void> {    const win = this.subWinMap.get(reqId);
+    // 置顶必须每次都做，且不受抖动节流限制：点击被阻塞的兄弟窗口时，系统会
+    // 把它 raise 到最前（子窗默认 raise-by-click），模态就被盖住了。
+    // raiseToAppTop 只作用于同父窗、同类型的兄弟子窗，正好是这些对话框。
+    if (win !== undefined) {
+      win.raiseToAppTop().catch(() => {});
+    }
     // 节流：鼠标悬停/拖动在模态外会高频触发 DROPPED → 连续 shake 互相打断，
     // 动画永远走不完（看不到抖动）。500ms（>一次完整序列时长）内只执行一次。
     const now = Date.now();
     if (now - this.lastShakeAt < 500) return;
     this.lastShakeAt = now;
     hilog.info(DOMAIN, TAG, 'shakeWindow: reqId=%d (modal feedback)', reqId);
-    const win = this.subWinMap.get(reqId);
-    if (win !== undefined) {
+    if (win === undefined) return;
       try {
         const p: window.WindowProperties = win.getWindowProperties();
         const x0 = p.windowRect.left;
@@ -1397,8 +1596,16 @@ struct Index {
         // 目标已 showWindow 且已加载内容；focusControl.requestFocus 无法跨窗口
         // 切系统焦点，必须用 window.shiftAppWindowFocus。
         try {
+          // 源窗口 = 实际被点击的那个窗口（点击会让它临时激活）；写死主窗时，
+          // 嵌套模态（焦点在下层模态）下 shift 不生效，模态不会被压回最前。
           const mainWin = getMainWindow();
-          const srcId: number = mainWin ? mainWin.getWindowProperties().id : 0;
+          let srcId: number = 0;
+          try {
+            const srcWin = (fromReqId > 0 && fromReqId !== reqId)
+              ? this.subWinMap.get(fromReqId) : undefined;
+            if (srcWin !== undefined) srcId = srcWin.getWindowProperties().id;
+            else if (mainWin) srcId = mainWin.getWindowProperties().id;
+          } catch (_e) {}
           const dstId: number = win.getWindowProperties().id;
           if (srcId > 0 && dstId > 0) {
             window.shiftAppWindowFocus(srcId, dstId).catch(() => {});
@@ -1406,7 +1613,6 @@ struct Index {
           }
         } catch (_e) {}
       } catch (_e) {}
-    }
   }
 
   // 清理已销毁但未收到 windowEvent t=7 的子窗记录（右键菜单/popup 常见）。
@@ -1451,6 +1657,7 @@ struct Index {
   // 主窗重新激活后强制重连 IME：仅恢复隐藏 TextInput 焦点不够，
   // 字母键会只有 KEYUP、没有 insertText。必须 stop→attach 新会话。
   private reattachMainIme(reason: string): void {
+    if (isInputBlocked(1)) return;   // 模态期间：主窗不得抢回 IME 会话
     if (!this.mainWindowActive) return;
     if (this.creatingSubWinCount > 0 || this.hasLiveSubWindow()) return;
     if (this.imeCtrl.ensureImeAttached === undefined) return;
@@ -1461,6 +1668,7 @@ struct Index {
 
   // 用户按下主窗时强制恢复按键捕获焦点：0/120/300ms 重试，直到 onFocus 确认。
   private forceMainKeyFocus(): void {
+    if (isInputBlocked(1)) return;   // 模态期间：主窗不得抢焦点/IME
     if (this.creatingSubWinCount > 0 || this.hasLiveSubWindow()) return;
     if (this.imeNeedsReattach) {
       setTimeout(() => {
@@ -1489,6 +1697,7 @@ struct Index {
   // 聚焦隐藏 TextInput（子窗关闭后恢复主窗键盘焦点）
   private focusHiddenInput(): void {
     try {
+      imeTouchWindow(1);   // 主窗重新成为键盘目标（子窗关闭后 show_keyboard 路由）
       const ok: boolean = focusControl.requestFocus('hidden_digit_input');
       hilog.info(DOMAIN, TAG, 'Index focusHiddenInput: ok=%{public}d', ok ? 1 : 0);
       if (!ok) {
@@ -1509,8 +1718,8 @@ struct Index {
     Stack() {
       // 主窗口渲染 surface（固定 reqId=1；XComponent/IME/事件转发全部在
       // 公共组件 FpgSurface 内；其它窗口由 createSubWin 创建系统子窗口）。
-      // mainReady 延迟创建：窗口 resize 到期望尺寸后才渲染 XComponent，
-      // 保证 surface（固定于创建时刻）尺寸=期望客户区 → 首帧无黑边。
+      // mainReady 延迟创建：窗口 resize 到期望尺寸、并 show 完成后再渲染
+      // XComponent，保证 surface（固定于创建时刻）尺寸=期望客户区 → 首帧无黑边。
       if (this.mainReady) {
         FpgSurface({ reqId: 1, ctrl: this.imeCtrl })
       }
@@ -1532,6 +1741,7 @@ struct Index {
           .enableKeyboardOnFocus(false)
           .defaultFocus(true)
           .onKeyEvent((event: KeyEvent): boolean => {
+            if (isInputBlocked(1)) return true;   // 模态期间：主窗不接收按键
             const kc: number = event.keyCode as number;
             const isDown: boolean = (event.type as number) === 0;
             const act: number = isDown ? 0 : 1;
@@ -1542,24 +1752,25 @@ struct Index {
             else if (kc === 2076 || kc === 2077) this.hiMetaDown = isDown;
             const mods: number = (this.hiCtrlDown ? 1 : 0) | (this.hiShiftDown ? 2 : 0)
               | (this.hiAltDown ? 4 : 0) | (this.hiMetaDown ? 8 : 0);
-            // 计算 unicode（字母/数字/符号）
-            let uni: number = 0;
-            if (kc >= 2000 && kc <= 2009) {
-              uni = 48 + (kc - 2000);  // '0'-'9'
-            } else if (kc >= 2017 && kc <= 2042) {
-              const base: number = 'a'.charCodeAt(0) + (kc - 2017);
-              uni = (mods & 2) !== 0 ? base - 32 : base;  // shift → 大写
-            } else if (kc === 2050) {
-              uni = 32;  // space
-            } else if (kc === 2049) {
+            // 计算 unicode（字母/数字/符号，含 Shift 上档）
+            let uni: number = ohosKeyToUnicode(kc, (mods & 2) !== 0);
+            if (kc === 2049) {
               uni = 9;   // tab
             } else if (kc === 2054) {
               uni = 13;  // enter
             }
-            // Backspace/Delete：放行让 IME 路径处理（已有 deleteLeft/deleteRight 回调），
-            // 避免双删（hidden TextInput 转发 + IME 回调双发）。
+            // Backspace/Delete：IME 已注入删除命令 → 丢弃防双删；否则转发给 Pascal 并消费。
+            // 不能 return false：PC 上 IME 英文模式把退格放行给应用（无 deleteLeft 回调），
+            // TextInput 会自行消费该键，Pascal 收不到 KEYPRESS → 终端退格失效。
             if (kc === 2055 || kc === 2071) {
-              return false;
+              if (imeConsumedDelete(kc)) {
+                return true;
+              }
+              fpbridge.onKeyEvent(kc, act, mods, uni);
+              return true;
+            }
+            if (imeConsumedChar(uni)) {
+              return true;  // IME 刚 insertText 过同一个字符，物理键不再重复插入
             }
             // 所有其他键统一转发，不区分类型——TextInput 不处理任何东西（纯传 key 工具人）
             fpbridge.onKeyEvent(kc, act, mods, uni);

@@ -20,6 +20,7 @@
 #include <database/pasteboard/oh_pasteboard.h>
 #include <database/udmf/udmf.h>
 #include <database/udmf/uds.h>
+#include <filemanagement/environment/oh_environment.h>
 #include "hilog/log.h"
 #include "napi/native_api.h"
 #include "fp_bridge_internal.h"
@@ -95,9 +96,6 @@ std::mutex g_resizeMutex;
 
 // ── 窗口属性暂存 ──────────────────────────────────────────
 int g_nextReqId = 1;
-
-// ── Modal 窗口跟踪 ─────────────────────────────────────────
-int g_modalReqId = -1;
 
 // ── 主窗口装饰尺寸 ──────────────────
 int32_t g_mainDecW = 0;
@@ -221,6 +219,9 @@ __attribute__((visibility("default"))) void* ohos_create_window(WindowOptions* o
 
     SendNativeCommand(cmd);
 
+    OHNativeWindow* win = nullptr;
+    bool failed = false;
+
     {
         std::unique_lock<std::mutex> lock(g_xcMutex);
         if (!g_xcCV.wait_for(lock, std::chrono::seconds(10),
@@ -235,10 +236,31 @@ __attribute__((visibility("default"))) void* ohos_create_window(WindowOptions* o
             delete req;
             return nullptr;
         }
+
+        // 唤醒后统一在锁内读取结果并摘除请求，避免与 notify 并发访问 map
+        failed = req->failed;
+        win    = req->nativeWin;
+        g_xcReqs.erase(reqId);
     }
 
-    OHNativeWindow* win = req->nativeWin;
-    g_xcReqs.erase(reqId);
+    // ETS 明确报告创建失败：立即失败返回，不再走普通“无 native window”分支
+    if (failed) {
+        if (win != nullptr) {
+            OH_NativeWindow_DestroyNativeWindow(win);
+            win = nullptr;
+        }
+
+        auto* cleanup = new NativeCommandData();
+        cleanup->type  = NATIVE_CMD_DESTROY_WINDOW;
+        cleanup->reqId = reqId;
+        SendNativeCommand(cleanup);
+
+        OH_LOG_Print(LOG_APP, LOG_ERROR, 0xFF00, "fpGUI",
+            "ohos_create_window FAILED: ETS reported create failure for req %{public}d", reqId);
+
+        delete req;
+        return nullptr;
+    }
 
     if (win) {
         {
@@ -285,6 +307,34 @@ __attribute__((visibility("default"))) void* ohos_create_window(WindowOptions* o
     return win;
 }
 
+// ── ETS 子窗口创建失败通知（唤醒 ohos_create_window 等待）──────────────
+// 由 napi_init.cpp 的 notifyWindowCreateFailed 调用。
+// reqId 可能已被 10s 超时路径 erase + delete，因此必须先查 map；
+// 找不到就安全返回，绝不能解引用旧指针。
+__attribute__((visibility("default")))
+void ohos_notify_window_create_failed(int reqId) {
+    bool found = false;
+
+    {
+        std::lock_guard<std::mutex> lock(g_xcMutex);
+        auto it = g_xcReqs.find(reqId);
+        if (it != g_xcReqs.end() && it->second != nullptr) {
+            // done 仍保持 false：done 专指 surface 已就绪，failed 单独表达失败
+            it->second->failed = true;
+            found = true;
+        }
+    }
+
+    if (found) {
+        OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "fpGUI",
+            "notifyWindowCreateFailed: req %{public}d marked failed", reqId);
+        g_xcCV.notify_all();
+    } else {
+        OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "fpGUI",
+            "notifyWindowCreateFailed: req %{public}d not found (finished/timeout already)", reqId);
+    }
+}
+
 // ── 销毁窗口 ──────────────────────────────────────────────
 __attribute__((visibility("default"))) void ohos_destroy_window(void* handle) {
     if (!handle) return;
@@ -309,6 +359,9 @@ __attribute__((visibility("default"))) void ohos_destroy_window(void* handle) {
     {
         std::lock_guard<std::mutex> lock(g_winMutex);
         g_winRects.erase(reqId);
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_xcMutex);
         g_xcReqs.erase(reqId);
     }
     {
@@ -380,11 +433,23 @@ __attribute__((visibility("default"))) void ohos_set_window_visible(void* handle
     SendNativeCommand(cmd);
 }
 
-// ── Modal 窗口跟踪 ────────────────────────────────────────
+// ── Modal 窗口通知 ────────────────────────────────────────
+// Pascal（fpg_ohos.pas 的 DoSetWindowVisible）在模态窗显示/隐藏时调用：
+//   handle != nil → 模态显示：通知 ETS 把它提到应用最前（NATIVE_CMD_RAISE_WINDOW）
+//   handle == nil → 模态清除：只记日志，不置顶
+// 注意：不能直接调 ArkTS，必须经 SendNativeCommand 投递到 ETS。
+// 只在 handle 非空时发命令，避免异步命令晚到把刚弹出的菜单盖住（ETS 侧还有
+// popup 存活判断作为第二道保护）。
 __attribute__((visibility("default"))) void ohos_set_modal_window(void* handle) {
-    g_modalReqId = handle ? FindReqIdByHandle(handle) : -1;
+    int reqId = handle ? FindReqIdByHandle(handle) : -1;
     OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "fpGUI",
-        "ohos_set_modal_window: handle=%{public}p reqId=%{public}d", handle, g_modalReqId);
+        "ohos_set_modal_window: handle=%{public}p reqId=%{public}d", handle, reqId);
+    if (reqId < 0) return;
+    auto* cmd = new NativeCommandData();
+    memset(cmd, 0, sizeof(*cmd));
+    cmd->type = NATIVE_CMD_RAISE_WINDOW;
+    cmd->reqId = reqId;
+    SendNativeCommand(cmd);
 }
 
 // ── 抖动窗口 (modal 反馈) ────────────────────────────────
@@ -408,6 +473,103 @@ __attribute__((visibility("default"))) int ohos_set_pointer_style(void* handle, 
     cmd->x = style;
     SendNativeCommand(cmd);
     return 0;
+}
+
+// ── 剪贴板文本提取辅助 ────────────────────────────────────────────────
+// 浏览器等应用复制的内容，主记录可能是 HTML，纯文本在后续 record 里；
+// 这里按“纯文本 → 任意 record 纯文本 → HTML 纯内容/HTML → 超链接”依次回退。
+static char* ClipboardDupText(const char* text) {
+    if (!text || text[0] == '\0') return nullptr;
+    return strdup(text);
+}
+
+static char* ClipboardPlainTextFromUds(OH_UdsPlainText* pt) {
+    if (!pt) return nullptr;
+    return ClipboardDupText(OH_UdsPlainText_GetContent(pt));
+}
+
+static char* ClipboardHtmlFromUds(OH_UdsHtml* html) {
+    if (!html) return nullptr;
+    char* text = ClipboardDupText(OH_UdsHtml_GetPlainContent(html));
+    if (text) return text;
+    return ClipboardDupText(OH_UdsHtml_GetContent(html));
+}
+
+static char* ClipboardExtractText(OH_UdmfData* data) {
+    if (!data) return nullptr;
+
+    // 1. 主记录纯文本（最快路径）
+    OH_UdsPlainText* pt = OH_UdsPlainText_Create();
+    if (pt) {
+        if (OH_UdmfData_GetPrimaryPlainText(data, pt) == 0) {
+            char* text = ClipboardPlainTextFromUds(pt);
+            OH_UdsPlainText_Destroy(pt);
+            if (text) return text;
+        } else {
+            OH_UdsPlainText_Destroy(pt);
+        }
+    }
+
+    const int count = OH_UdmfData_GetRecordCount(data);
+
+    // 2. 任意 record 的纯文本（浏览器复制常把 HTML 放在主记录）
+    for (int i = 0; i < count; ++i) {
+        OH_UdmfRecord* rec = OH_UdmfData_GetRecord(data, static_cast<unsigned int>(i));
+        if (!rec) continue;
+        pt = OH_UdsPlainText_Create();
+        if (!pt) continue;
+        if (OH_UdmfRecord_GetPlainText(rec, pt) == 0) {
+            char* text = ClipboardPlainTextFromUds(pt);
+            OH_UdsPlainText_Destroy(pt);
+            if (text) return text;
+        } else {
+            OH_UdsPlainText_Destroy(pt);
+        }
+    }
+
+    // 3. 主记录 HTML：优先取 HTML 的 plain content
+    OH_UdsHtml* html = OH_UdsHtml_Create();
+    if (html) {
+        if (OH_UdmfData_GetPrimaryHtml(data, html) == 0) {
+            char* text = ClipboardHtmlFromUds(html);
+            OH_UdsHtml_Destroy(html);
+            if (text) return text;
+        } else {
+            OH_UdsHtml_Destroy(html);
+        }
+    }
+
+    // 4. 任意 record 的 HTML
+    for (int i = 0; i < count; ++i) {
+        OH_UdmfRecord* rec = OH_UdmfData_GetRecord(data, static_cast<unsigned int>(i));
+        if (!rec) continue;
+        html = OH_UdsHtml_Create();
+        if (!html) continue;
+        if (OH_UdmfRecord_GetHtml(rec, html) == 0) {
+            char* text = ClipboardHtmlFromUds(html);
+            OH_UdsHtml_Destroy(html);
+            if (text) return text;
+        } else {
+            OH_UdsHtml_Destroy(html);
+        }
+    }
+
+    // 5. 超链接 URL 兜底
+    for (int i = 0; i < count; ++i) {
+        OH_UdmfRecord* rec = OH_UdmfData_GetRecord(data, static_cast<unsigned int>(i));
+        if (!rec) continue;
+        OH_UdsHyperlink* link = OH_UdsHyperlink_Create();
+        if (!link) continue;
+        if (OH_UdmfRecord_GetHyperlink(rec, link) == 0) {
+            char* text = ClipboardDupText(OH_UdsHyperlink_GetUrl(link));
+            OH_UdsHyperlink_Destroy(link);
+            if (text) return text;
+        } else {
+            OH_UdsHyperlink_Destroy(link);
+        }
+    }
+
+    return nullptr;
 }
 
 // ── 剪贴板 pasteboard + UDMF ──────────────────────────────────────────────
@@ -446,14 +608,7 @@ __attribute__((visibility("default"))) char* ohos_clipboard_get_text(void) {
     }
     char* out = nullptr;
     if (data && status == 0) {
-        OH_UdsPlainText* pt = OH_UdsPlainText_Create();
-        if (pt) {
-            if (OH_UdmfData_GetPrimaryPlainText(data, pt) == 0) {
-                const char* c = OH_UdsPlainText_GetContent(pt);
-                if (c) out = strdup(c);
-            }
-            OH_UdsPlainText_Destroy(pt);
-        }
+        out = ClipboardExtractText(data);
     }
     if (data) OH_UdmfData_Destroy(data);
     if (pb) OH_Pasteboard_Destroy(pb);
@@ -463,7 +618,82 @@ __attribute__((visibility("default"))) char* ohos_clipboard_get_text(void) {
 }
 
 // ──── 用户目录 ────
+// 公共用户目录（10–16）：
+//   10 Documents、11 Download、12 DCIM(Camera)、13 Pictures、14 Videos、15 Music(Audio)、16 Audios
+// OH_Environment 需要 READ_WRITE_DOCUMENTS/DOWNLOAD_DIRECTORY；未授权时回退到
+// /storage/media/<userId>/local/files，不影响只取路径的场景。
+static std::string StripDirSuffix(std::string value, const std::string& suffix) {
+    if (value.size() >= suffix.size() &&
+        value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0) {
+        value.erase(value.size() - suffix.size());
+    }
+    return value;
+}
+
+static std::string GetPublicFilesRoot() {
+    char* doc = nullptr;
+    if (OH_Environment_GetUserDocumentDir(&doc) == 0 && doc && doc[0] != '\0') {
+        std::string docPath(doc);
+        free(doc);
+        std::string root = StripDirSuffix(docPath, "/Docs/Documents");
+        if (root == docPath) {
+            root = StripDirSuffix(docPath, "/Documents");
+            root = StripDirSuffix(root, "/Docs");
+        }
+        if (!root.empty() && root != docPath) {
+            return root;
+        }
+    } else if (doc) {
+        free(doc);
+    }
+    return "/storage/media/100/local/files";
+}
+
+static bool GetEnvironmentDir(bool download, std::string& out) {
+    char* path = nullptr;
+    FileManagement_ErrCode rc = download ? OH_Environment_GetUserDownloadDir(&path)
+                                         : OH_Environment_GetUserDocumentDir(&path);
+    if (rc == 0 && path && path[0] != '\0') {
+        out.assign(path);
+        free(path);
+        return true;
+    }
+    if (path) free(path);
+    return false;
+}
+
+static void ResolvePublicUserDir(int dirType, char* out, size_t outSize) {
+    std::string root = GetPublicFilesRoot();
+    std::string path;
+    switch (dirType) {
+        case 10:
+            if (!GetEnvironmentDir(false, path)) {
+                path = root + "/Docs/Documents";
+            }
+            break;
+        case 11:
+            if (!GetEnvironmentDir(true, path)) {
+                path = root + "/Docs/Download";
+            }
+            break;
+        case 12: path = root + "/Camera"; break;
+        case 13: path = root + "/Pictures"; break;
+        case 14: path = root + "/Videos"; break;
+        case 15: path = root + "/Audio"; break;
+        case 16: path = root + "/Audios"; break;
+        default: path = root; break;
+    }
+    snprintf(out, outSize, "%s", path.c_str());
+}
+
 __attribute__((visibility("default"))) char* ohos_get_user_dir(int dirType) {
+    char out[640];
+    if (dirType >= 10 && dirType <= 16) {
+        ResolvePublicUserDir(dirType, out, sizeof(out));
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "fpGUI",
+            "get_user_dir: type=%{public}d -> %{public}s", dirType, out);
+        return strdup(out);
+    }
     char base[512];
     // 优先使用 ArkTS context.filesDir 传入的真实沙箱路径
     if (!g_sandboxFilesDir.empty()) {
@@ -476,7 +706,6 @@ __attribute__((visibility("default"))) char* ohos_get_user_dir(int dirType) {
             snprintf(base, sizeof(base), "/data/storage/el2/base/haps/entry/files");
         }
     }    
-    char out[640];
     switch (dirType) {
         case 0: snprintf(out, sizeof(out), "%s", base); break; //文件目录
         case 1: snprintf(out, sizeof(out), "%s", g_sandboxCacheDir.c_str()); break; //缓存目录
@@ -784,6 +1013,8 @@ __attribute__((visibility("default"))) void ohos_get_window_decoration(void* han
 
 // ── 定时器活动态通知 (Pascal → ETS) ──
 __attribute__((visibility("default"))) void ohos_send_timer_state(int active) {
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "fpGUI",
+        "ohos_send_timer_state: active=%{public}d", active);
     auto* cmd = new NativeCommandData();
     memset(cmd, 0, sizeof(*cmd));
     cmd->type = NATIVE_CMD_TIMER_STATE;
@@ -878,6 +1109,7 @@ int fp_bridge_init(int32_t version,
     cpp_api->notify_first_frame = (void*)ohos_notify_first_frame;  // v12 首帧上屏通知
     cpp_api->show_file_picker = (void*)ohos_show_file_picker;
     cpp_api->arkts_invoke = (void*)ohos_arkts_invoke;  // v13：Pascal → ArkTS 反向调用
+    cpp_api->notify_timer_state = (void*)ohos_send_timer_state; // v14：Pascal→ETS 定时器活动态
 
     g_bridgeReady = true;
     OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "fpGUI",

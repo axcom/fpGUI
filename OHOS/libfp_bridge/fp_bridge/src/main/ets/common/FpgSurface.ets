@@ -5,6 +5,7 @@ import { inputMethod } from '@kit.IMEKit';
 import { deviceInfo } from '@kit.BasicServicesKit';
 import { hasPhysicalKeyboard } from './KeyboardDetector';
 import { uniformTypeDescriptor, unifiedDataChannel } from '@kit.ArkData';
+import { ohosKeyToUnicode } from './FpKeyMap';
 
 // ── 系统拖拽辅助类型 ──
 interface DragPoint {
@@ -83,6 +84,17 @@ const LONGPRESS_SLOP: number = 20;
 let gImeCtl: inputMethod.InputMethodController | null = null;
 let gImeAttached: boolean = false;
 let gImeType: number = -1;   // 当前 attach 的 TextInputType（变化时 reattach）
+// IME 会话是【按窗口】绑定的：attach() 那一刻哪个窗口持有系统焦点，会话就挂在
+// 哪个窗口上。此前只按 TextInputType 去重 → 会话黏在主窗时，子窗 showIme 直接
+// 跳过 attach，字母键被 IME 吞掉（只有 KEYUP 到达，而 Pascal 仅 ACTION=DOWN 才
+// 发 KEYCHAR）→ 子窗编辑框录不进字母；数字不走 IME 文本通道故仍可录入。
+let gImeSessionReqId: number = -1;   // 会话当前绑定的窗口 reqId（-1=未绑定）
+// 当前真正持有系统焦点的窗口 reqId（由 windowEvent t=2/t=3 维护）。
+// 子窗此前完全不跟踪激活状态：点击其它窗口再点回来，弹窗的隐藏输入框只是
+// 拿到了 ArkUI 内部焦点，窗口本身没有系统键盘焦点 → 按键全部丢失。
+let gImeActiveReqId: number = 0;
+// 最近一次 show_keyboard 指向的窗口（Pascal 聚焦了哪个窗的编辑框）
+let gImeWantedReqId: number = 0;
 let gLastImeReattachAt: number = 0;   // popup/子窗关闭后强制重连的节流时间戳
 // 命令回调已注册标志：attach 成功后注册一次（提前注册不生效——insertText
 // 回传丢失导致字母/中文无法录入；重复注册则监听叠加——输入字数递增）
@@ -95,6 +107,24 @@ let gLastImeDeleteKind: number = 0;   // 1=deleteLeft(Backspace) 2=deleteRight(D
 // 事件（KEYEV uni）→ 时间窗内丢弃匹配字符的 KEYEV，防双插（字母键实测单通道）
 let gLastImeInsertAt: number = 0;
 let gLastImeInsertText: string = '';
+
+// IME insertText 刚插入过同一个字符时，物理键通道不要再插一次。
+// 供本文件 hiddenKeyHandler/sendKeyEvent 和 Index.ets 主窗隐藏输入共用。
+export function imeConsumedChar(uni: number): boolean {
+  return uni > 0 &&
+    Date.now() - gLastImeInsertAt < 150 &&
+    gLastImeInsertText.indexOf(String.fromCharCode(uni)) >= 0;
+}
+
+// IME deleteLeft/deleteRight 刚注入过删除命令时，物理删除键不要再转发一次。
+// kc=2055(Backspace) 对应 deleteLeft(kind=1)，kc=2071(Delete) 对应 deleteRight(kind=2)。
+// 只匹配同一种删除键：软键盘退格不应吞掉物理 Delete。
+export function imeConsumedDelete(kc: number): boolean {
+  if (kc !== 2055 && kc !== 2071) return false;
+  if (Date.now() - gLastImeDeleteAt >= 250) return false;
+  return (kc === 2055 && gLastImeDeleteKind === 1)
+      || (kc === 2071 && gLastImeDeleteKind === 2);
+}
 // hover 双通道自适应：onHoverMove 仅 SDK 15+ 系统触发；高版本系统上
 // onMouse Move(3)(Buttons=0) 可能仍携带 hover → 收到 onHoverMove 后
 // 500ms 内抑制 onMouse 的 hover Move（版本无关，低版本不受影响）
@@ -103,19 +133,22 @@ let gLastHoverMoveAt: number = 0;
 // AxisEvent（每段都带角度变化）→ 50ms 内只转发一次，防多段重复滚动
 let gLastWheelAt: number = 0;
 
-function imeEnsureAttached(kbType: number): void {
+function imeEnsureAttached(kbType: number, reqId: number): void {
   try {
     if (gImeCtl === null) {
       gImeCtl = inputMethod.getController();
     }
     const wantType: number = (kbType === 2 || kbType === 3)
       ? inputMethod.TextInputType.NUMBER : inputMethod.TextInputType.TEXT;
-    if (gImeAttached && gImeType === wantType) return;
+    // 复用条件：已 attach + 类型相同 + 【绑定窗口相同】。窗口不同必须重绑，
+    // 否则会话留在旧窗口，新窗口的字母被 IME 消费却不回 insertText。
+    if (gImeAttached && gImeType === wantType && gImeSessionReqId === reqId) return;
     if (gImeAttached) {
-      // 输入类型变化 → 结束旧会话后重新 attach
+      // 输入类型或目标窗口变化 → 结束旧会话后重新 attach
       gImeCtl.stopInputSession().catch(() => {});
       gImeAttached = false;
     }
+    gImeSessionReqId = -1;
     gImeCtl.attach(true, {
       inputAttribute: {
         textInputType: wantType,
@@ -124,7 +157,8 @@ function imeEnsureAttached(kbType: number): void {
     }).then(() => {
       gImeAttached = true;
       gImeType = wantType;
-      hilog.info(DOMAIN, TAG, 'IME attach OK type=%d', wantType);
+      gImeSessionReqId = reqId;
+      hilog.info(DOMAIN, TAG, 'IME attach OK type=%{public}d req=%{public}d', wantType, reqId);
       // 命令回调注册【attach 成功后、全局一次】：提前注册（attach 前）
       // 不生效——insertText 回传丢失（字母/中文无法录入）；重复注册
       // 则监听叠加（输入字数随 attach 次数递增）。注入目标由 Pascal
@@ -169,24 +203,196 @@ function imeEnsureAttached(kbType: number): void {
 }
 
 // popup/子窗关闭后 IME 会话可能仍挂在已销毁窗口上：stop → attach 重连到主窗。
-function imeForceReattach(kbType: number): void {
+function imeForceReattach(kbType: number, reqId: number): void {
   const now: number = Date.now();
   if (now - gLastImeReattachAt < 400) return;
   gLastImeReattachAt = now;
   try {
     if (gImeCtl === null) gImeCtl = inputMethod.getController();
     const ctl: inputMethod.InputMethodController = gImeCtl;
+    gImeSessionReqId = -1;
     ctl.stopInputSession().then(() => {
       gImeAttached = false;
-      imeEnsureAttached(kbType);
+      imeEnsureAttached(kbType, reqId);
     }).catch(() => {
       gImeAttached = false;
-      imeEnsureAttached(kbType);
+      imeEnsureAttached(kbType, reqId);
     });
   } catch (_e) {
     gImeAttached = false;
-    imeEnsureAttached(kbType);
+    imeEnsureAttached(kbType, reqId);
   }
+}
+
+// 强制重建会话（不走节流）：窗口焦点在子窗间翻转后，IME 的输入客户端可能
+// 已经失效——此时 gImeAttached 仍为 true，但事件不再回传（物理键和 IME 文本
+// 都收不到）。必须 stop → attach 重新绑定到当前焦点窗口。
+function imeRebind(kbType: number, reqId: number): void {
+  try {
+    if (gImeCtl === null) gImeCtl = inputMethod.getController();
+    const ctl: inputMethod.InputMethodController = gImeCtl;
+    gImeAttached = false;
+    gImeSessionReqId = -1;
+    ctl.stopInputSession().then(() => {
+      imeEnsureAttached(kbType, reqId);
+    }).catch(() => {
+      imeEnsureAttached(kbType, reqId);
+    });
+  } catch (_e) {
+    gImeAttached = false;
+    gImeSessionReqId = -1;
+    imeEnsureAttached(kbType, reqId);
+  }
+}
+
+// ── 窗口级 IME 入口注册表 ───────────────────────────────────────────
+// 原先每个 FpgSurface 实例都覆盖 ctrl.showIme/hideIme（最后创建者胜出），子窗
+// 销毁后指针仍指向已销毁实例 → 主窗 show_keyboard 落到死组件。改为按 reqId
+// 注册，分发时取「最近获得焦点且仍存活」的窗口：键盘命令本身不带 reqId
+// （C++ ohos_bridge_show_keyboard 里 cmd->reqId = 0），只能按焦点推断。
+const gImeWinOrder: number[] = [];
+const gImeShowCb = new Map<number, (kbType: number) => void>();
+const gImeHideCb = new Map<number, () => void>();
+const gImeActiveCb = new Map<number, () => void>();
+
+function imeRegisterWindow(reqId: number,
+  onShow: (kbType: number) => void, onHide: () => void, onActive: () => void): void {
+  if (!gImeShowCb.has(reqId)) gImeWinOrder.push(reqId);
+  gImeShowCb.set(reqId, onShow);
+  gImeHideCb.set(reqId, onHide);
+  gImeActiveCb.set(reqId, onActive);
+}
+
+function imeUnregisterWindow(reqId: number): void {
+  gImeShowCb.delete(reqId);
+  gImeHideCb.delete(reqId);
+  gImeActiveCb.delete(reqId);
+  const i: number = gImeWinOrder.indexOf(reqId);
+  if (i >= 0) gImeWinOrder.splice(i, 1);
+  // 目标/属主窗口已不存在：清掉指向它的全局状态，避免 IME 命令投给死窗口
+  if (gImeActiveReqId === reqId) gImeActiveReqId = 0;
+  if (gImeWantedReqId === reqId) gImeWantedReqId = 0;
+}
+
+// 窗口获得系统焦点（windowEvent t=2）：记为 IME 目标窗口，并通知该窗口恢复
+// 隐藏输入框焦点（ArkUI 内部焦点 ≠ 窗口系统焦点，两者都要）。
+export function imeNoteWindowActive(reqId: number): void {
+  gImeActiveReqId = reqId;
+  imeTouchWindow(reqId);
+  const cb: (() => void) | undefined = gImeActiveCb.get(reqId);
+  if (cb !== undefined) cb();
+}
+
+// 窗口失去系统焦点（windowEvent t=3）：只在它确实是当前目标窗口时清空，
+// 防止 t=3/t=2 乱序到达把刚激活的窗口误清。
+export function imeNoteWindowInactive(reqId: number): void {
+  if (gImeActiveReqId === reqId) gImeActiveReqId = 0;
+}
+
+// ── 模态窗口输入闸门 ──────────────────────────────────────────────
+// fpGUI 的 wtModalForm 在本桥接里只是普通子窗（legacy createSubWindow），系统
+// 并不知道它是模态 → 点其它窗口照样激活、照样能录入。除了用系统
+// setSubWindowModal 之外，这里再做一层应用内闸门：模态存活期间，非模态窗口
+// 丢弃所有输入事件（系统模态未必能挡住同级兄弟子窗）。
+const gModalReqIds = new Set<number>();
+const gPopupReqIds = new Set<number>();
+const gModalOrder: number[] = [];   // 模态创建顺序（末尾=最上层），抖动特效要用
+
+// wtype: 0=wtChild 1=wtWindow 2=wtModalForm 3=wtPopup
+export function imeSetWindowKind(reqId: number, wtype: number): void {
+  if (wtype === 2) {
+    if (!gModalReqIds.has(reqId)) gModalOrder.push(reqId);
+    gModalReqIds.add(reqId);
+  } else {
+    gModalReqIds.delete(reqId);
+    const i: number = gModalOrder.indexOf(reqId);
+    if (i >= 0) gModalOrder.splice(i, 1);
+  }
+  if (wtype === 3) gPopupReqIds.add(reqId); else gPopupReqIds.delete(reqId);
+  notifyModalState();
+}
+
+export function imeClearWindowKind(reqId: number): void {
+  gModalReqIds.delete(reqId);
+  gPopupReqIds.delete(reqId);
+  const i: number = gModalOrder.indexOf(reqId);
+  if (i >= 0) gModalOrder.splice(i, 1);
+  notifyModalState();
+}
+
+// 当前最上层模态窗口 reqId（0=无）。被阻塞窗口被点击时用它触发抖动反馈。
+export function blockedModalReqId(): number {
+  return gModalOrder.length > 0 ? gModalOrder[gModalOrder.length - 1] : 0;
+}
+
+// 模态抖动回调（模块级，所有窗口共用）。不能挂在 FpgSurfaceCtrl 上：子窗页面
+// WindowSurface.ets 每个窗口都 new 了自己的 ctrl，Index 只给主窗那个赋值 →
+// 被点是子窗（如下层模态）时回调为空，既不抖也不置顶。
+let gShakeWindowCb: ((targetReqId: number, fromReqId: number) => void) | null = null;
+
+export function setShakeWindowCallback(
+  cb: (targetReqId: number, fromReqId: number) => void): void {
+  gShakeWindowCb = cb;
+}
+
+// 模态集合变化回调（Index 绑定）：用于把非最上层窗口设为不可聚焦/点击不可置顶。
+// 标题栏是系统装饰、不经过 ArkUI 事件，只能靠窗口属性拦截。
+let gModalStateCb: ((topReqId: number) => void) | null = null;
+
+export function setModalStateCallback(cb: (topReqId: number) => void): void {
+  gModalStateCb = cb;
+}
+
+function notifyModalState(): void {
+  if (gModalStateCb !== null) gModalStateCb(blockedModalReqId());
+}
+
+// 窗口登记/销毁后重新下发一次模态状态（新建窗口默认 focusable，需要再压一次）
+export function refreshModalState(): void {
+  notifyModalState();
+}
+
+// 该窗口此刻是否应丢弃输入：存在模态窗时，只有【最上层模态】和弹窗可交互；
+// 其余窗口（包括下层模态）一律阻塞。否则嵌套模态时点下层模态的编辑框，
+// 输入仍会落进去（上层模态只抖动、拦不住）。
+export function isInputBlocked(reqId: number): boolean {
+  if (gModalOrder.length === 0) return false;
+  if (reqId === gModalOrder[gModalOrder.length - 1]) return false;
+  if (gPopupReqIds.has(reqId)) return false;
+  return true;
+}
+
+// 焦点窗口置顶：同时可能存在多个子窗，show_keyboard 只带类型不带窗口，
+// 用最近获得焦点的窗口作为目标（点击/隐藏输入框获焦即更新）。
+export function imeTouchWindow(reqId: number): void {
+  const i: number = gImeWinOrder.indexOf(reqId);
+  if (i < 0 || i === gImeWinOrder.length - 1) return;
+  gImeWinOrder.splice(i, 1);
+  gImeWinOrder.push(reqId);
+}
+
+function imeDispatch(show: boolean, kbType: number): boolean {
+  // 目标优先级：真正持有系统焦点的窗口 → 最后置顶的窗口 → 其余（主窗兜底）。
+  // 焦点乱跳时若只按“最后 touch”选，会把 show_keyboard 投给错窗口。
+  const order: number[] = [];
+  if (gImeActiveReqId > 0 && gImeShowCb.has(gImeActiveReqId)) {
+    order.push(gImeActiveReqId);
+  }
+  for (let i = gImeWinOrder.length - 1; i >= 0; i--) {
+    const id: number = gImeWinOrder[i];
+    if (id !== gImeActiveReqId) order.push(id);
+  }
+  for (let k = 0; k < order.length; k++) {
+    const id: number = order[k];
+    if (show) {
+      const f: ((kbType: number) => void) | undefined = gImeShowCb.get(id);
+      if (f !== undefined) { f(kbType); return true; }
+    } else {
+      const h: (() => void) | undefined = gImeHideCb.get(id);
+      if (h !== undefined) { h(); return true; }
+    }
+  }
+  return false;
 }
 
 // 光标跟随：编辑框内触摸 DOWN → IME 候选框跟随光标（物理屏幕 px）
@@ -324,6 +530,7 @@ export struct FpgSurface {
   private hasSurface: boolean = false;  // XComponent surface 已 onLoad（未加载前不可调 setXComponentSurfaceRect）
   private surfaceSyncTimer: number = -1; // surface 同步后延迟重刷的防抖定时器
   private destroyed: boolean = false;   // 组件已销毁（窗口关闭/卸载）——延迟刷新须跳过，防对失效窗口操作
+  private lastKbType: number = 1;       // 最近一次 showIme 的键盘类型（窗口重新激活时重绑用）
   private densityPx: number = 1.0;
   // modifier state -> real modifier mask for Pascal (avoids Shift stickiness)
   private shiftDown: boolean = false;
@@ -372,11 +579,17 @@ export struct FpgSurface {
       }, 600);
     }
     this.expectSetAt = Date.now();
-    this.ctrl.showIme = (kbType: number): void => { this.showIme(kbType); };
-    this.ctrl.hideIme = (): void => { this.hideIme(); };
+    // 注册本窗口的 IME 入口（替代旧的「实例覆盖 ctrl.showIme」）：
+    // ctrl.showIme/hideIme 统一指向模块级分发器，被多个实例重复赋值也无害。
+    imeRegisterWindow(this.reqId,
+      (kbType: number): void => { this.showIme(kbType); },
+      (): void => { this.hideIme(); },
+      (): void => { this.onWindowActive(); });
+    this.ctrl.showIme = (kbType: number): void => { imeDispatch(true, kbType); };
+    this.ctrl.hideIme = (): void => { imeDispatch(false, 0); };
     if (this.reqId === 1) {
       // 主窗：弹菜单/子窗关闭后由 Index 触发，确保 IME 会话重连到当前主窗
-      this.ctrl.ensureImeAttached = (): void => { imeForceReattach(1); };
+      this.ctrl.ensureImeAttached = (): void => { imeForceReattach(1, 1); };
     }
     this.ctrl.focus = (): void => {
       // 主窗（reqId=1）：焦点交给 Index 隐藏 TextInput；
@@ -417,6 +630,7 @@ export struct FpgSurface {
     // （扫菜单反复开合 popup 的崩溃回归）。卸载后跳过硬刷。
     this.destroyed = true;
     firstFrameMap.delete(this.reqId);
+    imeUnregisterWindow(this.reqId);
   }
 
   // Pascal 首帧已上屏：门条件之一满足。尺寸也已到位（或无期望）时立即放行；
@@ -454,6 +668,7 @@ export struct FpgSurface {
   // moveWindowTo 触发 windowRectChange → 现有即时通道上报 Pascal 位置同步。
   private titleBarDragStart(): void {
     if (this.titleBarWin === null) return;
+    if (isInputBlocked(this.reqId)) { this.shakeBlockedModal(); return; }
     try {
       const p: window.WindowProperties = this.titleBarWin.getWindowProperties();
       this.dragWinX = p.windowRect.left;
@@ -463,6 +678,7 @@ export struct FpgSurface {
 
   private titleBarDragMove(offsetX: number, offsetY: number): void {
     if (this.titleBarWin === null) return;
+    if (isInputBlocked(this.reqId)) return;
     try {
       this.titleBarWin.moveWindowTo(this.dragWinX + offsetX,
         this.dragWinY + offsetY).catch(() => {});
@@ -474,6 +690,7 @@ export struct FpgSurface {
   // destroyWindow → windowEvent 7（WINDOW_DESTROYED）→ onWindowClosed → 完整清理链。
   private titleBarClose(): void {
     if (this.titleBarWin === null) return;
+    if (isInputBlocked(this.reqId)) { this.shakeBlockedModal(); return; }
     hilog.info(DOMAIN, TAG, 'TitleBar close clicked req=%d', this.reqId);
     let can = -1;
     try { can = fpbridge.queryCanClose(this.reqId); } catch (_e) {}
@@ -509,7 +726,17 @@ export struct FpgSurface {
   }
 
   private showIme(kbType: number): void {
-    hilog.info(DOMAIN, TAG, 'showIme: type=%d', kbType);
+    if (this.destroyed) return;   // 组件已卸载：不对失效窗口 attach
+    if (isInputBlocked(this.reqId)) {
+      // 模态窗存在时，被阻塞的窗口（终端/Settings 等）不应抢走输入法会话
+      hilog.info(DOMAIN, TAG, 'showIme blocked (modal active) req=%{public}d', this.reqId);
+      return;
+    }
+    hilog.info(DOMAIN, TAG, 'showIme: req=%{public}d type=%{public}d', this.reqId, kbType);
+    this.lastKbType = kbType;
+    gImeWantedReqId = this.reqId;
+    // 本窗口是键盘目标：置顶到分发顺序末尾（多子窗时按焦点路由）
+    imeTouchWindow(this.reqId);
     // Pascal 聚焦了本窗口的编辑（showKeyboard → 本页）：把键盘焦点交给本窗口
     // 隐藏 TextInput——否则子窗内无获焦组件，物理数字键被 IME 忽略后丢弃。
     if (this.reqId !== 1) {
@@ -522,8 +749,21 @@ export struct FpgSurface {
     } else if (this.ctrl.focusHiddenInput) {
       this.ctrl.focusHiddenInput();
     }
-    // IME 命令模式：attach（输入类型变化时 reattach）→ 弹软键盘
-    imeEnsureAttached(kbType);
+    // IME 命令模式：attach（输入类型/目标窗口变化时 reattach）→ 弹软键盘。
+    // 必须带窗口 reqId：会话按窗口绑定，仅按类型去重会把子窗的字母吞掉。
+    if (this.reqId === 1) {
+      imeEnsureAttached(kbType, this.reqId);
+    } else {
+      // 子窗：focusControl.requestFocus 是异步的（onFocus 约 20~60ms 后才到），
+      // 而 attach() 只有在窗口已有【输入客户端】时才会绑对目标。实测在 showIme
+      // 里立即 attach，会早于隐藏输入框获焦 → 会话绑到上一个窗口，新弹窗首次
+      // 打开收不到任何按键（点走再点回来才恢复）。因此延后到获焦之后再重建。
+      setTimeout(() => {
+        if (this.destroyed || gImeWantedReqId !== this.reqId) return;
+        hilog.info(DOMAIN, TAG, 'IME rebind (deferred) req=%{public}d', this.reqId);
+        imeRebind(kbType, this.reqId);
+      }, 80);
+    }
     // PC/2in1：连接输入法（保中文输入）但不弹软键盘（物理键经输入法
     // 语言模式路由：中文组合拼音、英文直通；软键盘面板会拦截物理键）
     if (!isPcLike()) {
@@ -537,18 +777,27 @@ export struct FpgSurface {
   }
 
   private hideIme(): void {
-    hilog.info(DOMAIN, TAG, 'hideIme: enter');
+    hilog.info(DOMAIN, TAG, 'hideIme: req=%{public}d session=%{public}d',
+      this.reqId, gImeSessionReqId);
+    if (gImeWantedReqId === this.reqId) gImeWantedReqId = 0;
     const keepKeyFocus: boolean = (this.reqId !== 1) ||
       (this.ctrl.shouldKeepKeyFocus === undefined) ||
       this.ctrl.shouldKeepKeyFocus();
     // 隐藏软键盘（InputMethodController 命令模式，无 TextInput 组件）
     if (gImeCtl) {
-      try { gImeCtl.hideTextInput().catch(() => {}); } catch (_e) {}
-      // 必须结束会话：popup/子窗销毁后 IME 会话可能绑定在已销毁窗口上，
-      // 仅保留 gImeAttached 会让主窗 showIme 跳过 attach，字母只出 KEYUP、
-      // 没有 insertText（表现为弹菜单后无法录入）。下次 showIme/恢复焦点时重连。
-      try { gImeCtl.stopInputSession().catch(() => {}); } catch (_e) {}
-      gImeAttached = false;
+      // 只结束【属于本窗口】的会话，或属主窗口已不存在（被销毁）的残留会话。
+      // 旧实现无条件 stopInputSession → 任一窗口 hideIme 都会把正在输入的
+      // 那个窗口的会话一起停掉：表现为点一下别的窗口后弹窗抖动、再也录不进去。
+      const ownerAlive: boolean = gImeSessionReqId > 0 && gImeShowCb.has(gImeSessionReqId);
+      if (gImeSessionReqId === this.reqId || !ownerAlive) {
+        try { gImeCtl.hideTextInput().catch(() => {}); } catch (_e) {}
+        // 必须结束会话：popup/子窗销毁后 IME 会话可能绑定在已销毁窗口上，
+        // 仅保留 gImeAttached 会让主窗 showIme 跳过 attach，字母只出 KEYUP、
+        // 没有 insertText（表现为弹菜单后无法录入）。下次 showIme/恢复焦点时重连。
+        try { gImeCtl.stopInputSession().catch(() => {}); } catch (_e) {}
+        gImeAttached = false;
+        gImeSessionReqId = -1;
+      }
     }
     // 软键盘隐藏后仍保持按键捕获焦点：没有输入控件时主菜单快捷键也需要 KEYPRESS。
     // 子窗活动时由 shouldKeepKeyFocus 让出；子窗自己保持自己的隐藏输入框焦点。
@@ -567,9 +816,40 @@ export struct FpgSurface {
     hilog.info(DOMAIN, TAG, 'hideIme: done');
   }
 
+  // 窗口重新获得系统焦点（子窗 windowEvent t=2）：恢复本窗隐藏输入框焦点；
+  // 若 Pascal 之前要求过本窗的输入法（gImeWantedReqId），重绑会话。
+  // 关键：focusControl.requestFocus 只给 ArkUI 组件焦点，窗口本身没有系统键盘
+  // 焦点时按键仍然收不到 —— 所以必须在「窗口激活」事件里做恢复，而不是只在
+  // 点击/onLoad 时做。
+  private onWindowActive(): void {
+    if (this.destroyed) return;
+    hilog.info(DOMAIN, TAG,
+      'window active: req=%{public}d wanted=%{public}d session=%{public}d',
+      this.reqId, gImeWantedReqId, gImeSessionReqId);
+    if (isInputBlocked(this.reqId)) return;   // 模态期间：非模态窗口不恢复焦点
+    const isTarget: boolean = (gImeWantedReqId === this.reqId);
+    if (this.reqId !== 1) {
+      // 只有本窗口是 Pascal 的输入目标时才抢隐藏输入框焦点。旧实现无条件抢：
+      // 后台子窗（如 Settings）被激活一次就会把正在输入窗口的 IME 输入客户端
+      // 顶掉 → 回焦后物理键 / IME 文本全部静默丢失。
+      if (isTarget) this.focusKbdInput();
+    } else if (this.ctrl.forceKeyFocus) {
+      this.ctrl.forceKeyFocus();
+    }
+    if (isTarget) {
+      // 回焦后强制重建会话：焦点翻转会让旧会话的输入客户端失效，而 attached
+      // 标志仍是 true，仅靠 imeEnsureAttached 的“已绑定”判断无法发现。
+      setTimeout(() => {
+        if (this.destroyed || gImeWantedReqId !== this.reqId) return;
+        imeRebind(this.lastKbType, this.reqId);
+      }, 60);
+    }
+  }
+
   // 交互即聚焦：确保本窗口持有系统键盘焦点（onKeyEvent 仅在聚焦时触发）。
   // 弹窗关闭/托盘收起恢复/窗口失焦后焦点可能丢失——任何触摸/鼠标交互即恢复。
   private ensureFocus(): void {
+    if (isInputBlocked(this.reqId)) return;   // 模态期间：非模态窗口不抢焦点
     // 主窗（reqId=1）：焦点由 Index 的隐藏 TextInput 持有。点击/触摸主窗时
     // 必须主动恢复，否则模态窗/弹出菜单关闭后物理键会一直被 ArkUI 丢弃。
     if (this.reqId === 1) {
@@ -578,6 +858,17 @@ export struct FpgSurface {
       return;
     }
     this.focusKbdInput();
+  }
+
+  // 模态反馈抖动：被阻塞窗口被点击时抖一下最上层模态。视觉等价 Pascal 的
+  // re-raise + shake（同一段 ETS 动画），但点击不进 Pascal，避免它的
+  // gFocusedWinHandle 被改成被阻塞窗口（否则后续按键会路由过去）。
+  private shakeBlockedModal(): void {
+    const m: number = blockedModalReqId();
+    if (m <= 0 || m === this.reqId) return;
+    hilog.info(DOMAIN, TAG,
+      'shake blocked modal req=%{public}d triggered by win=%{public}d', m, this.reqId);
+    if (gShakeWindowCb !== null) gShakeWindowCb(m, this.reqId);
   }
 
   // 长按模拟右键：取消未到点的定时器
@@ -611,6 +902,7 @@ export struct FpgSurface {
   // 隐藏 TextInput 按键转发（与主窗 Index 同一路径）：TextInput 消费事件
   // 防止其自身插入字符，uni>0 才能让 Pascal 生成 KEYCHAR 插入。
   private hiddenKeyHandler(event: KeyEvent): boolean {
+    if (isInputBlocked(this.reqId)) return true;   // 模态期间：非模态窗口不接收按键
     const kc: number = event.keyCode as number;
     const isDown: boolean = (event.type as number) === 0;
     const act: number = isDown ? 0 : 1;
@@ -620,30 +912,33 @@ export struct FpgSurface {
     else if (kc === 2076 || kc === 2077) this.metaDown = isDown;
     const mods: number = (this.ctrlDown ? 1 : 0) | (this.shiftDown ? 2 : 0)
       | (this.altDown ? 4 : 0) | (this.metaDown ? 8 : 0);
-    let uni: number = 0;
-    if (kc >= 2000 && kc <= 2009) {
-      uni = 48 + (kc - 2000);  // '0'-'9'
-    } else if (kc >= 2017 && kc <= 2042) {
-      const base: number = 'a'.charCodeAt(0) + (kc - 2017);
-      uni = (mods & 2) !== 0 ? base - 32 : base;
-    } else if (kc === 2050) {
-      uni = 32;  // space
-    } else if (kc === 2049) {
-      uni = 9;   // tab
-    } else if (kc === 2054) {
-      uni = 13;  // enter
-    }
-    // Backspace/Delete：放行让 IME deleteLeft/deleteRight 路径处理，避免双删。
+    let uni: number = ohosKeyToUnicode(kc, (mods & 2) !== 0);
+    if (kc === 2049) uni = 9;
+    else if (kc === 2054) uni = 13;
+    // Backspace/Delete：IME 已注入删除命令 → 丢弃防双删；否则转发给 Pascal 并消费。
+    // 不能 return false：PC 上 IME 英文模式把退格放行给应用（无 deleteLeft 回调），
+    // TextInput 会自行消费该键，Pascal 收不到 KEYPRESS → 终端退格失效。
     if (kc === 2055 || kc === 2071) {
-      return false;
+      if (imeConsumedDelete(kc)) {
+        return true;
+      }
+      hilog.info(DOMAIN, TAG,
+        'SUBKEY kc=%d act=%d mods=%d uni=%d req=%d', kc, act, mods, uni, this.reqId);
+      fpbridge.onKeyEvent(kc, act, mods, uni);
+      return true;
+    }
+    if (imeConsumedChar(uni)) {
+      return true;   // IME 刚 insertText 过同一个字符
     }
     hilog.info(DOMAIN, TAG,
-      'SUBKEY kc=%d act=%d mods=%d uni=%d req=%d', kc, act, mods, uni, this.reqId);
+      'SUBKEY kc=%{public}d act=%{public}d mods=%{public}d uni=%{public}d req=%{public}d',
+      kc, act, mods, uni, this.reqId);
     fpbridge.onKeyEvent(kc, act, mods, uni);
     return true;
   }
 
   private sendKeyEvent(event: KeyEvent): void {
+    if (isInputBlocked(this.reqId)) return;   // 模态期间：非模态窗口不接收按键
     const kc: number = event.keyCode as number;
     const isDown: boolean = (event.type as number) === 0;  // component KeyType: Down=0, Up=1
     if (kc === 2047 || kc === 2048) this.shiftDown = isDown;
@@ -657,7 +952,7 @@ export struct FpgSurface {
     // 删除键双路径去重：软键盘删除键 → IME deleteLeft/deleteRight 命令注入后，
     // 系统仍发物理键事件（KEYEV code=2055/2071）→ 时间窗（250ms）内丢弃，
     // 否则 Pascal 双删。硬件键盘删除键无 IME 命令 → 正常转发。
-    if ((kc === 2055 || kc === 2071) && Date.now() - gLastImeDeleteAt < 250) {
+    if (imeConsumedDelete(kc)) {
       return;
     }
     // 物理键字符（数字/字母走 KEYEV 通道，uni 必须补上——Pascal 仅 uni>0 时
@@ -665,8 +960,7 @@ export struct FpgSurface {
     const uni: number = this.keyCodeToUnicode(kc, (mods & 2) !== 0);
     // 符号/标点键双通道去重：IME insertText 刚注入过相同字符 → 丢弃 KEYEV
     // （软键盘符号键实测双发：insertText 命令 + 物理键事件）
-    if (uni > 0 && Date.now() - gLastImeInsertAt < 150 &&
-        gLastImeInsertText.indexOf(String.fromCharCode(uni)) >= 0) {
+    if (imeConsumedChar(uni)) {
       return;
     }
     // DIAG: keyboard routing 对账（ETS 侧）——与 Pascal KEYEV kind/KEYEV mapped 对照。
@@ -684,34 +978,7 @@ export struct FpgSurface {
   //   2043=','、2044='.'、2050=空格、2056-2066=符号键。
   // shift 上档：数字行 !@#$%^&*()、字母大写、符号对应上档字符。
   private keyCodeToUnicode(kc: number, shift: boolean): number {
-    if (kc === 2000) return shift ? ')'.charCodeAt(0) : '0'.charCodeAt(0);
-    if (kc >= 2001 && kc <= 2009) {
-      const base = String.fromCharCode('1'.charCodeAt(0) + (kc - 2001));
-      if (!shift) return base.charCodeAt(0);
-      const up = '!@#$%^&*(';
-      return up.charCodeAt(kc - 2001);
-    }
-    if (kc === 2010) return '*'.charCodeAt(0);   // KEYCODE_STAR
-    if (kc === 2011) return '#'.charCodeAt(0);   // KEYCODE_POUND
-    if (kc >= 2017 && kc <= 2042) {
-      const base = String.fromCharCode('a'.charCodeAt(0) + (kc - 2017));
-      return shift ? base.toUpperCase().charCodeAt(0) : base.charCodeAt(0);
-    }
-    if (kc === 2043) return shift ? '<'.charCodeAt(0) : ','.charCodeAt(0);
-    if (kc === 2044) return shift ? '>'.charCodeAt(0) : '.'.charCodeAt(0);
-    if (kc === 2050) return ' '.charCodeAt(0);
-    if (kc === 2056) return shift ? '~'.charCodeAt(0) : '`'.charCodeAt(0);
-    if (kc === 2057) return shift ? '_'.charCodeAt(0) : '-'.charCodeAt(0);
-    if (kc === 2058) return shift ? '+'.charCodeAt(0) : '='.charCodeAt(0);
-    if (kc === 2059) return shift ? '{'.charCodeAt(0) : '['.charCodeAt(0);
-    if (kc === 2060) return shift ? '}'.charCodeAt(0) : ']'.charCodeAt(0);
-    if (kc === 2061) return shift ? '|'.charCodeAt(0) : '\\'.charCodeAt(0);
-    if (kc === 2062) return shift ? ':'.charCodeAt(0) : ';'.charCodeAt(0);
-    if (kc === 2063) return shift ? '"'.charCodeAt(0) : '\''.charCodeAt(0);
-    if (kc === 2064) return shift ? '?'.charCodeAt(0) : '/'.charCodeAt(0);
-    if (kc === 2065) return '@'.charCodeAt(0);
-    if (kc === 2066) return '+'.charCodeAt(0);
-    return 0;
+    return ohosKeyToUnicode(kc, shift);
   }
 
   build() {
@@ -749,6 +1016,11 @@ export struct FpgSurface {
               this.titleBarDragMove(event.offsetX, event.offsetY);
             })
         )
+        .onClick(() => {
+          // 标题栏是自绘的（无系统装饰），点击不会走 XComponent 闸门；
+          // 模态存在时这里补一次抖动反馈。
+          if (isInputBlocked(this.reqId)) this.shakeBlockedModal();
+        })
       }
       XComponent({
         id: 'xc_fpg_' + this.reqId,
@@ -761,6 +1033,10 @@ export struct FpgSurface {
       .defaultFocus(false)
       // onKeyPreIme：IME 之前拦截物理键——数字键被 HMKeyboard 消费前截获，
       // 直接注入 EnqueueKeyEvent；字母等留给 IME insertText 中文输入。
+      // ⚠ 实测本回调不会触发：XComponent .focusable(false) 拿不到焦点
+      //   （11-05 11:23 运行日志中 PreIme DIGIT / KEYD 均为 0 次）。真正的键盘
+      //   通道是下面的隐藏 TextInput。此处仅保留备用：若将来放开 XComponent
+      //   获焦，必须同时停用隐藏 TextInput 转发，否则按键会双发重复插入。
       .onKeyPreIme((event: KeyEvent): boolean => {
         const kc: number = event.keyCode as number;
         const isDown: boolean = (event.type as number) === 0;
@@ -810,7 +1086,9 @@ export struct FpgSurface {
         // 主窗（reqId=1）：焦点由 Index 隐藏 TextInput 持有；子窗：交给本窗口
         // 隐藏 TextInput 捕获键盘事件（XComponent 无法获焦）。
         if (this.reqId !== 1) {
-          this.focusKbdInput();
+          // 只有本窗是输入目标时才抢焦点：否则新开的子窗会把正在输入窗口的
+          // IME 输入客户端顶掉（打开弹窗/后台窗时表现为输入静默失效）。
+          if (gImeWantedReqId === this.reqId) this.focusKbdInput();
         }
       })
       .onAreaChange((oldValue: Area, newValue: Area) => {
@@ -879,6 +1157,11 @@ export struct FpgSurface {
         }
       })
       .onTouch((event: TouchEvent) => {
+        if (isInputBlocked(this.reqId)) {
+          // 模态反馈：点击被阻塞窗口时抖动模态（等价 Pascal 的 re-raise + shake）
+          if (event.type === TouchType.Down) this.shakeBlockedModal();
+          return;
+        }
         // 按输入来源分流：鼠标/触控板交给 onMouse（避免双通道重复）；
         // 手指/笔/未知来源走本通道（Down/Move/Up = 左键点按/拖拽）。
         if (event.source === SourceType.Mouse) {
@@ -957,6 +1240,11 @@ export struct FpgSurface {
         if (!INPUT_USE_ONMOUSE) {
           return;
         }
+        if (isInputBlocked(this.reqId)) {
+          // 模态反馈：按下被阻塞窗口时抖动模态（MOVE/UP 只丢弃，与 Pascal 原逻辑一致）
+          if ((event.action as number) === MOUSE_ACTION_PRESS) this.shakeBlockedModal();
+          return;
+        }
         // action → OH_TOUCH 语义（0=Down/1=Move/2=Up）。
         const btn = event.button as number;
         const ma = event.action as number;
@@ -1001,6 +1289,7 @@ export struct FpgSurface {
         fpbridge.onMouseEvent(String(this.reqId), mx, my, act, btn);
       })
       .onAxisEvent((event: AxisEvent) => {
+        if (isInputBlocked(this.reqId)) return;   // 模态期间：非模态窗口不接收滚轮
         // 鼠标滚轮：axisVertical 为单位为"角度"的单次变化量（非总量），
         // 受系统滚轮放大倍数影响（scrollStep 告知倍率）；向前滚为负、向后为正。
         // BEGIN/UPDATE/END 多段都带角度 → 50ms 去抖只转发一次。
@@ -1029,6 +1318,7 @@ export struct FpgSurface {
         fpbridge.onWheelEvent(String(this.reqId), mx, my, delta);
       })
       .onHoverMove((event: HoverEvent) => {
+        if (isInputBlocked(this.reqId)) return;   // 模态期间：非模态窗口不接收 hover
         // SDK 15+ 才有 onHoverMove（低版本系统不触发 → onMouse Move(3) 承载 hover）
         gLastHoverMoveAt = Date.now();
         // 坐标：组件本地 x/y（vp）+ 窗口原点，与 onMouse 同基准
@@ -1069,6 +1359,10 @@ export struct FpgSurface {
         try { fpbridge.onDragEvent(String(this.reqId), 2, 0, 0, ''); } catch (_e) {}
       })
       .onDrop((ev: DragEvent) => {
+        if (isInputBlocked(this.reqId)) {
+          ev.setResult(DragResult.DRAG_FAILED);
+          return;
+        }
         if (!this.dragEnabled()) {
           hilog.warn(DOMAIN, TAG, 'DRAG drop req=%d BLOCKED by dndEnabled', this.reqId);
           ev.setResult(DragResult.DRAG_FAILED);
@@ -1110,15 +1404,19 @@ export struct FpgSurface {
           .fontSize(0)
           .width(0).height(0)
           .focusable(true)
-          // 程序性/defaultFocus 获焦只作物理键捕获兜底，不绑输入法：
+          // 程序性获焦只作物理键捕获兜底，不绑输入法：
           // 防子窗创建时隐藏输入框获焦误弹软键盘；正式输入仍由 Pascal showIme 控制。
+          // 不能设 defaultFocus(true)：多个子窗会各自在窗口激活时自动抢焦点，
+          // 表现为弹窗抖动 + 焦点落到别的窗口（按键静默丢失）。
           .enableKeyboardOnFocus(false)
-          .defaultFocus(true)
+          .defaultFocus(false)
           .onKeyEvent((event: KeyEvent): boolean => {
             return this.hiddenKeyHandler(event);
           })
           .onFocus(() => {
-            hilog.info(DOMAIN, TAG, 'SubHiddenInput: focused req=%d', this.reqId);
+            hilog.info(DOMAIN, TAG, 'SubHiddenInput: focused req=%{public}d', this.reqId);
+            // 本窗口获得键盘焦点 → 置顶为 show_keyboard 的目标窗口
+            imeTouchWindow(this.reqId);
           })
       }
     }
@@ -1157,6 +1455,7 @@ export struct FpgSurface {
 
   private forwardDrag(ev: DragEvent, kind: number): void {
     if (!this.dragEnabled()) return;
+    if (isInputBlocked(this.reqId)) return;   // 模态期间：非模态窗口不接收拖拽
     try {
       const pt = this.dragCoords(ev);
       const types = this.serializeSummary(ev.getSummary());

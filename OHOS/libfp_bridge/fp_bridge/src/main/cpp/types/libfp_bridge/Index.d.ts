@@ -31,7 +31,8 @@ export const setSandboxPaths: (
 // cmd.type: 0=create, 1=move, 2=show, 3=hide, 4=destroy, 5=shake, 6=show_keyboard,
 //           7=resize, 8=tray_add, 9=tray_menu, 10=tray_remove, 11=timer_state,
 //           12=pointer_style, 13=drag_start, 14=dnd_enabled, 15=window_state,
-//           16=window_opacity, 17=window_title, 18=window_attributes
+//           16=window_opacity, 17=window_title, 18=window_attributes,
+//           19=first_frame, 20=file_picker, 21=file_io, 22=raise_window
 // 第二参数选择通道：'window'（Index 页面）或 'keyboard'（当前可见 WindowSurface 页面）
 export const setNativeCallback: (callback: (cmd: object) => void, cbType?: string) => void;
 
@@ -46,6 +47,9 @@ export const registerOpenUrl: (callback: (url: string) => void) => void;
 // ── Surface 就绪 ──
 // ETS 在 XComponent.onLoad() 中调用
 export const onSurfaceReady: (reqId: number, xcId: string, surfaceId: string, surfW?: number, surfH?: number) => void;
+
+// 子窗口创建失败通知：ETS createSubWin 失败后立即调用，唤醒 C++ 等待（避免 10 秒超时）
+export const notifyWindowCreateFailed: (reqId: number) => void;
 
 // ── 窗口属性 ──
 export const onWindowResized: (reqId: number, w: number, h: number) => void;
@@ -68,9 +72,6 @@ export const onDeleteRightChars: (count: number) => void;
 export const onImeMoveCursor: (direction: number) => void;
 // ETS 主动请求显示/隐藏软键盘（状态同步，仅日志；弹/收由 FpgSurface 自行完成）
 export const showKeyboard: (show: number) => void;
-
-// ── 辅助 ──
-export const getModalReqId: () => number;
 
 // ── 系统托盘（HarmonyOS trayIcon，仅 2in1/PC） ──
 // 托盘事件：0=左键点击, 1=右键点击, 2=菜单项选中(menuId), 3=add 结果回传("ok"/"fail")

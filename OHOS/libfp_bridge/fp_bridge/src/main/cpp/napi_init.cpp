@@ -483,6 +483,29 @@ static napi_value OnSurfaceReady(napi_env env, napi_callback_info info) {
     return result;
 }
 
+// ── ETS 子窗口创建失败通知（唤醒 C++ ohos_create_window 的 10s 等待）──
+static napi_value NotifyWindowCreateFailed(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+
+    int32_t reqId = 0;
+    if (argc < 1 || args[0] == nullptr ||
+        napi_get_value_int32(env, args[0], &reqId) != napi_ok) {
+        OH_LOG_Print(LOG_APP, LOG_ERROR, 0xFF00, "fpGUI",
+            "NotifyWindowCreateFailed: invalid reqId arg");
+        napi_value result;
+        napi_get_undefined(env, &result);
+        return result;
+    }
+
+    ohos_notify_window_create_failed(reqId);
+
+    napi_value result;
+    napi_get_undefined(env, &result);
+    return result;
+}
+
 // ── 主窗口装饰尺寸 ──────────────────
 static napi_value SetMainWindowDec(napi_env env, napi_callback_info info) {    size_t argc = 2;
     napi_value args[2] = {nullptr};
@@ -710,7 +733,6 @@ static napi_value OnWindowClosed(napi_env env, napi_callback_info info) {
             if (g_inject_closed) g_inject_closed(win);
             g_winMap.erase(reqId);
             g_winRects.erase(reqId);
-            g_modalReqId = -1;
             OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "fpGUI",
                 "WindowClosed: req=%d cleaned (win=%p)", reqId, win);
         }
@@ -1150,13 +1172,6 @@ static napi_value OnImeMoveCursor(napi_env env, napi_callback_info info) {
     napi_value result;
     napi_get_undefined(env, &result);
     return result;
-}
-
-// ── 获取 modal reqId ─────────────────────────────────────
-static napi_value GetModalReqId(napi_env env, napi_callback_info info) {
-    napi_value val;
-    napi_create_int32(env, g_modalReqId, &val);
-    return val;
 }
 
 // ── ETS 主动请求显示/隐藏软键盘（状态同步，仅日志）────────────
@@ -1661,6 +1676,9 @@ static napi_value Init(napi_env env, napi_value exports) {
         // ── Surface 就绪 ──
         { "onSurfaceReady",      nullptr, OnSurfaceReady,      nullptr, nullptr, nullptr, napi_default, nullptr },
 
+        // ── 子窗口创建失败通知（ETS → C++，立即唤醒创建等待）──
+        { "notifyWindowCreateFailed", nullptr, NotifyWindowCreateFailed, nullptr, nullptr, nullptr, napi_default, nullptr },
+
         // ── 窗口属性 ──
         { "onWindowResized",     nullptr, OnWindowResized,     nullptr, nullptr, nullptr, napi_default, nullptr },
         { "onWindowMoved",       nullptr, OnWindowMoved,       nullptr, nullptr, nullptr, napi_default, nullptr },
@@ -1681,9 +1699,6 @@ static napi_value Init(napi_env env, napi_value exports) {
         { "onDeleteRightChars",  nullptr, OnDeleteRightChars,  nullptr, nullptr, nullptr, napi_default, nullptr },
         { "onImeMoveCursor",     nullptr, OnImeMoveCursor,     nullptr, nullptr, nullptr, napi_default, nullptr },
         { "showKeyboard",        nullptr, ShowKeyboard,        nullptr, nullptr, nullptr, napi_default, nullptr },
-
-        // ── 辅助 ──
-        { "getModalReqId",       nullptr, GetModalReqId,       nullptr, nullptr, nullptr, napi_default, nullptr },
 
         // ── 动态分发（Registry-Dispatch） ──
         { "dispatch",            nullptr, Dispatch,             nullptr, nullptr, nullptr, napi_default, nullptr },

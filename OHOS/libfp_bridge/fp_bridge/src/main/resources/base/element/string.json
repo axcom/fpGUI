@@ -23,6 +23,26 @@
     {
       "name": "reason_documents",
       "value": "读写文档目录"
+    },
+    {
+      "name": "reason_camera",
+      "value": "拍照、录像"
+    },
+    {
+      "name": "reason_microphone",
+      "value": "录音"
+    },
+    {
+      "name": "reason_screen_capture",
+      "value": "屏幕共享、截图"
+    },
+    {
+      "name": "reason_location",
+      "value": "获取位置信息"
+    },
+    {
+      "name": "reason_bluetooth",
+      "value": "连接蓝牙设备"
     }
   ]
 }

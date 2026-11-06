@@ -12,7 +12,8 @@
 #pragma once
 #include <cstdint>
 
-#define OHOS_BRIDGE_VERSION 13   // v13：新增 arkts_invoke_result（Pascal→ArkTS 结果回传）/ arkts_invoke（反向调用入口）
+#define OHOS_BRIDGE_VERSION 14   // v14：新增 notify_timer_state（Pascal→ETS 定时器活动态通知）
+                                 // v13：新增 arkts_invoke_result（Pascal→ArkTS 结果回传）/ arkts_invoke（反向调用入口）
 
 // Pascal → C++：Pascal 实现的导出函数表（Pascal 填充输入，C++ 缓存后直接调用）
 typedef struct {
@@ -82,6 +83,7 @@ typedef struct {
     void* show_file_picker;           // 文件选择器
     void* file_io;
     void* arkts_invoke;               // v13：int32_t(const char* callId, const char* method, const char* params)
+    void* notify_timer_state;         // v14：void(int active)（Pascal→ETS 定时器活动态通知）
 } FpBridgeCppApi; // pascal 以后也可直接动态加载 而不必再维护本表
 
 void* fp_bridge_get_pascal_lib_handle(void);

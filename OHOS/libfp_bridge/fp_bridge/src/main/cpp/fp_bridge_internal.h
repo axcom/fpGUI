@@ -59,6 +59,7 @@ enum NativeCmdType {
     NATIVE_CMD_FIRST_FRAME      = 19,   // 首帧上屏通知（Pascal FlushBuffer 成功后）
     NATIVE_CMD_FILE_PICKER      = 20,   // Pascal 请求拉起系统文件选择器（x=picker 类型，payload=optsJson）
     NATIVE_CMD_FILE_IO          = 21,   // Pascal 文件流操作（x=子操作，y=open 模式，offset/length/bin=数据）
+    NATIVE_CMD_RAISE_WINDOW     = 22,   // 模态窗口显示时请求置顶（reqId=目标窗口）
 };
 
 // 文件流子操作（与 ETS FpgFileIo.ets、Pascal fpg_ohos_filestream.pas 一致）
@@ -184,7 +185,6 @@ extern std::map<int, SizeW>   g_pendingResize; // 句柄未登记时暂存的 re
 extern std::map<int, SizeW>   g_surfaceSize;   // ETS 上报的渲染面(surface)权威尺寸
 extern std::mutex             g_resizeMutex;   
 extern int                    g_nextReqId;
-extern int                    g_modalReqId;
 extern int32_t                g_mainDecW;
 extern int32_t                g_mainDecH;
 extern std::map<int, std::pair<int32_t,int32_t>> g_winDec;
@@ -233,6 +233,11 @@ extern "C" {
 #endif
 // Pascal Handler 完成时调用（任意线程）；napi_init.cpp 守护线程亦调用
 void ohos_dispatch_result(const char* jobId, const char* resultJson, int failed);
+
+// ETS 子窗口创建失败通知（napi_init.cpp → fp_bridge.cpp）
+// 立即唤醒 ohos_create_window 的 g_xcCV 等待；reqId 已被超时路径清理时安全忽略
+void ohos_notify_window_create_failed(int reqId);
+
 #ifdef __cplusplus
 }
 #endif

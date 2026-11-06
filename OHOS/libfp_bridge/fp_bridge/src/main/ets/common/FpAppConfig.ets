@@ -7,7 +7,7 @@ export const APP_LIB_NAME: string = 'helloworld';
 
 // 静态命令行参数（空格分隔；支持 -b debug 和 key=value 两种风格）
 // Pascal 侧通过 ICmdLineParams 接口消费：cmd.HasOption('b') / cmd.GetOptionValue('key')
-export const APP_ARGS: string = '';//'ESC2.INF -style ';
+export const APP_ARGS: string = '';
 
 // 动态参数 want key：Ability 从 want.parameters[WANT_PARAM_ARGS] 读取并合并到 APP_ARGS
 export const WANT_PARAM_ARGS: string = 'fpArgs';

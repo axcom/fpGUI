@@ -54,17 +54,10 @@
           ],
           "when": "always"
         }
-      },*/
-      {
-        "name": "ohos.permission.READ_WRITE_DOCUMENTS_DIRECTORY",
-        "reason": "$string:reason_documents",
-        "usedScene": {
-          "abilities": [
-            "Fp_bridgeAbility"
-          ],
-          "when": "always"
-        }
       },
+      {
+        "name": "ohos.permission.GET_FILE_ICON"
+      },*/
       {
         "name": "ohos.permission.WINDOW_TOPMOST"
       },
@@ -78,11 +71,30 @@
         "name": "ohos.permission.STORE_PERSISTENT_DATA"
       },
       {
+        "name": "ohos.permission.GET_WIFI_INFO",
+      },
+      {
         "name": "ohos.permission.INTERNET"
       },
       {
+        "name": "ohos.permission.ACCELEROMETER"
+      },
+      {
+        "name": "ohos.permission.GYROSCOPE"
+      },
+      {
+        "name": "ohos.permission.READ_WRITE_DOCUMENTS_DIRECTORY",
+        "reason": "$string:reason_documents",
+        "usedScene": {
+          "abilities": [
+            "Fp_bridgeAbility"
+          ],
+          "when": "always"
+        }
+      },
+      {
         "name": "ohos.permission.CAMERA",
-        "reason": "{}",
+        "reason": "$string:reason_camera",
         "usedScene": {
           "abilities": [
             "Fp_bridgeAbility"
@@ -92,7 +104,7 @@
       },
       {
         "name": "ohos.permission.MICROPHONE",
-        "reason": "{}",
+        "reason": "$string:reason_microphone",
         "usedScene": {
           "abilities": [
             "Fp_bridgeAbility"
@@ -102,7 +114,7 @@
       },
       {
         "name": "ohos.permission.CUSTOM_SCREEN_CAPTURE",
-        "reason": "{}",
+        "reason": "$string:reason_screen_capture",
         "usedScene": {
           "abilities": [
             "Fp_bridgeAbility"
@@ -111,14 +123,8 @@
         }
       },
       {
-        "name": "ohos.permission.ACCELEROMETER"
-      },
-      {
-        "name": "ohos.permission.GYROSCOPE"
-      },
-      {
         "name": "ohos.permission.APPROXIMATELY_LOCATION",
-        "reason": "{}",
+        "reason": "$string:reason_location",
         "usedScene": {
           "abilities": [
             "Fp_bridgeAbility"
@@ -128,17 +134,7 @@
       },
       {
         "name": "ohos.permission.LOCATION",
-        "reason": "{}",
-        "usedScene": {
-          "abilities": [
-            "Fp_bridgeAbility"
-          ],
-          "when": "always"
-        }
-      },
-      {
-        "name": "ohos.permission.GET_WIFI_INFO",
-        "reason": "{}",
+        "reason": "$string:reason_location",
         "usedScene": {
           "abilities": [
             "Fp_bridgeAbility"
@@ -148,17 +144,14 @@
       },
       {
         "name": "ohos.permission.ACCESS_BLUETOOTH",
-        "reason": "{}",
+        "reason": "$string:reason_bluetooth",
         "usedScene": {
           "abilities": [
             "Fp_bridgeAbility"
           ],
           "when": "always"
         }
-      }/*,
-      {
-        "name": "ohos.permission.GET_FILE_ICON"
-      }*/
+      }
     ],
     "extensionAbilities": [
       {

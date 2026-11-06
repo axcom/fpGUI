@@ -21,7 +21,6 @@ export const onDeleteChars: (count: number) => void = () => {};
 export const onDeleteRightChars: (count: number) => void = () => {};
 export const onImeMoveCursor: (direction: number) => void = () => {};
 export const showKeyboard: (show: number) => void = () => {};
-export const getModalReqId: () => number = () => -1;
 export const onTrayEvent: (eventType: number, menuId: string) => void = () => {};
 export const notifyConfiguration: (kv: string) => void = () => {};
 export const timerTick: () => void = () => {};
