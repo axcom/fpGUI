@@ -84,7 +84,7 @@ procedure SetMaxAsyncJobs(AMax: Integer);}
 
 implementation
 
-uses fpg_ohos, fpg_main;
+uses fpg_ohos, fpg_main, fpg_jsonutil;
 
 const
   DEFAULT_TIMEOUT_MS = 30000; { 0 = 禁用超时（不做过期回收）；>0 设定毫秒阈值 }
@@ -215,52 +215,6 @@ begin
   fpGUI_Hilog(LOG_INFO, Msg);
 end;
 
-function JsonEscape(const S: string): string;
-var
-  i: Integer;
-  c: AnsiChar;
-begin
-  Result := '';
-  for i := 1 to Length(S) do
-  begin
-    c := S[i];
-    case c of
-      '"': Result := Result + '\"';
-      '\': Result := Result + '\\';
-      #8:  Result := Result + '\b';
-      #9:  Result := Result + '\t';
-      #10: Result := Result + '\n';
-      #12: Result := Result + '\f';
-      #13: Result := Result + '\r';
-    else
-      if Ord(c) < 32 then
-        Result := Result + '\u' + LowerCase(IntToHex(Ord(c), 4))
-      else
-        Result := Result + c;
-    end;
-  end;
-end;
-
-function JsonError(const Code, Msg: string): string;
-begin
-  Result := '{"ok":false,"code":"' + JsonEscape(Code) +
-            '","error":"' + JsonEscape(Msg) + '"}';
-end;
-
-function ExtractJsonString(const S, Key: string): string;
-var
-  pat: string;
-  p, q: Integer;
-begin
-  Result := '';
-  pat := '"' + Key + '":"';
-  p := Pos(pat, S);
-  if p = 0 then Exit;
-  p := p + Length(pat);
-  q := p;
-  while (q <= Length(S)) and (S[q] <> '"') do Inc(q);
-  if q > p then Result := Copy(S, p, q - p);
-end;
 
 function NormalizeOp(const S: string): string;
 begin
@@ -283,52 +237,9 @@ begin
 end;
 
 { =====================================================================
-  Schema 校验（内置轻量 JSON 对象解析，无 fpjson 依赖）
+  Schema 校验（JsonFindKeyValue / JsonValueKind，来自 fpg_jsonutil）
   ===================================================================== }
 
-const
-  JSON_WS = [' ', #9, #10, #13];
-
-{ 返回顶层 "key": 后 value 的起始位置（已跳过空白）；未找到返回 0 }
-function JsonValuePos(const Obj, Key: string): Integer;
-var
-  pat: string;
-  p, q: Integer;
-begin
-  Result := 0;
-  pat := '"' + Key + '"';
-  p := Pos(pat, Obj);
-  while p > 0 do
-  begin
-    q := p + Length(pat);
-    while (q <= Length(Obj)) and (Obj[q] in JSON_WS) do Inc(q);
-    if (q <= Length(Obj)) and (Obj[q] = ':') then
-    begin
-      Inc(q);
-      while (q <= Length(Obj)) and (Obj[q] in JSON_WS) do Inc(q);
-      Exit(q);
-    end;
-    p := Pos(pat, Obj, p + 1);
-  end;
-end;
-
-function JsonKindAt(const Obj: string; pos: Integer): TfpguiParamType;
-var
-  c: AnsiChar;
-begin
-  Result := ptAny;
-  if (pos < 1) or (pos > Length(Obj)) then Exit;
-  c := Obj[pos];
-  case c of
-    '"': Result := ptString;
-    '{': Result := ptObject;
-    '[': Result := ptArray;
-    't', 'f': Result := ptBoolean;
-    '-', '0'..'9': Result := ptNumber;
-  else
-    Result := ptAny;
-  end;
-end;
 
 function ValidateParams(const Params: string; const Schema: TfpguiParamSchema;
   out ErrorMsg: string): Boolean;
@@ -347,8 +258,7 @@ begin
   for i := 0 to High(Schema) do
   begin
     spec := Schema[i];
-    pos := JsonValuePos(Params, spec.Name);
-    if pos = 0 then
+    if not JsonFindKeyValue(Params, spec.Name, pos) then
     begin
       if spec.Required then
       begin
@@ -358,15 +268,15 @@ begin
       Continue;
     end;
     case spec.ParamType of
-      ptString:  if JsonKindAt(Params, pos) <> ptString then
+      ptString:  if JsonValueKind(Params, pos) <> jkString then
         begin ErrorMsg := spec.Name + ' must be string'; Exit; end;
-      ptNumber:  if JsonKindAt(Params, pos) <> ptNumber then
+      ptNumber:  if JsonValueKind(Params, pos) <> jkNumber then
         begin ErrorMsg := spec.Name + ' must be number'; Exit; end;
-      ptBoolean: if JsonKindAt(Params, pos) <> ptBoolean then
+      ptBoolean: if JsonValueKind(Params, pos) <> jkBoolean then
         begin ErrorMsg := spec.Name + ' must be boolean'; Exit; end;
-      ptObject:  if JsonKindAt(Params, pos) <> ptObject then
+      ptObject:  if JsonValueKind(Params, pos) <> jkObject then
         begin ErrorMsg := spec.Name + ' must be object'; Exit; end;
-      ptArray:   if JsonKindAt(Params, pos) <> ptArray then
+      ptArray:   if JsonValueKind(Params, pos) <> jkArray then
         begin ErrorMsg := spec.Name + ' must be array'; Exit; end;
       ptAny: ;
     end;
@@ -434,7 +344,7 @@ end;
 
 procedure FailJob(const JobId, ErrorMsg: string);
 begin
-  EmitResult(JobId, JsonError('INTERNAL', ErrorMsg), True);
+  EmitResult(JobId, JsonErrorObject('INTERNAL', ErrorMsg), True);
 end;
 
 function IsJobCancelled(const JobId: string): Boolean;
@@ -532,7 +442,7 @@ begin
 
     { Handler 返回但未 CompleteJob → 视为失败（避免作业悬挂） }
     if JobPending(job.JobId) then
-      EmitResult(job.JobId, JsonError('INTERNAL',
+      EmitResult(job.JobId, JsonErrorObject('INTERNAL',
         'async handler returned without CompleteJob'), True);
   finally
     job.Free;
@@ -569,7 +479,7 @@ begin
   except
     on E: Exception do
     begin
-      r := JsonError('INTERNAL', 'handler error: ' + E.Message);
+      r := JsonErrorObject('INTERNAL', 'handler error: ' + E.Message);
       Job.Failed := True;
     end;
   end;
@@ -707,13 +617,13 @@ begin
     idx := gEntries.IndexOf(op);
     if idx < 0 then
     begin
-      Result := JsonError('NO_HANDLER', 'no handler: ' + op);
+      Result := JsonErrorObject('NO_HANDLER', 'no handler: ' + op);
       Exit;
     end;
     entry := TDispatchEntry(gEntries.Objects[idx]);
     if not ValidateParams(params, entry.Schema, err) then
     begin
-      Result := JsonError('SCHEMA_FAIL', err);
+      Result := JsonErrorObject('SCHEMA_FAIL', err);
       Exit;
     end;
     job := TDispatchJob.Create;
@@ -761,7 +671,8 @@ var
   idx: Integer;
   job: TDispatchJob;
 begin
-  jobId := ExtractJsonString(params, 'jobId');
+  jobId := '';
+  JsonGetString(params, 'jobId', jobId);
   gJobLock.Acquire;
   try
     idx := gJobs.IndexOf(jobId);
@@ -820,7 +731,7 @@ begin
   if params <> nil then p := string(params) else p := '';
 
   if op = '' then
-    res := JsonError('BAD_ARGS', 'empty opType')
+    res := JsonErrorObject('BAD_ARGS', 'empty opType')
   else if op = '__ping' then
     res := '{"ok":true,"pong":true}'
   else if op = '__ops' then
@@ -997,7 +908,7 @@ begin
         if toKill[i] <> '' then
         begin
           DLog('dispatch WARN: job timeout/cancelled -> ' + toKill[i]);
-          EmitResult(toKill[i], JsonError('TIMEOUT', 'job timeout or cancelled'), True);
+          EmitResult(toKill[i], JsonErrorObject('TIMEOUT', 'job timeout or cancelled'), True);
         end;
       end;
     finally

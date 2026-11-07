@@ -87,7 +87,8 @@ implementation
 
 uses
   SyncObjs,
-  fpg_ohos;
+  fpg_ohos,
+  fpg_jsonutil;
 
 const
   { 单次 I/O 透传分块：1MB。每次往返为 tsfn + JS 线程同步 fs 调用 + NAPI 回传，
@@ -140,45 +141,6 @@ var
   g_io_pending: TStringList = nil;   { Names[reqId] → Objects[TFileIoRequest] }
   g_io_lock: TCriticalSection = nil;
   _ohos_file_io: TOhosFileIoFn = nil;
-
-{ ── 极简固定 schema JSON 整数提取（不引 fpjson）────────────────────────── }
-
-function JsonGetInt64(const S, Key: string; out V: Int64): Boolean;
-var
-  p, i: Integer;
-  neg: Boolean;
-  ch: Char;
-begin
-  Result := False;
-  V := 0;
-  p := Pos('"' + Key + '"', S);
-  if p = 0 then Exit;
-  i := p + Length(Key) + 2;          { 越过 "key" }
-  while (i <= Length(S)) and (S[i] in [' ', #9]) do Inc(i);
-  if (i > Length(S)) or (S[i] <> ':') then Exit;
-  Inc(i);
-  while (i <= Length(S)) and (S[i] in [' ', #9]) do Inc(i);
-  neg := False;
-  if i <= Length(S) then
-  begin
-    if S[i] = '-' then
-    begin
-      neg := True;
-      Inc(i);
-    end;
-  end;
-  while i <= Length(S) do
-  begin
-    ch := S[i];
-    if ch in ['0'..'9'] then
-      V := V * 10 + (Ord(ch) - Ord('0'))
-    else
-      Break;
-    Inc(i);
-  end;
-  if neg then V := -V;
-  Result := True;
-end;
 
 { ── 同步请求往返（JS 线程回传，竞态防护同文件选择器）──────────────────── }
 

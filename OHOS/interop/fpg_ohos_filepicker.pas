@@ -71,7 +71,11 @@ type
   TfpgOhosFilePicker = class
   public
     class function OpenDocument(const AOptions: TfpgDocumentPickerOptions): TStringList; overload;
+    { 旧式简化接口：SuffixFilters 为逗号分隔的后缀列表（如 '.txt,.pdf'），
+      可带空格；空串=不过滤。单次最多选 1 个，filepath 为选中路径。 }
     class function OpenDocument(var filepath: string; SuffixFilters:string=''): integer; overload;
+    { 同上；MaxSelectNumber=0 表示系统默认（多选）。sl 为 nil 时返回新建列表
+      （调用方 Free），非 nil 时结果复制进 sl（调用方保留所有权）。 }
     class function OpenDocument(var sl: TStringList; SuffixFilters:string=''; MaxSelectNumber:integer=0): integer; overload;
     class function SaveDocument(const AOptions: TfpgDocumentSaveOptions): string;
     class function OpenPhoto(const AOptions: TfpgPhotoPickerOptions): TStringList;
@@ -82,7 +86,8 @@ implementation
 
 uses
   SyncObjs,
-  fpg_ohos;
+  fpg_ohos,
+  fpg_jsonutil;
 
 const
   { 等待 ETS 结果的超时（ms）。系统选择器为模态 UI，给足用户操作时间；
@@ -96,8 +101,8 @@ type
     ResultJson: string;   { ETS 回传 JSON（uris 数组 + code 字段）}
   end;
 
-  { 本单元内部使用的字符串动态数组（避免依赖 Classes.TStringDynArray 可见性）}
-  TPickerStringArray = array of string;
+  { 本单元内部使用的字符串动态数组（来自 fpg_jsonutil）}
+  TPickerStringArray = TJsonStringArray;
 
   { C++ 独立导出符号（LibEntrySym 懒加载，与 ohos_set_modal_window 同模式）}
   TOhosShowFilePicker = procedure(reqId: Integer; pickerType: Integer;
@@ -109,213 +114,6 @@ var
   g_lock: TCriticalSection = nil;
   { 文件选择器 }
   _ohos_show_file_picker: TOhosShowFilePicker = nil;
-
-{ ── 极简 JSON 辅助（固定 schema，避免引入 fpjson 依赖）────────────────── }
-
-function JsonEscape(const S: string): string;
-var
-  i: Integer;
-begin
-  Result := '';
-  for i := 1 to Length(S) do
-    case S[i] of
-      '"':  Result := Result + '\"';
-      '\':  Result := Result + '\\';
-      #10:  Result := Result + '\n';
-      #13:  Result := Result + '\r';
-      #9:   Result := Result + '\t';
-      #0..#8, #11, #12, #14..#31:
-        Result := Result + '\u' + IntToHex(Ord(S[i]), 4);
-    else
-      Result := Result + S[i];
-    end;
-end;
-
-function JsonQuote(const S: string): string;
-begin
-  Result := '"' + JsonEscape(S) + '"';
-end;
-
-function StringArrayToJsonArray(const A: array of string): string;
-var
-  i: Integer;
-begin
-  Result := '[';
-  for i := Low(A) to High(A) do
-  begin
-    if i > Low(A) then Result := Result + ',';
-    Result := Result + JsonQuote(A[i]);
-  end;
-  Result := Result + ']';
-end;
-
-function CodePointToUtf8(cp: UInt32): string;
-begin
-  Result := '';
-  if cp < $80 then
-    Result := Chr(cp)
-  else if cp < $800 then
-    Result := Chr($C0 or (cp shr 6)) + Chr($80 or (cp and $3F))
-  else if cp < $10000 then
-    Result := Chr($E0 or (cp shr 12)) +
-              Chr($80 or ((cp shr 6) and $3F)) +
-              Chr($80 or (cp and $3F))
-  else
-    Result := Chr($F0 or (cp shr 18)) +
-              Chr($80 or ((cp shr 12) and $3F)) +
-              Chr($80 or ((cp shr 6) and $3F)) +
-              Chr($80 or (cp and $3F));
-end;
-
-{ 解析 JSON 字符串字面量（S[pos] 必须为开引号），返回值并把 pos 移到闭引号后 }
-function ParseJsonString(const S: string; var pos: Integer): string;
-var
-  v, hi, lo: LongWord;
-begin
-  Result := '';
-  if (pos > Length(S)) or (S[pos] <> '"') then Exit;
-  Inc(pos);
-  while pos <= Length(S) do
-  begin
-    if S[pos] = '"' then
-    begin
-      Inc(pos);
-      Exit;
-    end;
-    if S[pos] = '\' then
-    begin
-      Inc(pos);
-      if pos > Length(S) then Break;
-      case S[pos] of
-        '"':  Result := Result + '"';
-        '\':  Result := Result + '\';
-        '/':  Result := Result + '/';
-        'n':  Result := Result + #10;
-        'r':  Result := Result + #13;
-        't':  Result := Result + #9;
-        'b':  Result := Result + #8;
-        'f':  Result := Result + #12;
-        'u':
-          begin
-            if pos + 4 <= Length(S) then
-            begin
-              v := StrToInt64Def('$' + Copy(S, pos + 1, 4), 0);
-              Inc(pos, 4);
-              { UTF-16 代理对：此时 pos 指向首个 \uXXXX 的末位十六进制字符，
-                第二个转义符 '\' 位于 pos+1，'u' 位于 pos+2，低代理 4 位在 pos+3 }
-              if (v >= $D800) and (v <= $DBFF) and (pos + 6 <= Length(S)) and
-                 (Copy(S, pos + 1, 2) = '\u') then
-              begin
-                lo := StrToInt64Def('$' + Copy(S, pos + 3, 4), 0);
-                if (lo >= $DC00) and (lo <= $DFFF) then
-                begin
-                  Inc(pos, 6);
-                  hi := $10000 + ((v - $D800) shl 10) + (lo - $DC00);
-                  Result := Result + CodePointToUtf8(hi);
-                end
-                else
-                  Result := Result + CodePointToUtf8(v);
-              end
-              else
-                Result := Result + CodePointToUtf8(v);
-            end;
-          end;
-      end;
-      Inc(pos);
-    end
-    else
-    begin
-      Result := Result + S[pos];
-      Inc(pos);
-    end;
-  end;
-end;
-
-{ 定位 "key" 后冒号后的位置（跳过空白）；找不到返回 -1 }
-function FindJsonValue(const AJson, AKey: string; var outPos: Integer): Boolean;
-var
-  i, p, e: Integer;
-begin
-  Result := False;
-  outPos := -1;
-  i := 1;
-  while i <= Length(AJson) do
-  begin
-    if AJson[i] = '"' then
-    begin
-      p := i + 1;
-      e := p;
-      while (e <= Length(AJson)) and (AJson[e] <> '"') do
-      begin
-        if AJson[e] = '\' then Inc(e, 2) else Inc(e);
-      end;
-      if (e - p = Length(AKey)) and (Copy(AJson, p, e - p) = AKey) then
-      begin
-        i := e + 1;
-        while (i <= Length(AJson)) and (AJson[i] in [' ', #9, #10, #13]) do Inc(i);
-        if (i <= Length(AJson)) and (AJson[i] = ':') then
-        begin
-          Inc(i);
-          while (i <= Length(AJson)) and (AJson[i] in [' ', #9, #10, #13]) do Inc(i);
-          outPos := i;
-          Exit(True);
-        end;
-      end;
-      i := e + 1;
-    end
-    else
-      Inc(i);
-  end;
-end;
-
-function JsonGetInt(const AJson, AKey: string): Integer;
-var
-  pos: Integer;
-  s: string;
-begin
-  Result := 0;
-  if not FindJsonValue(AJson, AKey, pos) then Exit;
-  s := '';
-  if (pos <= Length(AJson)) and (AJson[pos] = '-') then
-  begin
-    s := '-';
-    Inc(pos);
-  end;
-  while (pos <= Length(AJson)) and (AJson[pos] in ['0'..'9']) do
-  begin
-    s := s + AJson[pos];
-    Inc(pos);
-  end;
-  if s <> '' then Result := StrToIntDef(s, 0);
-end;
-
-function JsonGetStringArray(const AJson, AKey: string): TPickerStringArray;
-var
-  pos: Integer;
-  list: TStringList;
-begin
-  Result := nil;
-  if not FindJsonValue(AJson, AKey, pos) then Exit;
-  if (pos > Length(AJson)) or (AJson[pos] <> '[') then Exit;
-  Inc(pos);
-  list := TStringList.Create;
-  try
-    while pos <= Length(AJson) do
-    begin
-      while (pos <= Length(AJson)) and (AJson[pos] in [' ', #9, #10, #13, ',']) do Inc(pos);
-      if AJson[pos] = ']' then Break;
-      if AJson[pos] = '"' then
-        list.Add(ParseJsonString(AJson, pos))
-      else
-        Inc(pos);  { 跳过非预期字符 }
-    end;
-    SetLength(Result, list.Count);
-    for pos := 0 to list.Count - 1 do
-      Result[pos] := list[pos];
-  finally
-    list.Free;
-  end;
-end;
 
 { ── 结果回调（C++ 在 JS/ETS 线程调用）────────────────────────────────────
   安全约定（与主线程超时/释放的竞态防护）：
@@ -412,6 +210,36 @@ begin
   end;
 end;
 
+{ 把 "a,b,c" 形式的后缀过滤器拆成 JSON 字符串数组。
+  逗号分隔，逐项 Trim 并丢弃空项；空串输出 []（不能输出 ""，
+  ETS 侧按数组使用，字符串会让 fileSuffixFilters 类型不符）。
+  每项都走 JsonArrayOfStrings 转义，含引号/反斜杠的后缀也不会破坏 JSON。 }
+function SuffixFiltersToJson(const ASuffixFilters: string): string;
+var
+  parts: array of string;
+  count, i, start: Integer;
+  item: string;
+begin
+  count := 0;
+  SetLength(parts, 0);
+  start := 1;
+  for i := 1 to Length(ASuffixFilters) + 1 do
+  begin
+    if (i > Length(ASuffixFilters)) or (ASuffixFilters[i] = ',') then
+    begin
+      item := Trim(Copy(ASuffixFilters, start, i - start));
+      if item <> '' then
+      begin
+        SetLength(parts, count + 1);
+        parts[count] := item;
+        Inc(count);
+      end;
+      start := i + 1;
+    end;
+  end;
+  Result := JsonArrayOfStrings(parts);
+end;
+
 { ── TfpgOhosFilePicker ────────────────────────────────────────────────── }
 
 class function TfpgOhosFilePicker.OpenDocument(
@@ -419,7 +247,7 @@ class function TfpgOhosFilePicker.OpenDocument(
 var
   json: string;
 begin
-  json := '{"suffix":' + StringArrayToJsonArray(AOptions.SuffixFilters) +
+  json := '{"suffix":' + JsonArrayOfStrings(AOptions.SuffixFilters) +
           ',"max":' + IntToStr(AOptions.MaxSelectNumber) + '}';
   Result := ShowPickerSync(Ord(ptDocument), json);
 end;
@@ -429,7 +257,7 @@ var
   json: string;
   l: TStringList;
 begin
-  json := '{"suffix":' + '"'+StringReplace(SuffixFilters,',','","',[rfReplaceAll]) +'","max": 1}';
+  json := '{"suffix":' + SuffixFiltersToJson(SuffixFilters) + ',"max":1}';
   l := ShowPickerSync(Ord(ptDocument), json);
   result := l.Count;
   filepath := trim(l.Text);
@@ -441,7 +269,7 @@ var
   json: string;
   l: TStringList;
 begin
-  json := '{"suffix":' + '"'+StringReplace(SuffixFilters,',','","',[rfReplaceAll]) +'"'+
+  json := '{"suffix":' + SuffixFiltersToJson(SuffixFilters) +
           ',"max":' + IntToStr(MaxSelectNumber) + '}';
   l := ShowPickerSync(Ord(ptDocument), json);
   result := l.Count;
@@ -465,7 +293,7 @@ begin
   { ETS 端：name→DocumentSaveOptions.newFileNames（预填，用户可改），
     suffix→fileSuffixFilters；save() 仅回传一个可写 URI }
   json := '{"name":' + JsonQuote(AOptions.SuggestedFileName) +
-          ',"suffix":' + StringArrayToJsonArray(AOptions.SuffixFilters) + '}';
+          ',"suffix":' + JsonArrayOfStrings(AOptions.SuffixFilters) + '}';
   list := ShowPickerSync(Ord(ptDocumentSave), json);
   try
     if list.Count > 0 then Result := list[0];

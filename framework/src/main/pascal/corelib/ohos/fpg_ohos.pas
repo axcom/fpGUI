@@ -1,4 +1,4 @@
-﻿{
+{
     fpGUI  -  Free Pascal GUI Toolkit
 
     Copyright (c) 2026 See the file AUTHORS.txt, included in this
@@ -77,8 +77,36 @@ const
   OH_KEY_DOWN = 0;
   OH_KEY_UP   = 1;
 
+const
+  { ohos_get_user_dir 的 dirType 参数，必须与 libfp_bridge.so 侧
+    fp_bridge.cpp 中的 ohos_get_user_dir 保持一致。 }
+  { 应用沙箱目录 }
+  OHOS_DIR_SANDBOX_FILES        = 0;   // filesDir
+  OHOS_DIR_SANDBOX_CACHE        = 1;   // cacheDir
+  OHOS_DIR_SANDBOX_TEMP         = 2;   // tempDir
+  OHOS_DIR_SANDBOX_RESOURCE     = 3;   // resourceDir
+  OHOS_DIR_SANDBOX_DATABASE     = 4;   // databaseDir
+  OHOS_DIR_SANDBOX_PREFERENCES  = 5;   // preferencesDir
+  OHOS_DIR_SANDBOX_BUNDLE_CODE  = 6;   // bundleCodeDir
+  OHOS_DIR_SANDBOX_DISTRIBUTED  = 7;   // distributedFilesDir
+  OHOS_DIR_SANDBOX_CLOUD        = 8;   // cloudFileDir
+
+  { 公共用户目录 }
+  OHOS_DIR_DOCUMENTS         = 10;  // Documents
+  OHOS_DIR_DOWNLOAD          = 11;  // Download
+  OHOS_DIR_DCIM              = 12;  // DCIM（实际目录 Camera）
+  OHOS_DIR_PICTURES          = 13;  // Pictures
+  OHOS_DIR_VIDEOS            = 14;  // Videos
+  OHOS_DIR_MUSIC             = 15;  // Music（实际目录 Audio）
+  OHOS_DIR_AUDIOS            = 16;  // Audios
+
+  { 沙箱 base 下的旧 Downloads/Documents 子目录 }
+  OHOS_DIR_SANDBOX_DOWNLOADS = 101;
+  OHOS_DIR_SANDBOX_DOCUMENTS = 102;
+  
 type
-{ TfpgOhosFontResource }
+
+  { TfpgOhosFontResource }
 
   TfpgOhosFontResource = class(TfpgFontResourceBase)
   protected
@@ -120,45 +148,6 @@ type
     property  IsBold: Boolean read FIsBold;
     property  IsItalic: Boolean read FIsItalic;
     property  IsUnderline: Boolean read FIsUnderline;
-  end;
-
-{ TfpgOhosCmdLineParams — OHOS command-line params from C++ }
-{ Parses space-separated args string: "-b debug key=value" }
-type
-  TfpgOhosCmdLineParams = class(TInterfacedObject, ICmdLineParams)
-  private
-    FItems: TStringList;
-    FOptionChar: char;
-    FCaseSensitiveOptions: Boolean;
-    procedure   ParsePayload(const APayload: string);
-    function    GetOptionAtIndex(AIndex: Integer; IsLong: Boolean): string;
-    function    FindOptionIndex(const S: string; var LongOpt: Boolean; StartAt: Integer = -1): Integer;
-    function    GetOptionValue(const S: string): string;
-    function    GetOptionValue(const C: char; const S: string): string;
-    function    GetOptionValues(const C: Char; const S: string): TStringArray;
-    function    HasOption(const S: string): Boolean;
-    function    HasOption(const C: char; const S: string): Boolean;
-    function    CheckOptions(const ShortOptions: string; const Longopts: TStrings; Opts, NonOpts: TStrings; AllErrors: Boolean = False): string;
-    function    CheckOptions(const ShortOptions: string; const Longopts: array of string; Opts, NonOpts: TStrings; AllErrors: Boolean = False): string;
-    function    CheckOptions(const ShortOptions: string; const LongOpts: TStrings; AllErrors: Boolean = False): string;
-    function    CheckOptions(const ShortOptions: string; const LongOpts: array of string; AllErrors: Boolean = False): string;
-    function    CheckOptions(const ShortOptions: string; const LongOpts: string; AllErrors: Boolean = False): string;
-    function    GetNonOptions(const ShortOptions: string; const LongOpts: Array of string): TStringArray;
-    procedure   GetNonOptions(const ShortOptions: string; const LongOpts: Array of string; NonOptions: TStrings);
-    function    GetCaseSensitiveOptions: Boolean;
-    function    GetOptionChar: char;
-    procedure   SetCaseSensitiveOptions(AValue: Boolean);
-    procedure   SetOptionChar(AValue: char);
-    function    ParamStr(AIndex: integer): string;
-    function    GetParams(AIndex: integer): string;
-    function    GetParamCount: integer;
-  public
-    constructor Create(const AAppArgs, APayload: string);
-    destructor  Destroy; override;
-    property    OptionChar: char read GetOptionChar write SetOptionChar;
-    property    CaseSensitiveOptions: Boolean read GetCaseSensitiveOptions write SetCaseSensitiveOptions;
-    property    Params[Index: integer]: string read GetParams;
-    property    ParamCount: integer read GetParamCount;
   end;
 
 { TfpgOhosImage }
@@ -856,6 +845,8 @@ implementation
 uses
   baseunix,
   unix,
+  fpg_ohos_CmdLineParams,
+  fpg_jsonutil,
   fpg_utils,
   fpg_main,
   fpg_constants,
@@ -864,7 +855,6 @@ uses
   fpg_window,      { TfpgWindow.WindowTitle（窗题读取——应用 Create 阶段设置）}
   fpg_trayicon,    { TfpgSystemTrayIcon（托盘 Owner 强转，仅 implementation 层引用，避免循环）}
   fpg_menu,        { TfpgPopupMenu/TfpgMenuItem（托盘菜单序列化）}
-//  fpg_ohos_dispatch,{ 动态分发（Registry-Dispatch）：注册表/Job/UI 队列 }
   fpg_form;        { TfpgBaseForm.CloseQuery（标题栏 X 关闭前 CanClose 查询，静态接管原 dlsym 桥）}
 
 { 前向声明（TfpgOhosApplication.Create 启动期调用，定义在文件后部）}
@@ -4185,7 +4175,7 @@ begin
 	if Assigned(_get_user_dir) then
 	begin
 	  // rawfile Dir
-	  p := _get_user_dir(0);  
+	  p := _get_user_dir(OHOS_DIR_SANDBOX_FILES);  
 	  if (p <> nil) and (p[0] <> #0) then
 	  begin
         if setenv('HOME', p, 1) = 0 then
@@ -4196,7 +4186,7 @@ begin
 	  end else if p <> nil then
         cfree(p);
       // resfile Dir
-	  p := _get_user_dir(3);  
+	  p := _get_user_dir(OHOS_DIR_SANDBOX_RESOURCE);  
 	  if (p <> nil) and (p[0] <> #0) then
 	  begin
         fpgSearchPath := fpgAppendPathDelim(fpgFromOSEncoding(p));
@@ -4949,8 +4939,8 @@ begin
 if (gModalWinHandle <> nil) and (FindWindowByHandle(gModalWinHandle) = nil) then
 begin
   fpGUI_Hilog(LOG_INFO, 'modal handle stale, clearing');
-  gModalWinHandle := nil;
   if Assigned(_set_modal_window) then _set_modal_window(nil);
+  gModalWinHandle := nil;
 end;
 
     { Track focused window for keyboard routing. Only DOWN updates it:
@@ -5909,547 +5899,6 @@ begin
 end;
 
 { ═══════════════════════════════════════════════════════════════
-  TfpgOhosCmdLineParams — ICmdLineParams 实现
-  解析 OhosArgs 空格分隔参数："-b debug key=value"
-  ═══════════════════════════════════════════════════════════════ }
-
-constructor TfpgOhosCmdLineParams.Create(const AAppArgs, APayload: string);
-var tmp: TStringList;
-    i: Integer;
-begin
-  inherited Create;
-  FItems := TStringList.Create;
-  FOptionChar := '-';
-  FCaseSensitiveOptions := False;
-  // 1. 解析 OhosArgs → 按空格分割追加到 FItems
-  if Trim(AAppArgs) <> '' then
-  begin
-    tmp := TStringList.Create;
-    try
-      tmp.Delimiter := ' ';
-      tmp.StrictDelimiter := True;
-      tmp.DelimitedText := Trim(AAppArgs);
-      for i := 0 to tmp.Count - 1 do
-        if Trim(tmp[i]) <> '' then
-          FItems.Add(Trim(tmp[i]));
-    finally
-      tmp.Free;
-    end;
-  end;
-  // 2. 解析 gLaunchParams → JSON 字段追加为 key=value
-  ParsePayload(APayload);
-end;
-
-destructor TfpgOhosCmdLineParams.Destroy;
-begin
-  FItems.Free;
-  inherited Destroy;
-end;
-
-procedure TfpgOhosCmdLineParams.ParsePayload(const APayload: string);
-var
-  p, pEnd, pField: PChar;
-  key, value, subKey: string;
-begin
-  if APayload = '' then Exit;
-  p := PChar(APayload);
-  while (p^ <> #0) and (p^ <> '{') do Inc(p);
-  if p^ = '{' then Inc(p);
-
-  while p^ <> #0 do
-  begin
-    while (p^ <> #0) and (p^ in [' ', ',', #10, #13, #9]) do Inc(p);
-    if (p^ = #0) or (p^ = '}') then Break;
-
-    if p^ = '"' then Inc(p);
-    pField := p;
-    while (p^ <> #0) and (p^ <> '"') do Inc(p);
-    SetString(key, pField, p - pField);
-    if p^ = '"' then Inc(p);
-
-    while (p^ <> #0) and (p^ in [' ', #9]) do Inc(p);
-    if p^ = ':' then Inc(p);
-    while (p^ <> #0) and (p^ in [' ', #9]) do Inc(p);
-
-    if p^ = '"' then
-    begin
-      Inc(p);
-      pField := p;
-      while (p^ <> #0) and (p^ <> '"') do
-      begin
-        if (p^ = '\') and (p[1] <> #0) then Inc(p);
-        Inc(p);
-      end;
-      SetString(value, pField, p - pField);
-      if p^ = '"' then Inc(p);
-      value := StringReplace(value, '\"', '"', [rfReplaceAll]);
-      value := StringReplace(value, '\\', '\', [rfReplaceAll]);
-      value := StringReplace(value, '\n', #10, [rfReplaceAll]);
-      value := StringReplace(value, '\r', #13, [rfReplaceAll]);
-      value := StringReplace(value, '\t', #9, [rfReplaceAll]);
-      FItems.Add(key + '=' + value);
-    end
-    else if p^ = '{' then
-    begin
-      Inc(p);
-      while (p^ <> #0) and (p^ <> '}') do
-      begin
-        while (p^ <> #0) and (p^ in [' ', ',', #10, #13, #9]) do Inc(p);
-        if (p^ = #0) or (p^ = '}') then Break;
-        if p^ = '"' then Inc(p);
-        pField := p;
-        while (p^ <> #0) and (p^ <> '"') do Inc(p);
-        SetString(subKey, pField, p - pField);
-        if p^ = '"' then Inc(p);
-        while (p^ <> #0) and (p^ in [' ', #9]) do Inc(p);
-        if p^ = ':' then Inc(p);
-        while (p^ <> #0) and (p^ in [' ', #9]) do Inc(p);
-        if p^ = '"' then
-        begin
-          Inc(p);
-          pField := p;
-          while (p^ <> #0) and (p^ <> '"') do
-          begin
-            if (p^ = '\') and (p[1] <> #0) then Inc(p);
-            Inc(p);
-          end;
-          SetString(value, pField, p - pField);
-          if p^ = '"' then Inc(p);
-          value := StringReplace(value, '\"', '"', [rfReplaceAll]);
-          value := StringReplace(value, '\\', '\', [rfReplaceAll]);
-          FItems.Add(key + '.' + subKey + '=' + value);
-        end
-        else
-          Inc(p);
-        while (p^ <> #0) and (p^ in [' ', ',', #9]) do Inc(p);
-      end;
-      if p^ = '}' then Inc(p);
-    end
-    else
-      Inc(p);
-    while (p^ <> #0) and (p^ in [' ', #9]) do Inc(p);
-  end;
-end;
-
-function TfpgOhosCmdLineParams.GetOptionAtIndex(AIndex: Integer; IsLong: Boolean): string;
-var
-  P: Integer;
-  O: String;
-begin
-  Result := '';
-  If (AIndex < 0) then
-    Exit;
-  If IsLong then
-  begin // Long options have form --option=value
-    O := FItems[AIndex];
-    P := Pos('=', O);
-    if (P = 0) then
-      P := Length(O);
-    Delete(O, 1, P);
-    Result := O;
-  end
-  else
-  begin // short options have form '-o value'
-    if (AIndex<ParamCount-1) then
-      if (Copy(FItems[AIndex+1], 1, 1) <> '-') then
-        Result := FItems[AIndex+1];
-  end;
-end;
-
-function TfpgOhosCmdLineParams.FindOptionIndex(const S: string; var LongOpt: Boolean; StartAt: Integer): Integer;
-var
-  SO, O: string;
-  I, P: integer;
-begin
-  if not CaseSensitiveOptions then
-    SO := UpperCase(S)
-  else
-    SO := S;
-  Result := -1;
-  I := StartAt;
-  if (I = -1) then
-    I := ParamCount-1;
-  while (Result = -1) and (I >= 0) do
-  begin
-    O := FItems[i];
-    // - must be seen as an option value
-    if (Length(O) > 1) and (O[1] = FOptionChar) then
-    begin
-      Delete(O, 1, 1);
-      LongOpt := (Length(O) > 0) and (O[1] = FOptionChar);
-      if LongOpt then
-        Delete(O, 1, 1);
-      P := Pos('=', O);
-      if (P <> 0) then
-        O := Copy(O, 1, P - 1);
-      if not CaseSensitiveOptions then
-        O      := UpperCase(O);
-      if (O = SO) then
-        Result := i;
-    end;
-    Dec(i);
-  end;
-end;
-
-function TfpgOhosCmdLineParams.GetOptionValue(const S: string): string;
-begin
-  Result := GetoptionValue(#255, S);
-end;
-
-function TfpgOhosCmdLineParams.GetOptionValue(const C: char; const S: string): string;
-var
-  B: Boolean;
-  I, P: integer;
-  O: string;
-begin
-  Result := '';
-  B := False;
-  I      := FindOptionIndex(C, B);
-  if (I = -1) then
-    I := FindoptionIndex(S, B);
-  if (I <> -1) then
-    if B then
-    begin
-      // Long options have form --option=value
-      O := FItems[I];
-      P := Pos('=', O);
-      if (P = 0) then
-        P := Length(O);
-      Delete(O, 1, P);
-      Result := O;
-    end
-    else if (I < ParamCount-1) then
-    begin
-      if (Copy(FItems[I+1], 1, 1) <> '-') then
-        Result := FItems[I+1]; // short options have form '-o value'
-    end;
-end;
-
-function TfpgOhosCmdLineParams.GetOptionValues(const C: Char; const S: string): TStringArray;
-var
-  I, Cnt: Integer;
-  B: Boolean;
-begin
-  SetLength(Result, ParamCount);
-  Cnt := 0;
-  Repeat
-    I := FindOptionIndex(C, B, I);
-    If I<>-1 then
-    begin
-      Inc(Cnt);
-      Dec(I);
-    end;
-  Until I = -1;
-  Repeat
-    I := FindOptionIndex(S, B,I );
-    If I <> -1 then
-    begin
-      Inc(Cnt);
-      Dec(I);
-    end;
-  Until I = -1;
-  SetLength(Result, Cnt);
-  Cnt := 0;
-  I := -1;
-  Repeat
-    I := FindOptionIndex(C, B, I);
-    If (I <> -1) then
-    begin
-      Result[Cnt] := GetOptionAtIndex(I, False);
-      Inc(Cnt);
-      Dec(i);
-    end;
-  Until (I = -1);
-  I := -1;
-  Repeat
-    I := FindOptionIndex(S, B, I);
-    If I <> -1 then
-    begin
-      Result[Cnt] := GetOptionAtIndex(I, True);
-      Inc(Cnt);
-      Dec(i);
-    end;
-  Until (I = -1);
-end;
-
-function TfpgOhosCmdLineParams.HasOption(const S: string): Boolean;
-var
-  B: Boolean;
-begin
-  B := False;
-  Result := FindOptionIndex(S, B) <> -1;
-end;  
-
-function TfpgOhosCmdLineParams.HasOption(const C: char; const S: string): Boolean;
-var
-  B: Boolean;
-begin
-  B := False;
-  Result := (FindOptionIndex(C, B) <> -1) or (FindOptionIndex(S, B) <> -1);
-end;
-
-function TfpgOhosCmdLineParams.CheckOptions(const ShortOptions: string; const Longopts: TStrings; AllErrors: Boolean): string;
-begin
-  Result := CheckOptions(ShortOptions, LongOpts, nil, nil, AllErrors);
-end;
-
-function TfpgOhosCmdLineParams.CheckOptions(const ShortOptions: string; const Longopts: TStrings; Opts, NonOpts: TStrings; AllErrors: Boolean): string;
-var
-  I, J, L, P: integer;
-  O, OV, SO: string;
-  UsedArg, HaveArg: Boolean;
-
-  function FindLongOpt(S: string): Boolean;
-  var
-    I: integer;
-  begin
-    Result := Assigned(LongOpts);
-    if not Result then
-      Exit;
-    if CaseSensitiveOptions then
-    begin
-      I := LongOpts.Count - 1;
-      while (I >= 0) and (LongOpts[i] <> S) do
-        Dec(i);
-    end
-    else
-    begin
-      S := UpperCase(S);
-      I := LongOpts.Count - 1;
-      while (I >= 0) and (UpperCase(LongOpts[i]) <> S) do
-        Dec(i);
-    end;
-    Result := (I <> -1);
-  end;
-
-  procedure AddToResult(const Msg: string);
-  begin
-    if (Result <> '') then
-      Result := Result + LineEnding;
-    Result := Result + Msg;
-  end;
-
-begin
-  if CaseSensitiveOptions then
-    SO := ShortOptions
-  else
-    SO := LowerCase(ShortOptions);
-  Result := '';
-  I := 1;
-  while (I < ParamCount) and ((Result = '') or AllErrors) do
-  begin
-    O := FItems[I];
-    if (Length(O) = 0) or (O[1] <> FOptionChar) then
-    begin
-      if Assigned(NonOpts) then
-        NonOpts.Add(O);
-    end
-    else
-	  begin
-      if (Length(O) < 2) then
-        AddToResult(Format(SErrInvalidOption, [i, O]))
-      else
-      begin
-        HaveArg := False;
-        OV      := '';
-        // Long option ?
-        if (O[2] = FOptionChar) then
-        begin
-          Delete(O, 1, 2);
-          J := Pos('=', O);
-          if J <> 0 then
-          begin
-            HaveArg := True;
-            OV      := O;
-            Delete(OV, 1, J);
-            O       := Copy(O, 1, J - 1);
-          end;
-          // Switch Option
-          if FindLongopt(O) then
-          begin
-            if HaveArg then
-              AddToResult(Format(SErrNoOptionAllowed, [I, O]));
-          end
-          else
-          begin // Required argument
-            if FindLongOpt(O + ':') then
-            begin
-              if not HaveArg then
-                AddToResult(Format(SErrOptionNeeded, [I, O]));
-            end
-            else
-            begin // Optional Argument.
-              if not FindLongOpt(O + '::') then
-                AddToResult(Format(SErrInvalidOption, [I, O]));
-            end;
-          end;
-        end
-        else // Short Option.
-        begin
-          HaveArg := (I < ParamCount-1) and (Length(FItems[I + 1]) > 0) and (FItems[I + 1][1] <> FOptionChar);
-          UsedArg := False;
-          if HaveArg then
-            OV := FItems[I + 1];
-          if not CaseSensitiveOptions then
-            O := LowerCase(O);
-          L := Length(O);
-          J := 2;
-          while ((Result = '') or AllErrors) and (J <= L) do
-          begin
-            P := Pos(O[J], ShortOptions);
-            if (P = 0) or (O[j] = ':') then
-              AddToResult(Format(SErrInvalidOption, [I, O[J]]))
-            else
-            begin
-		          if (P < Length(ShortOptions)) and (Shortoptions[P + 1] = ':') then
-			        begin
-                // Required argument
-                if ((P + 1) = Length(ShortOptions)) or (Shortoptions[P + 2] <> ':') then
-                  if (J < L) or not haveArg then // Must be last in multi-opt !!
-                    AddToResult(Format(SErrOptionNeeded, [I, O[J]]));
-                O := O[j]; // O is added to arguments.
-                UsedArg := True;
-              end;
-            end;
-            Inc(J);
-          end;
-          if HaveArg and UsedArg then
-          begin
-            Inc(I); // Skip argument.
-            O := O[Length(O)]; // O is added to arguments !
-          end;
-        end;
-        if HaveArg and ((Result = '') or AllErrors) then
-          if Assigned(Opts) then
-            Opts.Add(O + '=' + OV);
-      end;
-    end;
-    Inc(I);
-  end;
-end;
-
-function TfpgOhosCmdLineParams.CheckOptions(const ShortOptions: string; const Longopts: array of string; Opts, NonOpts: TStrings; AllErrors: Boolean): string;
-var
-  L: TStringList;
-  I: integer;
-begin
-  L := TStringList.Create;
-  try
-    for I := 0 to High(LongOpts) do
-      L.Add(LongOpts[i]);
-    Result := CheckOptions(ShortOptions, L, Opts, NonOpts, AllErrors);
-  finally
-    L.Free;
-  end;
-end;
-
-function TfpgOhosCmdLineParams.CheckOptions(const ShortOptions: string; const LongOpts: array of string; AllErrors: Boolean): string;
-var
-  L: TStringList;
-  I: integer;
-begin
-  L := TStringList.Create;
-  try
-    for I := 0 to High(LongOpts) do
-      L.Add(LongOpts[i]);
-    Result := CheckOptions(ShortOptions, L, AllErrors);
-  finally
-    L.Free;
-  end;
-end;
-
-function TfpgOhosCmdLineParams.CheckOptions(const ShortOptions: string; const LongOpts: string; AllErrors: Boolean): string;
-const
-  cSepChars = ' '#10#13#9;
-var
-  L: TStringList;
-  Len, I, J: integer;
-begin
-  L := TStringList.Create;
-  try
-    I := 1;
-    Len := Length(LongOpts);
-    while I <= Len do
-    begin
-      while Isdelimiter(cSepChars, LongOpts, I) do
-        Inc(I);
-      J := I;
-      while (J <= Len) and not IsDelimiter(cSepChars, LongOpts, J) do
-        Inc(J);
-      if (I <= J) then
-        L.Add(Copy(LongOpts, I, (J - I)));
-      I := J + 1;
-    end;
-    Result := CheckOptions(Shortoptions, L, AllErrors);
-  finally
-    L.Free;
-  end;
-end;
-
-function TfpgOhosCmdLineParams.GetNonOptions(const ShortOptions: string; const LongOpts: array of string): TStringArray;
-var
-  NO : TStrings;
-  I : Integer;
-begin
-  NO := TStringList.Create;
-  try
-    GetNonOptions(ShortOptions, LongOpts, No);
-    SetLength(Result, NO.Count);
-    For I := 0 to NO.Count-1 do
-      Result[I] := NO[i];
-  finally
-    NO.Free;
-  end;
-end;
-
-procedure TfpgOhosCmdLineParams.GetNonOptions(const ShortOptions: string; const LongOpts: array of string; NonOptions: TStrings);
-var
-  S: String;
-begin
-  S := CheckOptions(ShortOptions, LongOpts, Nil, NonOptions, true);
-  if (S <> '') then
-    Raise EListError.Create(S);
-end;
-
-function TfpgOhosCmdLineParams.GetCaseSensitiveOptions: Boolean;
-begin
-  Result := FCaseSensitiveOptions;
-end;
-
-function TfpgOhosCmdLineParams.GetOptionChar: char;
-begin
-  Result := FOptionChar;
-end;
-
-procedure TfpgOhosCmdLineParams.SetCaseSensitiveOptions(AValue: Boolean);
-begin
-  FCaseSensitiveOptions := AValue;
-end;
-
-procedure TfpgOhosCmdLineParams.SetOptionChar(AValue: char);
-begin
-  FOptionChar := AValue;
-end;
-
-function TfpgOhosCmdLineParams.ParamStr(AIndex: integer): string;
-begin
-  if AIndex < FItems.Count then 
-    Result := FItems[AIndex]
-  else
-    Result := '';
-end;
-
-function TfpgOhosCmdLineParams.GetParams(AIndex: integer): string;
-begin
-  Result := GetOptionAtIndex(AIndex, False);
-end;
-
-function TfpgOhosCmdLineParams.GetParamCount: integer;
-begin
-  Result := FItems.Count;
-end;
-
-{ ═══════════════════════════════════════════════════════════════
   HandleLaunchParamsEvent — 启动载荷 JSON 消费（UI 线程）
   热启动由 C++ set_launch_params 调用；仅更新 gLaunchParams + 事件回调
   appArgs 已由 ohos_inject_app_args 独立处理，此处不再提取
@@ -7105,7 +6554,10 @@ begin
     SafeDeliverMessages;
   except
     on E: Exception do
+    begin
       fpGUI_Hilog(LOG_ERROR, 'loop-wave exception: ' + E.ClassName + ': ' + E.Message);
+      raise;
+    end;
   end;
   UpdateKeyboardVisibility;
 
@@ -7160,7 +6612,10 @@ begin
     SafeDeliverMessages;
   except
     on E: Exception do
+    begin
       fpGUI_Hilog(LOG_ERROR, 'loop-wave2 exception: ' + E.ClassName + ': ' + E.Message);
+      raise;
+    end;
   end;
 
   if Assigned(FOnIdle) then
@@ -7334,7 +6789,7 @@ begin
   inherited PopulateSpecialDirs(aDirectory);
   if Assigned(_get_user_dir) then
   begin
-    p := _get_user_dir(0);  // rawfile
+    p := _get_user_dir(OHOS_DIR_SANDBOX_FILES);  // rawfile
     if (p <> nil) and (p[0] <> #0) then
     begin
       if FSpecialDirs.IndexOf(p) < 0 then
@@ -7358,7 +6813,7 @@ begin
     dir := '';
     if Assigned(_get_user_dir) then
     begin
-      p := _get_user_dir(0);          // rawfile
+      p := _get_user_dir(OHOS_DIR_SANDBOX_FILES);          // rawfile
       if (p <> nil) and (p[0] <> #0) then
       begin
         dir := StrPas(p);
@@ -7392,10 +6847,7 @@ type
   TDragHack = class(TfpgDrag)
   end;
 
-{ JSON/序列化工具（实现见后）——forward 声明以满足先于 TfpgOhosDrag.Execute 使用 }
-function OhosJsonEscape(const S: string): string; forward;
-function OhosJsonUnescape(const S: string): string; forward;
-function OhosJsonGetString(const AJson, AKey: string; var AValue: string): Boolean; forward;
+{ JSON 转义/取值来自 fpg_jsonutil；这里只 forward 本单元内的领域辅助函数 }
 function DropActionsToInt(const AActions: TfpgDropActions): Int32; forward;
 function OhosMimeDataToJson(const AMimeData: TfpgMimeDataBase): string; forward;
 
@@ -7575,7 +7027,7 @@ begin
   work := ASummaryJson;
   while True do
   begin
-    if not OhosJsonGetString(work, 'mime', mime) then Break;
+    if not JsonGetString(work, 'mime', mime) then Break;
     if mime <> '' then
     begin
       itm := TfpgMimeDataItem.Create(mime, 0);
@@ -7602,7 +7054,7 @@ begin
   work := ARecordsJson;
   while True do
   begin
-    if not OhosJsonGetString(work, 'type', t) then Break;
+    if not JsonGetString(work, 'type', t) then Break;
     { 前缀匹配覆盖 UTD 后缀（-65 等）：注意 general.plain-text 不以 general.text 开头，
       必须单独匹配（此前漏配导致外部文本拖入 mimes 空 → 拒绝）}
     if (Pos('general.plain-text', t) = 1) or (Pos('general.text', t) = 1) or
@@ -7666,12 +7118,12 @@ begin
   text := ''; html := '';
   uris := TStringList.Create;
   try
-    if OhosJsonGetString(ARecordsJson, 'textContent', s) then text := s;
-    if OhosJsonGetString(ARecordsJson, 'htmlContent', s) then html := s;
+    if JsonGetString(ARecordsJson, 'textContent', s) then text := s;
+    if JsonGetString(ARecordsJson, 'htmlContent', s) then html := s;
     work := ARecordsJson;
     while True do
     begin
-      if not OhosJsonGetString(work, 'uri', s) then Break;
+      if not JsonGetString(work, 'uri', s) then Break;
       uris.Add(s);
       p := Pos('"uri"', work);
       if p = 0 then Break;
@@ -7687,112 +7139,6 @@ begin
       SetDropData(html);
   finally
     uris.Free;
-  end;
-end;
-
-{ ---------------------------------------------------------------------
-   JSON 工具（固定 schema 的轻量提取；ETS 侧 JSON.stringify 输出：
-   非 ASCII 原样 UTF-8，转义仅 " \ \n \r \t 及 \uXXXX 控制符）
-   --------------------------------------------------------------------- }
-
-function OhosJsonEscape(const S: string): string;
-var
-  i: Integer;
-begin
-  Result := '';
-  for i := 1 to Length(S) do
-  begin
-    case S[i] of
-      '"':  Result := Result + '\"';
-      '\':  Result := Result + '\\';
-      #10:  Result := Result + '\n';
-      #13:  Result := Result + '\r';
-      #9:   Result := Result + '\t';
-      #0..#8, #11, #12, #14..#31:
-        Result := Result + '\u' + IntToHex(Ord(S[i]), 4);
-    else
-      Result := Result + S[i];
-    end;
-  end;
-end;
-
-function OhosJsonUnescape(const S: string): string;
-var
-  i: Integer;
-  cp: LongWord;
-begin
-  Result := '';
-  i := 1;
-  while i <= Length(S) do
-  begin
-    if S[i] = '\' then
-    begin
-      Inc(i);
-      if i > Length(S) then Break;
-      case S[i] of
-        '"':  Result := Result + '"';
-        '\':  Result := Result + '\';
-        '/':  Result := Result + '/';
-        'n':  Result := Result + #10;
-        'r':  Result := Result + #13;
-        't':  Result := Result + #9;
-        'u':
-          begin
-            cp := StrToInt64('$' + Copy(S, i + 1, 4));
-            Result := Result + UnicodeCodepointToUTF8(cp);   { 单元内已有 }
-            Inc(i, 4);
-          end;
-      end;
-      Inc(i);
-    end
-    else
-    begin
-      Result := Result + S[i];
-      Inc(i);
-    end;
-  end;
-end;
-
-{ 提取 JSON 对象中指定键的字符串值（首个匹配；供固定 schema 使用）}
-function OhosJsonGetString(const AJson, AKey: string; var AValue: string): Boolean;
-var
-  i, p, e: Integer;
-begin
-  Result := False;
-  i := 1;
-  while i <= Length(AJson) do
-  begin
-    if AJson[i] = '"' then
-    begin
-      p := i + 1;
-      e := p;
-      while (e <= Length(AJson)) and (AJson[e] <> '"') do Inc(e);
-      if (e - p = Length(AKey)) and (Copy(AJson, p, e - p) = AKey) then
-      begin
-        i := e + 1;
-        while (i <= Length(AJson)) and (AJson[i] in [' ', #9, #10, #13]) do Inc(i);
-        if (i <= Length(AJson)) and (AJson[i] = ':') then
-        begin
-          Inc(i);
-          while (i <= Length(AJson)) and (AJson[i] in [' ', #9, #10, #13]) do Inc(i);
-          if (i <= Length(AJson)) and (AJson[i] = '"') then
-          begin
-            Inc(i);
-            p := i;
-            while (i <= Length(AJson)) and (AJson[i] <> '"') do
-            begin
-              if AJson[i] = '\' then Inc(i, 2) else Inc(i);
-            end;
-            AValue := OhosJsonUnescape(Copy(AJson, p, i - p));
-            Result := True;
-            Exit;
-          end;
-        end;
-      end;
-      i := e + 1;
-    end
-    else
-      Inc(i);
   end;
 end;
 
@@ -7815,16 +7161,16 @@ begin
   if AMimeData = nil then Exit('{}');
   Result := '{';
   if AMimeData.Text <> '' then
-    Result := Result + '"text":"' + OhosJsonEscape(AMimeData.Text) + '",';
+    Result := Result + '"text":"' + JsonEscape(AMimeData.Text) + '",';
   if AMimeData.HTML <> '' then
-    Result := Result + '"html":"' + OhosJsonEscape(AMimeData.HTML) + '",';
+    Result := Result + '"html":"' + JsonEscape(AMimeData.HTML) + '",';
   if (AMimeData.urls <> nil) and (AMimeData.urls.Count > 0) then
   begin
     Result := Result + '"uris":[';
     for i := 0 to AMimeData.urls.Count - 1 do
     begin
       if i > 0 then Result := Result + ',';
-      Result := Result + '"' + OhosJsonEscape(StrPas(PChar(AMimeData.urls[i]))) + '"';
+      Result := Result + '"' + JsonEscape(StrPas(PChar(AMimeData.urls[i]))) + '"';
     end;
     Result := Result + '],';
   end;
@@ -7837,7 +7183,7 @@ begin
     for i := 0 to sl.Count - 1 do
     begin
       if i > 0 then Result := Result + ',';
-      Result := Result + '"' + OhosJsonEscape(sl[i]) + '"';
+      Result := Result + '"' + JsonEscape(sl[i]) + '"';
     end;
   finally
     sl.Free;
@@ -7851,25 +7197,6 @@ end;
    通过 C++ 桥接命令通道（ohos_tray_add/set_menu/remove）控制 ETS 托盘，
    事件通道（onTrayEvent → ohos_inject_tray_event）回传点击/菜单选择。
    --------------------------------------------------------------------- }
-
-{ JSON 字符串转义（菜单 label 安全序列化）}
-function OhosTrayEscapeJson(const S: string): string;
-var
-  i: Integer;
-begin
-  Result := '';
-  for i := 1 to Length(S) do
-  begin
-    case S[i] of
-      '"':  Result := Result + '\"';
-      '\':  Result := Result + '\\';
-      #10:  Result := Result + '\n';
-      #13:  Result := Result + '\r';
-      #9:   Result := Result + '\t';
-      else  Result := Result + S[i];
-    end;
-  end;
-end;
 
 constructor TfpgOhosSystemTrayIcon.Create(AOwner: TComponent);
 begin
@@ -7921,7 +7248,7 @@ begin
     else
     begin
       json := json + '{"id":"m' + IntToStr(itemIdx) + '","label":"'
-        + OhosTrayEscapeJson(item.Text) + '"}';
+        + JsonEscape(item.Text) + '"}';
       FMenuIndex.Add(item);
       Inc(itemIdx);
     end;
@@ -8053,7 +7380,7 @@ begin
   end;
   if appArgs <> nil then
   begin
-    OhosArgs := StrPas(appArgs);
+    OhosArgs := Trim(StrPas(appArgs));
     fpGUI_Hilog(LOG_INFO, format('ohos_inject_app_args: OhosArgs=%s', [OhosArgs]));
   end;
 end;
@@ -8511,6 +7838,8 @@ var
   mp: PfpgMessageRec;
   m: TfpgMessageRec;
   destOk: Boolean;
+  curCode: Integer;
+  curDest: string;
 begin
   try
     fpgCoalesceMessages;
@@ -8519,8 +7848,10 @@ begin
       if mp <> nil then
       begin
         m := mp^;
+        curCode := m.MsgCode;
+        if m.Dest <> nil then curDest := m.Dest.ClassName else curDest := 'nil';
         fpgDeleteFirstMessage;
-        { 软守卫：窗口类 → HasHandle（失效=False）；widget → WindowAllocated
+       { 软守卫：窗口类 → HasHandle（失效=False）；widget → WindowAllocated
           FPGM_PAINT 例外：放行给 MsgPaint 自复位（见上注），避免 popup 首绘丢失 }
         destOk := True;
         if m.MsgCode <> FPGM_PAINT then
@@ -8535,13 +7866,14 @@ begin
           fpgDeliverMessage(m);
         end
         else
-          fpGUI_Hilog(LOG_INFO, 'drop stale msg code='+inttostr(m.MsgCode)+' dest=%p'+inttostr(QWord(m.Dest)));
+          fpGUI_Hilog(LOG_INFO, format('drop stale msg code=%d dest=%s', [m.MsgCode, IntToHex(PtrUInt(m.Dest), 16)]));
       end;
     until mp = nil;
   except
     on E: Exception do
     begin
-      fpGUI_Hilog(LOG_ERROR, 'SafeDeliverMessages exception: ' + E.ClassName +	': ' + E.Message);
+      fpGUI_Hilog(LOG_ERROR, format('SafeDeliverMessages exception: %s: %s (msg=%d dest=%s)',
+        [E.ClassName, E.Message, curCode, curDest]));
 	  raise;
 	end;
   end;
@@ -8922,7 +8254,7 @@ begin
   Result := '';
   if not Assigned(_get_user_dir) then
     Exit;
-  p := _get_user_dir(3);   // resourceDir (read-only HAP)
+  p := _get_user_dir(OHOS_DIR_SANDBOX_RESOURCE);   // resourceDir (read-only HAP)
   if (p = nil) or (p[0] = #0) then
   begin
     if p <> nil then cfree(p);
@@ -8941,7 +8273,7 @@ begin
   Result := '';
   if not Assigned(_get_user_dir) then
     Exit;
-  p := _get_user_dir(6);   // bundleCodeDir (HAP install root)
+  p := _get_user_dir(OHOS_DIR_SANDBOX_BUNDLE_CODE);   // bundleCodeDir (HAP install root)
   if (p = nil) or (p[0] = #0) then
   begin
     if p <> nil then cfree(p);
@@ -8960,7 +8292,7 @@ begin
   Result := '';
   if not Assigned(_get_user_dir) then
     Exit;
-  p := _get_user_dir(0);   // filesDir (writable, persistent)
+  p := _get_user_dir(OHOS_DIR_SANDBOX_FILES);   // filesDir (writable, persistent)
   if (p = nil) or (p[0] = #0) then
   begin
     if p <> nil then cfree(p);
@@ -9113,4 +8445,3 @@ initialization
   SavedErrorProc := System.ErrorProc;
   System.ErrorProc := @OhosErrorProc;
 end.
-

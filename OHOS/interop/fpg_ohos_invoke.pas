@@ -37,7 +37,8 @@ function ArkTS_InvokeAsync(const Method, Params: string): Integer;
 implementation
 
 uses
-  fpg_ohos;
+  fpg_ohos,
+  fpg_jsonutil;
 
 const
   { 与 C++ ohos_arkts_invoke 返回码一致 }
@@ -62,47 +63,16 @@ var
 
   _arkts_invoke: TArkTsInvokeFn = nil;                                       { v13 }
 
-function JsonEscape(const S: string): string;
-var
-  i: Integer; c: AnsiChar;
-begin
-  Result := '';
-  for i := 1 to Length(S) do
-  begin
-    c := S[i];
-    case c of
-      '"':  Result := Result + '\"';
-      '\':  Result := Result + '\\';
-      #8:   Result := Result + '\b';
-      #9:   Result := Result + '\t';
-      #10:  Result := Result + '\n';
-      #12:  Result := Result + '\f';
-      #13:  Result := Result + '\r';
-    else
-      if Ord(c) < 32 then
-        Result := Result + '\u' + LowerCase(IntToHex(Ord(c), 4))
-      else
-        Result := Result + c;
-    end;
-  end;
-end;
-
-function JsonError(const Code, Msg: string): string;
-begin
-  Result := '{"ok":false,"code":"' + JsonEscape(Code) +
-            '","error":"' + JsonEscape(Msg) + '"}';
-end;
-
 function StatusEnvelope(Ret: Integer): string;
 begin
   case Ret of
     INVOKE_OK:        Result := '';
-    INVOKE_BAD_ARGS:  Result := JsonError('BAD_ARGS', 'invalid callId/method');
-    INVOKE_NO_CONN:   Result := JsonError('NOT_CONNECTED', 'bridge TSFN not initialized');
-    INVOKE_NO_METHOD: Result := JsonError('NO_METHOD', 'method not registered in ArkTS');
-    INVOKE_Q_FULL:    Result := JsonError('QUEUE_FULL', 'tsfn queue full or closing');
+    INVOKE_BAD_ARGS:  Result := JsonErrorObject('BAD_ARGS', 'invalid callId/method');
+    INVOKE_NO_CONN:   Result := JsonErrorObject('NOT_CONNECTED', 'bridge TSFN not initialized');
+    INVOKE_NO_METHOD: Result := JsonErrorObject('NO_METHOD', 'method not registered in ArkTS');
+    INVOKE_Q_FULL:    Result := JsonErrorObject('QUEUE_FULL', 'tsfn queue full or closing');
   else
-    Result := JsonError('INTERNAL', 'ohos_arkts_invoke returned ' + IntToStr(Ret));
+    Result := JsonErrorObject('INTERNAL', 'ohos_arkts_invoke returned ' + IntToStr(Ret));
   end;
 end;
 
@@ -161,12 +131,12 @@ begin
   fn := GetInvokeFn();
   if fn = nil then
   begin
-    Result := JsonError('NOT_CONNECTED', 'libfp_bridge.so not connected');
+    Result := JsonErrorObject('NOT_CONNECTED', 'libfp_bridge.so not connected');
     Exit;
   end;
   if Trim(Method) = '' then
   begin
-    Result := JsonError('BAD_ARGS', 'empty method');
+    Result := JsonErrorObject('BAD_ARGS', 'empty method');
     Exit;
   end;
 
@@ -204,7 +174,7 @@ begin
     end;
 
     if wres <> wrSignaled then
-      Result := JsonError('TIMEOUT',
+      Result := JsonErrorObject('TIMEOUT',
         Format('arkTS_Invoke timeout %d ms: %s', [TimeoutMs, Method]))
     else
       Result := json;    { 成功串 或 C++ 生成的错误信封（JS_EXCEPTION 等），原样返回 }
