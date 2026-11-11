@@ -107,6 +107,15 @@ let gLastImeDeleteKind: number = 0;   // 1=deleteLeft(Backspace) 2=deleteRight(D
 // 事件（KEYEV uni）→ 时间窗内丢弃匹配字符的 KEYEV，防双插（字母键实测单通道）
 let gLastImeInsertAt: number = 0;
 let gLastImeInsertText: string = '';
+// 软键盘回车（IME sendFunctionKey）时间戳：之后系统可能再补发
+// insertText('\n') 或物理 KEYEV(Enter) → 150ms 内丢弃，防双回车。
+let gLastImeEnterAt: number = 0;
+
+// IME 功能键（回车/换行）刚注入过 Enter 时，其他通道不要再发一次。
+// 供本文件 hiddenKeyHandler/sendKeyEvent 和 Index.ets 主窗隐藏输入共用。
+export function imeConsumedEnter(): boolean {
+  return Date.now() - gLastImeEnterAt < 150;
+}
 
 // IME insertText 刚插入过同一个字符时，物理键通道不要再插一次。
 // 供本文件 hiddenKeyHandler/sendKeyEvent 和 Index.ets 主窗隐藏输入共用。
@@ -152,7 +161,10 @@ function imeEnsureAttached(kbType: number, reqId: number): void {
     gImeCtl.attach(true, {
       inputAttribute: {
         textInputType: wantType,
-        enterKeyType: inputMethod.EnterKeyType.UNSPECIFIED
+        // 终端要的是换行键：UNSPECIFIED 会让 IME 显示“开始/搜索”等功能键；
+        // NEWLINE（API 12+）显示换行键。两者最终都走 sendFunctionKey，
+        // 下面统一按 Enter 注入，不依赖具体键名。
+        enterKeyType: inputMethod.EnterKeyType.NEWLINE
       }
     }).then(() => {
       gImeAttached = true;
@@ -165,11 +177,24 @@ function imeEnsureAttached(kbType: number, reqId: number): void {
       // 焦点窗口路由，与 attach 无关。
       if (!gImeListenersRegistered) {
         gImeCtl!.on('insertText', (text: string) => {
+          // 软键盘回车已由 sendFunctionKey 注入过 Enter → 不再插入换行字符
+          if ((text === '\n' || text === '\r') && imeConsumedEnter()) return;
           hilog.info(DOMAIN, TAG, 'IME insertText: [%{public}s]', text);
           try { fpbridge.onTextInput(text); } catch (_e) {}
           // 记录：符号/标点键双通道（insertText + KEYEV）→ sendKeyEvent 去重用
           gLastImeInsertAt = Date.now();
           gLastImeInsertText = text;
+        });
+        // 软键盘上的回车/换行/开始键：终端一律当 Enter（\r）处理。
+        // 与物理 Enter 同路：kc=2054, uni=13（Pascal 仅 uni>0 时生成 KEYCHAR）。
+        gImeCtl!.on('sendFunctionKey', (fk: inputMethod.FunctionKey) => {
+          hilog.info(DOMAIN, TAG, 'IME sendFunctionKey: %{public}d',
+            fk.enterKeyType as number);
+          gLastImeEnterAt = Date.now();
+          try {
+            fpbridge.onKeyEvent(2054, 0, 0, 13);   // down
+            fpbridge.onKeyEvent(2054, 1, 0, 13);   // up
+          } catch (_e) {}
         });
         gImeCtl!.on('deleteLeft', (n: number) => {
           hilog.info(DOMAIN, TAG, 'IME deleteLeft: %d', n);
@@ -919,6 +944,8 @@ export struct FpgSurface {
     let uni: number = ohosKeyToUnicode(kc, (mods & 2) !== 0);
     if (kc === 2049) uni = 9;
     else if (kc === 2054) uni = 13;
+    // 软键盘回车已由 IME sendFunctionKey 注入过 → 系统再补发的 Enter 键丢弃
+    if (kc === 2054 && imeConsumedEnter()) return true;
     // Backspace/Delete：IME 已注入删除命令 → 丢弃防双删；否则转发给 Pascal 并消费。
     // 不能 return false：PC 上 IME 英文模式把退格放行给应用（无 deleteLeft 回调），
     // TextInput 会自行消费该键，Pascal 收不到 KEYPRESS → 终端退格失效。
@@ -962,6 +989,10 @@ export struct FpgSurface {
     // 物理键字符（数字/字母走 KEYEV 通道，uni 必须补上——Pascal 仅 uni>0 时
     // 生成 KEYCHAR 插入；否则数字键无字符可插（此前"不能输入数字"根因））
     const uni: number = this.keyCodeToUnicode(kc, (mods & 2) !== 0);
+    // 软键盘回车已由 IME sendFunctionKey 注入过 → 系统补发的 Enter 键丢弃，防双回车
+    if (kc === 2054 && imeConsumedEnter()) {
+      return;
+    }
     // 符号/标点键双通道去重：IME insertText 刚注入过相同字符 → 丢弃 KEYEV
     // （软键盘符号键实测双发：insertText 命令 + 物理键事件）
     if (imeConsumedChar(uni)) {

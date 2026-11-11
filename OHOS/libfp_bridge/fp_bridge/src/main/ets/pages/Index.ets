@@ -6,7 +6,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { getWindowStage, getMainWindow, terminateAbility, getLaunchPayload, getMergedArgs } from '../fp_bridgeability/Fp_bridgeAbility';
 import { APP_LIB_NAME } from '../common/FpAppConfig';
-import { FpgSurface, FpgSurfaceCtrl, notifyFirstFrame, registerWindowPositionSync, unregisterWindowPositionSync, imeConsumedChar, imeConsumedDelete, imeTouchWindow, imeNoteWindowActive, imeNoteWindowInactive, imeSetWindowKind, imeClearWindowKind, isInputBlocked, setShakeWindowCallback, setModalStateCallback, refreshModalState } from '../common/FpgSurface';
+import { FpgSurface, FpgSurfaceCtrl, notifyFirstFrame, registerWindowPositionSync, unregisterWindowPositionSync, imeConsumedChar, imeConsumedDelete, imeConsumedEnter, imeTouchWindow, imeNoteWindowActive, imeNoteWindowInactive, imeSetWindowKind, imeClearWindowKind, isInputBlocked, setShakeWindowCallback, setModalStateCallback, refreshModalState } from '../common/FpgSurface';
 import { ohosKeyToUnicode } from '../common/FpKeyMap';
 import { TrayManager } from '../common/TrayManager';
 import { initTimerDaemon, startTimerTick, stopTimerTick } from '../common/TimerDaemon';
@@ -1795,6 +1795,10 @@ struct Index {
               uni = 9;   // tab
             } else if (kc === 2054) {
               uni = 13;  // enter
+            }
+            // 软键盘回车已由 IME sendFunctionKey 注入过 → 系统补发的 Enter 丢弃
+            if (kc === 2054 && imeConsumedEnter()) {
+              return true;
             }
             // Backspace/Delete：IME 已注入删除命令 → 丢弃防双删；否则转发给 Pascal 并消费。
             // 不能 return false：PC 上 IME 英文模式把退格放行给应用（无 deleteLeft 回调），
