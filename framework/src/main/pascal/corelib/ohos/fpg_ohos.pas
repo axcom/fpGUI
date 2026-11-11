@@ -1182,8 +1182,14 @@ begin
   p := _get_user_dir(OHOS_DIR_SANDBOX_FILES);
   if (p <> nil) and (p[0] <> #0) then
   begin
-    if GetEnvironmentVariable('HOME') = '' then
-      setenv('HOME', p, 1);
+    //if GetEnvironmentVariable('HOME') = '' then
+    //  setenv('HOME', p, 1);
+    { 真机 app 的 HOME 默认是 /storage/Users/currentUser（app 不可写），
+      必须改到沙箱 filesDir；否则 $HOME/bin/shrc、$HOME/.config 全部写不进去。 }
+    if setenv('HOME', p, 1) = 0 then
+      fpGUI_Hilog(LOG_INFO, format('HOME redirected: %s', [strpas(p)]))
+    else
+      fpGUI_Hilog(LOG_WARN, format('HOME redirect failed: %s', [strpas(p)]));
   end;
   if p <> nil then cfree(p);
 
