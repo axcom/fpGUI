@@ -491,6 +491,27 @@ struct Index {
     }
   }
 
+  // 主动上报窗口屏幕位置（px）。系统对“程序化 maximize / 沉浸全屏 / 创建后
+  // 系统移动”不一定派发 windowRectChange（与用户拖动不同），而 Pascal 的窗口
+  // 原点是触摸坐标与弹窗锚点的基准 → 在状态切换后显式补报（切换异步完成，
+  // 300ms 后多半已生效，1200ms 兜底）。
+  private reportWindowRect(reqId: number, reason: string): void {
+    try {
+      const w = (reqId === 1) ? getMainWindow() : (this.subWinMap.get(reqId) ?? null);
+      if (w === null || w === undefined) return;
+      const p = w.getWindowProperties();
+      fpbridge.onWindowMoved(reqId, p.windowRect.left, p.windowRect.top);
+      hilog.info(DOMAIN, TAG,
+        'Window %{public}d rect report (%{public}s): left=%{public}d top=%{public}d w=%{public}d h=%{public}d',
+        reqId, reason, p.windowRect.left, p.windowRect.top,
+        p.windowRect.width, p.windowRect.height);
+    } catch (_e) {}
+  }
+
+  private reportMainWindowRect(reason: string): void {
+    this.reportWindowRect(1, reason);
+  }
+
   private async setupMainWindow(width: number, height: number,
       posX: number, posY: number, attrs: number, winTitle: string): Promise<void> {
     const ATTR_FULLSCREEN = 1 << 3;
@@ -676,6 +697,11 @@ struct Index {
             hilog.info(DOMAIN, TAG,
               'MainWindow statusChange: %{public}d', status);
             fpbridge.updateWindowState(1, status);
+            // 最大化/还原会改变窗口原点且不一定派发 windowRectChange → 补报。
+            this.reportMainWindowRect('status=' + status);
+            setTimeout(() => {
+              this.reportMainWindowRect('status=' + status + '+300ms');
+            }, 300);
           });
           hilog.info(DOMAIN, TAG, 'MainWindow statusChange registered');
         } catch (_e) {}
@@ -695,7 +721,7 @@ struct Index {
         }
       }
       hilog.info(DOMAIN, TAG,
-        'MainWindow setup: attrs=%{public}d fullscreen=%{public}d borderless=%{public}d size=%{public}dx%{public} pos=(%{public}d,%{public}d)',
+        'MainWindow setup: attrs=%{public}d fullscreen=%{public}d borderless=%{public}d size=%{public}dx%{public}d pos=(%{public}d,%{public}d)',
         attrs, (attrs & ATTR_FULLSCREEN) !== 0 ? 1 : 0,
         (attrs & ATTR_BORDERLESS) !== 0 ? 1 : 0,
         width, height, posX, posY);
@@ -703,6 +729,10 @@ struct Index {
       // windowRectChange 为即时通道），wnd.Left/Top 与系统实际一致是点击全局
       // 坐标基准正确的前提。
       registerWindowPositionSync(1, () => getMainWindow());
+      // maximize / 沉浸全屏是异步生效的，且系统对这类程序化切换常不发
+      // windowRectChange → 显式补报两次（300ms 生效、1200ms 兜底）。
+      setTimeout(() => { this.reportMainWindowRect('after-setup+300ms'); }, 300);
+      setTimeout(() => { this.reportMainWindowRect('after-setup+1200ms'); }, 1200);
     } catch (err) {
       hilog.warn(DOMAIN, TAG,
         'MainWindow setup failed: code=%{public}d msg=%{public}s',
@@ -1135,6 +1165,11 @@ struct Index {
           if (this.lastWinStatus.get(reqId) === status) return;   // 去重止抖
           this.lastWinStatus.set(reqId, status);
           fpbridge.updateWindowState(reqId, status);
+          // 最大化/还原可能移动子窗（系统调整位置）→ 补报原点。
+          this.reportWindowRect(reqId, 'status=' + status);
+          setTimeout(() => {
+            this.reportWindowRect(reqId, 'status=' + status + '+300ms');
+          }, 300);
         });
       } catch (_e) {}
 
@@ -1150,6 +1185,8 @@ struct Index {
       }
       // 位置同步（FpgSurface.PositionSync）：子窗位置变化（输入法避让/系统移动）实时上报 Pascal
       registerWindowPositionSync(reqId, () => this.subWinMap.get(reqId));
+      // 创建后系统可能再微调位置（装饰/居中），补报一次
+      setTimeout(() => { this.reportWindowRect(reqId, 'after-create+300ms'); }, 300);
       return true;
     } catch (err) {
       hilog.warn(DOMAIN, TAG,

@@ -182,6 +182,7 @@ extern std::mutex             g_winMutex;
 extern std::map<int, int>     g_winStateCache;
 extern std::map<int, SizeW>   g_lastResize;    
 extern std::map<int, SizeW>   g_pendingResize; // 句柄未登记时暂存的 resize（创建握手期）
+extern std::map<int, WinRect> g_pendingMove;   // 句柄未登记时暂存的窗口屏幕位置（px）
 extern std::map<int, SizeW>   g_surfaceSize;   // ETS 上报的渲染面(surface)权威尺寸
 extern std::mutex             g_resizeMutex;   
 extern int                    g_nextReqId;
@@ -197,6 +198,9 @@ extern std::mutex             g_launchMutex;
 extern InjectAppArgsFn        g_inject_app_args;
 extern DispatchFn             g_dispatch;
 extern DispatchFreeFn         g_dispatch_free;
+
+// napi_init.cpp：补发 Pascal 连接前暂存的 ArkTS 配置 / 启动参数。
+void FlushPendingConfigAndLaunchParams();
 
 // NAPI 侧拥有（napi_init.cpp 定义；桥核心经 extern 消费）
 extern std::atomic<bool>      g_started;

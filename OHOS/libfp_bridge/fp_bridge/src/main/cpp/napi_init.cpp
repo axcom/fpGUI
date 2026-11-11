@@ -641,6 +641,37 @@ static napi_value OnNotifyConfiguration(napi_env env, napi_callback_info info) {
     return result;
 }
 
+// Pascal 尚未连接（libhelloworld.so 未装载完成）时 ArkTS 推送的配置/启动参数
+// 只暂存在 g_pendingConfig / g_pendingLaunchParams，此前没有补发路径 ——
+// 首启时 ArkTS 的 probeKeyboard() 往往早于 Pascal 连接，kbd KV 会丢。
+// fp_bridge_init 装载完 Pascal 函数表后调用本函数补发一次。
+void FlushPendingConfigAndLaunchParams() {
+    std::string cfg;
+    {
+        std::lock_guard<std::mutex> lock(g_cfgMutex);
+        cfg.swap(g_pendingConfig);
+    }
+    if (!cfg.empty()) {
+        typedef void (*UpdateConfigFn)(const char*);
+        UpdateConfigFn fn = (UpdateConfigFn)g_pascal.update_configuration;
+        if (fn) {
+            OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "fpGUI",
+                "Config pending flush: %{public}s", cfg.c_str());
+            fn(cfg.c_str());
+        }
+    }
+    std::string launch;
+    {
+        std::lock_guard<std::mutex> lock(g_launchMutex);
+        launch.swap(g_pendingLaunchParams);
+    }
+    if (!launch.empty() && g_set_launch_params) {
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "fpGUI",
+            "LaunchParams pending flush: %{public}s", launch.c_str());
+        g_set_launch_params(launch.c_str());
+    }
+}
+
 // ── 启动载荷 JSON 推送（ArkTS onNewWant → Pascal）──────────────
 // payload 为 JSON 串：{"uri","action","entities","parameters"}
 // Pascal 未连接（连接前推送）时暂存，fp_bridge_init 内兜底补发。
@@ -704,14 +735,30 @@ static napi_value OnWindowMoved(napi_env env, napi_callback_info info) {
     napi_get_value_int32(env, args[0], &reqId);
     napi_get_value_int32(env, args[1], &x);
     napi_get_value_int32(env, args[2], &y);
+    bool found = false;
     {
         std::lock_guard<std::mutex> lock(g_winMutex);
         auto it = g_winMap.find(reqId);
         if (it != g_winMap.end() && g_inject_moved) {
             g_inject_moved(it->second, x, y);
+            auto rit = g_winRects.find(reqId);
+            if (rit != g_winRects.end()) {
+                rit->second.x = x;
+                rit->second.y = y;
+            }
             OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "fpGUI",
                 "WindowMoved: req=%{public}d (%{public}d,%{public}d)", reqId, x, y);
+            found = true;
         }
+    }
+    if (!found) {
+        // 创建握手期（native window 尚未登记）：暂存，等 ohos_create_window 补送。
+        std::lock_guard<std::mutex> lk(g_resizeMutex);
+        WinRect r;
+        r.x = x; r.y = y; r.w = 0; r.h = 0;
+        g_pendingMove[reqId] = r;
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "fpGUI",
+            "WindowMoved: pending req=%{public}d (%{public}d,%{public}d)", reqId, x, y);
     }
     napi_value result;
     napi_get_undefined(env, &result);
@@ -736,6 +783,11 @@ static napi_value OnWindowClosed(napi_env env, napi_callback_info info) {
             OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "fpGUI",
                 "WindowClosed: req=%d cleaned (win=%p)", reqId, win);
         }
+    }
+    {
+        // 清掉未消费的创建期位置暂存（reqId 复用时不至于套用旧坐标）
+        std::lock_guard<std::mutex> lk(g_resizeMutex);
+        g_pendingMove.erase(reqId);
     }
     if (win) OH_NativeWindow_DestroyNativeWindow((OHNativeWindow*)win);
     if (win) {

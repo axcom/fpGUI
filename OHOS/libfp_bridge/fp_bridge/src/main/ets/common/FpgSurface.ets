@@ -425,6 +425,10 @@ class PositionSync {
 
   register(reqId: number, getWin: () => window.Window | null | undefined): void {
     this.wins.set(reqId, getWin);
+    // 注册后的第一拍必须上报：创建握手期 NAPI 上报可能被桥丢弃（句柄未登记，
+    // 桥侧会暂存并补送），若这里沿用旧 cache 就会“值没变化 → 永不再报”，
+    // 窗口原点永久停在 Pascal 的请求值（触摸坐标整体偏移）。
+    this.cache.delete(reqId);
     this.ensureTimer();
   }
 

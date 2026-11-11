@@ -89,6 +89,9 @@ std::map<int, int> g_winStateCache;
 std::map<int, SizeW> g_lastResize;
 // 句柄尚未登记时暂存的 resize（ETS 在创建握手期上报，待 ohos_create_window 登记后补送）
 std::map<int, SizeW> g_pendingResize;
+// 句柄尚未登记时暂存的窗口屏幕位置（同上；ETS 的首次位置上报早于句柄登记，
+// 丢失后 PositionSync 只在“位置变化”时重报，最大化后位置不再变 → 永久偏移）
+std::map<int, WinRect> g_pendingMove;
 // ETS 上报的渲染面(surface)权威尺寸：native buffer 几何一律以它为准，
 // 防 Pascal 创建期用旧逻辑尺寸覆盖（被系统强制最大化场景会因此放大显示）
 std::map<int, SizeW> g_surfaceSize;
@@ -293,6 +296,37 @@ __attribute__((visibility("default"))) void* ohos_create_window(WindowOptions* o
             OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "fpGUI",
                 "replay pending resize req=%{public}d %{public}dx%{public}d (rc=%{public}d)",
                 reqId, pendingResize.w, pendingResize.h, rc);
+        }
+
+        // 补送创建握手段被丢弃的 move：ETS 的 PositionSync 首拍/最大化通知都
+        // 早于本句柄登记，丢了之后 PositionSync 只在“位置变化”时重报 ——
+        // 系统强制最大化后位置稳定不变 → Pascal 的窗口原点（触摸基准/弹窗
+        // 锚点）永久停在请求值。这里登记后立刻补一次。
+        WinRect pendingMove;
+        bool hasPendingMove = false;
+        {
+            std::lock_guard<std::mutex> lk(g_resizeMutex);
+            auto mit = g_pendingMove.find(reqId);
+            if (mit != g_pendingMove.end()) {
+                pendingMove = mit->second;
+                hasPendingMove = true;
+                g_pendingMove.erase(mit);
+            }
+        }
+        if (hasPendingMove) {
+            {
+                std::lock_guard<std::mutex> lk(g_winMutex);
+                auto rit = g_winRects.find(reqId);
+                if (rit != g_winRects.end()) {
+                    rit->second.x = pendingMove.x;
+                    rit->second.y = pendingMove.y;
+                }
+            }
+            if (g_inject_moved)
+                g_inject_moved(win, pendingMove.x, pendingMove.y);
+            OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "fpGUI",
+                "replay pending move req=%{public}d (%{public}d,%{public}d)",
+                reqId, pendingMove.x, pendingMove.y);
         }
     } else {
         auto* cleanup = new NativeCommandData();
@@ -1076,6 +1110,9 @@ int fp_bridge_init(int32_t version,
     g_dispatch_free       = (DispatchFreeFn)g_pascal.dispatch_free;   // v7 释放入口返回的 PChar
     g_set_launch_params   = (SetLaunchParamsFn)g_pascal.set_launch_params;
     g_inject_app_args     = (InjectAppArgsFn)g_pascal.inject_app_args;
+
+    // ArkTS 可能在 Pascal 连接前就推过配置（首启 kbd/语言等）：补发。
+    FlushPendingConfigAndLaunchParams();
 
     // 填出 C++ 函数表（命名回调）
     memset(cpp_api, 0, sizeof(*cpp_api));

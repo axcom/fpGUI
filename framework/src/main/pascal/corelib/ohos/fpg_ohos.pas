@@ -148,6 +148,8 @@ type
     property  IsBold: Boolean read FIsBold;
     property  IsItalic: Boolean read FIsItalic;
     property  IsUnderline: Boolean read FIsUnderline;
+    { 传给 OH_Drawing_FontSetTextSize 的 em 字号；与 GetHeight（行高）区分 }
+    property  TextSize: Integer read FHeight;
   end;
 
 { TfpgOhosImage }
@@ -622,6 +624,15 @@ function OhosResolveFontFile(const ACandidates: array of string): string;
 { fpGUI 默认家族（'Sans' 等）→ 鸿蒙中文默认家族（SC 存在优先，否则 Sans） }
 function OhosMapDefaultFaceName(const AFaceName: string): string;
 
+{ 设备形态：phone / tablet / 2in1 / tv / car / wearable…；取不到返回 ''。
+  来源 libdeviceinfo_ndk.z.so 的 OH_GetDeviceType（结果缓存）。 }
+function OhosDeviceType: string;
+{ 是否接入物理键盘（来自系统 Configuration 的 `kbd` KV；软键盘/虚拟设备不算）。
+  默认 False —— 未知时按“无键盘”处理，需要虚拟按键栏的应用会先显示它。 }
+function OhosHasHardwareKeyboard: Boolean;
+{ 是否已收到过 kbd 上报（区分“未知”与“确认为 0”）。 }
+function OhosHasKeyboardReport: Boolean;
+
 var
   OnOhosTouch: procedure(x, y: Integer) = nil;
   { 托盘事件全局回调（TfpgOhosSystemTrayIcon 构造时注册）：
@@ -648,6 +659,8 @@ var
   gCfgDensityPixels: Single = 1.0;    { den }
   gCfgDisplayId: Integer = 0;         { i   }
   gCfgHasPointerDevice: Boolean = False; { p }
+  gCfgHasKeyboard: Boolean = False;   { kbd }
+  gCfgKeyboardKnown: Boolean = False; { 收到过 kbd 上报 }
   gCfgFontId: string = '';            { f   }
   gCfgFontSizeScale: Single = 1.0;    { fs  }
   gCfgFontWeightScale: Single = 1.0;  { fw  }
@@ -820,6 +833,7 @@ const
   CFG_CHANGED_DENSITY    = 1 shl 4;   { 屏幕密度/缩放 }
   CFG_CHANGED_FONTSCALE  = 1 shl 5;   { 字体缩放 }
   CFG_CHANGED_DISPLAYSZ  = 1 shl 6;   { 屏幕尺寸（旋转重查后）}
+  CFG_CHANGED_KEYBOARD   = 1 shl 7;   { 物理键盘接入/移除（kbd KV）}
 
   { OHOS 应用内置字体候选（相对名；解析根 = CWD 即 resfile(resourceDir)、
     Context.resourceDir/filesDir、bundleCodeDir/libs/<abi> —— 见
@@ -843,6 +857,7 @@ const
 implementation
 
 uses
+  Math,
   baseunix,
   unix,
   fpg_ohos_CmdLineParams,
@@ -1150,6 +1165,40 @@ type
   TFpBridgeInitFn = function(version: Integer; pascalApi: POHOSExportTable;
     cppApi: POHOSBridgeCallbacks): Integer; cdecl;
 
+function setenv(const name, value: PChar; overwrite: LongInt): LongInt; cdecl; external 'c';
+
+{ 沙箱目录落地。必须在 _get_user_dir 可用之后调用：
+  应用对象构造时桥接还没连接（_get_user_dir = nil），不能只放在构造函数里。
+  - HOME：仅当进程没有 HOME 时才指向 filesDir（有系统 HOME 就保留，
+    避免 $HOME/.config 配置路径漂移）；
+  - CWD：切到 resfile（资源目录），终端初始目录、相对路径、字体查找都以它为基准。 }
+procedure OhosApplySandboxDirs;
+var
+  p: PChar;
+  Res: string;
+begin
+  if not Assigned(_get_user_dir) then Exit;
+
+  p := _get_user_dir(OHOS_DIR_SANDBOX_FILES);
+  if (p <> nil) and (p[0] <> #0) then
+  begin
+    if GetEnvironmentVariable('HOME') = '' then
+      setenv('HOME', p, 1);
+  end;
+  if p <> nil then cfree(p);
+
+  p := _get_user_dir(OHOS_DIR_SANDBOX_RESOURCE);
+  if (p <> nil) and (p[0] <> #0) then
+  begin
+    Res := fpgAppendPathDelim(fpgFromOSEncoding(p));
+    if fpgSetCurrentDir(Res) then
+      fpGUI_Hilog(LOG_INFO, 'CWD redirected to resfile: ' + Res)
+    else
+      fpGUI_Hilog(LOG_INFO, 'CWD redirect failed: ' + Res);
+  end;
+  if p <> nil then cfree(p);
+end;
+
 { 向 LIB_fpgBridge 建立桥接（反向）：
   ① 传入本方函数表（与 ohos_bridge_connect 的 AExports 填充完全一致）
   ② 取回 C++ 函数表，装载到 _ohos_* 全局
@@ -1262,6 +1311,7 @@ begin
 //  { v13：Pascal → ArkTS 反向调用 }
 //  Pointer(_arkts_invoke) := cppApi.arkts_invoke;
   
+  OhosApplySandboxDirs;       { ← 桥接就绪后立刻落 CWD/HOME }
   gBridgeInitialized := True;
   fpGUI_Hilog(LOG_INFO, format('fp_bridge: connected OK (v%d)', [OHOS_BRIDGE_VERSION]));
 end;
@@ -1760,9 +1810,11 @@ begin
 
     { Try to read real font metrics; fall back to heuristic on failure }
     RefreshMetrics;
-    fpGUI_Hilog(LOG_INFO, format('FONT RES: desc=%s tf=%p font=%p h=%d bold=%d metrics=%s',
+    fpGUI_Hilog(LOG_INFO,
+      format('FONT RES: desc=%s tf=%p font=%p em=%d asc=%d desc=%d line=%d bold=%d metrics=%s',
       [afontdesc, Pointer(FNativeTypeface), Pointer(FNativeFont), FHeight,
-       Integer(FIsBold), BoolToStr(FMetricsValid, True)]));
+       FAscent, FDescent, GetHeight, Integer(FIsBold),
+       BoolToStr(FMetricsValid, True)]));
   finally
     fd.Free;
   end;
@@ -1882,13 +1934,21 @@ begin
     FMetricsValid := False;
   if FMetricsValid then
   begin
-    // OH_Drawing ascent is negative (distance from baseline to top)
-    FAscent := Round(-FMetrics.fAscent);
-    FDescent := Round(FMetrics.fDescent);
+    { OH_Drawing 的 ascent 为负（基线上方），descent 为正。
+      行高必须包含 descender：用推荐 ascent/descent 向上取整，
+      与 GDI 的 tmAscent/tmDescent 语义一致。
+      注意不要用 fTop/fBottom：它们是字体所有字形（含 CJK）的最大
+      墨迹范围，在 16px 下发散到 -21/9.5，会把行高撑到 32px。 }
+    FAscent := Ceil(-FMetrics.fAscent);
+    FDescent := Ceil(FMetrics.fDescent);
+    if FAscent < 1 then
+      FAscent := (FHeight * 3 + 3) div 4;
+    if FDescent < 1 then
+      FDescent := (FHeight + 3) div 4;
   end
   else begin
-    FAscent := FHeight * 3 div 4;
-    FDescent := FHeight div 4;
+    FAscent := (FHeight * 3 + 3) div 4;
+    FDescent := (FHeight + 3) div 4;
   end;
 end;
 
@@ -1923,7 +1983,14 @@ end;
 
 function TfpgOhosFontResource.GetHeight: Integer;
 begin
-  Result := FHeight;
+  { 行高 = ascent + descent（含 descender），不是 em 字号。
+    这样与 GDI 的 tmHeight 语义一致，SynEdit/标签等不会裁掉 p/g/y。 }
+  if FMetricsValid then
+    Result := FAscent + FDescent
+  else
+    Result := FHeight;
+  if Result < FHeight then
+    Result := FHeight;
 end;
 
 function TfpgOhosFontResource.GetTextWidth(const txt: string): Integer;
@@ -2573,7 +2640,8 @@ begin
     ohosFntRes := TfpgOhosFontResource(FFont);
     lFont := ohosFntRes.NativeFont;
     lTypeface := ohosFntRes.FNativeTypeface;
-    fontSize := ohosFntRes.GetHeight;
+    { GetHeight 现在是行高（ascent+descent）；SetTextSize 必须用 em 字号 }
+    fontSize := ohosFntRes.TextSize;
     baseY := y + FDeltaY + ohosFntRes.GetAscent;
   end
   else
@@ -2665,7 +2733,7 @@ begin
     begin
       { 无任何字体命中：宽度兜底（不步进 0 导致叠字）}
       if ohosFntRes <> nil then
-        chW := ohosFntRes.GetHeight * 3 / 5
+        chW := ohosFntRes.TextSize * 3 / 5
       else
         chW := fontSize * 3 / 5;
     end;
@@ -4109,8 +4177,6 @@ end;
   TfpgOhosApplication
   --------------------------------------------------------------------- }
 
-function setenv(const name, value: PChar; overwrite: LongInt): LongInt; cdecl; external 'c';
-
 constructor TfpgOhosApplication.Create(const AParams: string);
 var
   i: Integer;
@@ -4172,7 +4238,7 @@ begin
   Classes.WakeMainThread := nil;
   FSelection := TfpgOhosClipboard.Create;
 
-	if Assigned(_get_user_dir) then
+	{if Assigned(_get_user_dir) then
 	begin
 	  // rawfile Dir
 	  p := _get_user_dir(OHOS_DIR_SANDBOX_FILES);  
@@ -4197,7 +4263,7 @@ begin
 	    cfree(p);
 	  end else if p <> nil then
         cfree(p);
-	end;
+	end;}
   
 end;
 
@@ -4892,6 +4958,18 @@ begin
   end;
 end;
 
+{ 把鼠标按键状态补进 shiftstate，与 GDI/X11 语义保持一致：
+  GDI 的 GetKeyboardShiftState 会由 VK_LBUTTON/VK_RBUTTON/VK_MBUTTON
+  生成 ssLeft/ssRight/ssMiddle，X11 的 ConvertShiftState 同样来自
+  button state；OHOS 触摸/鼠标事件只报按钮位，必须在此补齐，
+  否则依赖 “ssLeft in shiftstate” 的拖动逻辑（文本选择等）全部失效。 }
+procedure AddMouseButtonsToShiftState(var AShift: TShiftState; AButtons: word);
+begin
+  if (AButtons and MOUSE_LEFT) <> 0 then Include(AShift, ssLeft);
+  if (AButtons and MOUSE_RIGHT) <> 0 then Include(AShift, ssRight);
+  if (AButtons and MOUSE_MIDDLE) <> 0 then Include(AShift, ssMiddle);
+end;
+
 procedure TfpgOhosApplication.ProcessQueuedEvents;
 var
   ev: PfpgOhosTouchEvent;
@@ -5169,6 +5247,7 @@ end;
             is the global screen point; subtract the delivery window origin. }
           msg.mouse.x := gx - wnd.Left;
           msg.mouse.y := gy - wnd.Top;
+          AddMouseButtonsToShiftState(msg.mouse.shiftstate, msg.mouse.Buttons);
           fpGUI_Hilog(LOG_INFO, 'TOUCH: DOWN x=' + IntToStr(msg.mouse.x) + ' y=' + IntToStr(msg.mouse.y));
           fpgPostMessage(nil, wnd, FPGM_MOUSEDOWN, msg);
         end;
@@ -5178,6 +5257,7 @@ end;
             a hover move (no button pressed) must deliver Buttons=0 so
             widgets do not start a drag/selection without a click. }
           msg.mouse.Buttons := gLastDownButton;
+          AddMouseButtonsToShiftState(msg.mouse.shiftstate, msg.mouse.Buttons);
           { Throttle: coalesce consecutive MOVE events — only the last one
             before a non-MOVE (or queue drain) is delivered. }
           if (FEventQueue.Count > 0) and
@@ -5203,6 +5283,7 @@ end;
             (e.g. left click delivered as button=1 -> would open the right-
             click popup menu of edits). }
           msg.mouse.Buttons := gLastDownButton;
+          AddMouseButtonsToShiftState(msg.mouse.shiftstate, msg.mouse.Buttons);
           gLastDownButton := 0;
           { Deliver UP to the window that got the DOWN (re-routed target if
             any), NOT the event's window: when a click on the MenuBar pops a
@@ -5715,6 +5796,21 @@ end;
   由 'd'（方向）配置变化分支调用；Pascal 直调 native_display_manager。 }
 procedure OhosRefreshDisplayScaling; forward;
 
+function OhosDeviceType: string;
+begin
+  Result := fpg_ohos_nativewindow.GetDeviceType;
+end;
+
+function OhosHasHardwareKeyboard: Boolean;
+begin
+  Result := gCfgHasKeyboard;
+end;
+
+function OhosHasKeyboardReport: Boolean;
+begin
+  Result := gCfgKeyboardKnown;
+end;
+
 procedure HandleConfigurationEvent(const kv: string);
 var
   i, p, eq: Integer;
@@ -5876,6 +5972,21 @@ begin
       begin
         gCfgDateFormat := val;
         changed := True;
+      end;
+    end
+    else if key = 'kbd' then
+    begin
+      { 物理键盘接入/移除（ArkTS 侧探测 inputDevice 后推送）。
+        首次上报也要置位（kbd=0 与“未知”的默认值同为零，否则永远不通知）。 }
+      if TryStrToInt(val, ival) then
+      begin
+        if (not gCfgKeyboardKnown) or ((ival <> 0) <> gCfgHasKeyboard) then
+        begin
+          gCfgHasKeyboard := ival <> 0;
+          gCfgKeyboardKnown := True;
+          flags := flags or CFG_CHANGED_KEYBOARD;
+          changed := True;
+        end;
       end;
     end;
     if changed then
@@ -6397,6 +6508,12 @@ begin
             except
               fpGUI_Hilog(LOG_INFO, 'ProcessQueuedKeyEvents ENTER dropped');
             end;
+            { 这个 KEYPRESS 可能同步关闭并销毁目标窗口（补全弹窗 Enter 确认、
+              模态对话框默认按钮等）。之后不能再向 dest 发 KEYRELEASE，
+              否则会向已销毁的窗口对象派发消息 → SIGSEGV。 }
+            FLastKeyDown := 0;
+            Dispose(ev);
+            Continue;
           end;
         end;
 
@@ -6407,14 +6524,29 @@ begin
           Ctrl+X/C/V 的字母被当普通字符插入（替换选中/污染粘贴）。
           Enter 的 10/13 已由上面的 KEYPRESS 处理，不能再作为 KEYCHAR
           发一次；否则 Enter unicode=10 的系统会再插入一个换行。 }
-        if (ev^.UnicodeChar > 0) and (ev^.Action = OH_KEY_DOWN) and
+        {if (ev^.UnicodeChar > 0) and (ev^.Action = OH_KEY_DOWN) and
            (not (ev^.UnicodeChar in [10, 13])) and
            ((ev^.Modifiers and (OHOS_MODIFIER_CTRL or OHOS_MODIFIER_ALT or OHOS_MODIFIER_META)) = 0) then
         begin
           msg.keyboard.keychar := UnicodeCodepointToUTF8(ev^.UnicodeChar);
           fpgPostMessage(nil, dest, FPGM_KEYCHAR, msg);
+        end;}
+        { 主窗口字母通常已由 IME insertText 插入，随后到来的 UP 不能再补；
+          只有弹窗/菜单这类 wtPopup 窗口，隐藏 TextInput 吞掉 DOWN 且
+          没有 insertText，才需要在 UP 补发一次 KEYCHAR。 }
+        if (ev^.UnicodeChar > 0) and
+           (not (ev^.UnicodeChar in [10, 13])) and
+           ((ev^.Modifiers and (OHOS_MODIFIER_CTRL or OHOS_MODIFIER_ALT or
+             OHOS_MODIFIER_META)) = 0) and
+           ((ev^.Action = OH_KEY_DOWN) or
+            ((ev^.Action = OH_KEY_UP) and
+             (FLastKeyDown <> ev^.KeyCode) and
+             (dest <> nil) and (dest.WindowType = wtPopup))) then
+        begin
+          msg.keyboard.keychar := UnicodeCodepointToUTF8(ev^.UnicodeChar);
+          fpgPostMessage(nil, dest, FPGM_KEYCHAR, msg);
         end;
-
+        
         { Modifier state: per-event snapshot from the injected modifiers.
           Self-healing — a lost SHIFT-UP can no longer stick the state,
           because every key event re-snapshots it from its own mods field. }

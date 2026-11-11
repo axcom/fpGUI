@@ -35,6 +35,7 @@ const
   native_window = 'libnative_window.so';
   native_display_manager = 'libnative_display_manager.so';
   native_fence = 'libnative_fence.so';
+  deviceinfo = 'libdeviceinfo_ndk.z.so';
 
 type
   TOH_Region_Rect = record
@@ -82,6 +83,30 @@ function OH_NativeDisplayManager_GetDefaultDisplayHeight(out height: Int32): Int
 function OH_NativeDisplayManager_GetDefaultDisplayDensityDpi(out dpi: Int32): Int32; cdecl; external native_display_manager;
 function OH_NativeDisplayManager_GetDefaultDisplayVirtualPixelRatio(out ratio: Single): Int32; cdecl; external native_display_manager;
 
+{ ── deviceinfo：设备形态（phone / tablet / 2in1 / tv / car / wearable…）── }
+function OH_GetDeviceType: PAnsiChar; cdecl; external deviceinfo;
+
+{ 包装：返回设备类型字符串；取不到返回 ''。设备形态运行期不变，结果缓存。 }
+function GetDeviceType: string;
+
 implementation
+
+var
+  GCachedDeviceType: string = '';
+  GCachedDeviceTypeValid: Boolean = False;
+
+function GetDeviceType: string;
+var
+  P: PAnsiChar;
+begin
+  if not GCachedDeviceTypeValid then
+  begin
+    GCachedDeviceTypeValid := True;
+    P := OH_GetDeviceType;
+    if P <> nil then
+      GCachedDeviceType := string(AnsiString(P));
+  end;
+  Result := GCachedDeviceType;
+end;
 
 end.

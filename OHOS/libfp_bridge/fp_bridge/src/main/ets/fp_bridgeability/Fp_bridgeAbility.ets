@@ -2,6 +2,7 @@ import { AbilityConstant, ConfigurationConstant, UIAbility, Want, abilityAccessC
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
 import { settings } from '@kit.BasicServicesKit';
+import { inputDevice } from '@kit.InputKit';
 import fpbridge from 'libfp_bridge.so';
 import { startDispatchRelay, stopDispatchRelay } from '../common/FpDispatchRelay';
 import { bindOpenUrlContext, openUrl } from '../common/OpenUrl';
@@ -177,6 +178,45 @@ function pushConfiguration(cfg: Configuration | null): void {
   }
 }
 
+// ── 物理键盘探测 ────────────────────────────────────────────────
+// Configuration 没有键盘字段，只能查 multimodalInput 的设备表：
+// 过滤虚拟设备（软键盘 isVirtual=true），看 sources 里有没有 'keyboard'。
+// 变化时单独推 `kbd=0/1;`，Pascal 侧置 CFG_CHANGED_KEYBOARD。
+let gKeyboardPushed: number = -1;   // -1 = 尚未推送
+
+async function probeKeyboard(): Promise<void> {
+  let has: boolean = false;
+  try {
+    const ids: number[] = await inputDevice.getDeviceIds();
+    for (const id of ids) {
+      const dev: inputDevice.InputDeviceData = await inputDevice.getDevice(id);
+      if (!dev) continue;
+      const isKbd: boolean = dev.sources !== undefined &&
+        dev.sources.indexOf('keyboard') >= 0;
+      const isVirtual: boolean = dev.isVirtual === true;
+      // 诊断：设备表很小，且只在启动/热插拔时打印，便于确认真机与模拟器差异。
+      hilog.info(DOMAIN, TAG,
+        'input device id=%{public}d name=%{public}s virtual=%{public}s kbd=%{public}s',
+        id, dev.name, isVirtual ? '1' : '0', isKbd ? '1' : '0');
+      if (!isVirtual && isKbd) has = true;
+    }
+  } catch (err) {
+    // 查询失败（权限/服务异常）时按“没有键盘”处理，让按键栏照常出现。
+    hilog.error(DOMAIN, TAG, 'probeKeyboard failed: %{public}s', JSON.stringify(err));
+  }
+  const v: number = has ? 1 : 0;
+  if (v === gKeyboardPushed) return;
+  gKeyboardPushed = v;
+  const kv: string = 'kbd=' + v + ';';
+  try {
+    fpbridge.notifyConfiguration(kv);
+    hilog.info(DOMAIN, TAG, 'Keyboard pushed: %{public}s', kv);
+  } catch (err) {
+    hilog.error(DOMAIN, TAG, 'notifyConfiguration(kbd) failed: %{public}s',
+      JSON.stringify(err));
+  }
+}
+
 // 12/24 小时制 + 日期格式（settings；@ohos.settings 无观察者，按约定仅启动读一次）。
 // 值：TIME_FORMAT='12'/'24'；DATE_FORMAT='mm/dd/yyyy'|'dd/mm/yyyy'|'yyyy/mm/dd'（均不含 ';'/'='）。
 // 走同一 notifyConfiguration 通道（g_pendingConfig 兜底时序），Pascal 仅存储对比幂等。
@@ -245,6 +285,9 @@ export default class Fp_bridgeAbility extends UIAbility {
     hilog.info(DOMAIN, TAG, '%{public}s', 'Ability onCreate (exit-friendly)');
     // 跨进程 dispatch 中继：随 Ability 生命周期（不依赖 Index 页面）
     startDispatchRelay();
+    // 尽早探测物理键盘：kbd KV 若在 Pascal 连接前到达，会在 fp_bridge_init
+    // 里补发（pending flush），窗口首帧就能拿到正确的按键栏状态。
+    probeKeyboard();
   }
 
   onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
@@ -296,6 +339,17 @@ export default class Fp_bridgeAbility extends UIAbility {
 
     // 启动读一次 12/24 小时制 + 日期格式（settings；无观察者，不轮询）。
     readDateTimeFormat();
+
+    // 物理键盘有无（Configuration 里没有这个字段，靠 inputDevice 探测）：
+    // 首查已在 onCreate 发起；这里只挂热插拔监听，变化时重查并按 kbd 推送。
+    try {
+      inputDevice.on('change', () => {
+        probeKeyboard();
+      });
+    } catch (err) {
+      hilog.error(DOMAIN, TAG, 'inputDevice.on(change) failed: %{public}s',
+        JSON.stringify(err));
+    }
 
     windowStage.loadContent('pages/Index', (err) => {
       if (err.code) {

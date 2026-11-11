@@ -313,15 +313,17 @@ begin
   if (FLogicalFont <> nil) and (FNativeTypeface <> nil) and
      (OH_Drawing_FontGetMetrics(FLogicalFont, @lm) <> 0) then
   begin
-    FLogicalAscent := Round(-lm.fAscent);
-    FLogicalDescent := Round(lm.fDescent);
+    { 行高包含 descender：用推荐 ascent/descent 向上取整。
+      不用 fTop/fBottom（字体全字形最大墨迹范围，会把行高撑到约 2 倍）。 }
+    FLogicalAscent := Ceil(-lm.fAscent);
+    FLogicalDescent := Ceil(lm.fDescent);
   end
   else
   begin
     lh := Round(FPointSize * 96 / 72);
     if lh < 1 then lh := 1;
-    FLogicalAscent := lh * 3 div 4;
-    FLogicalDescent := lh div 4;
+    FLogicalAscent := (lh * 3 + 3) div 4;
+    FLogicalDescent := (lh + 3) div 4;
   end;
 end;
 
@@ -505,12 +507,14 @@ begin
     FMetricsValid := (OH_Drawing_FontGetMetrics(FNativeFont, @FMetrics) <> 0);
   if FMetricsValid then
   begin
-    FAscent := Round(-FMetrics.fAscent);
-    FDescent := Round(FMetrics.fDescent);
+    { 与 native 链一致：用推荐 ascent/descent 计算行高（含 descender）；
+      不用 fTop/fBottom（全字形最大墨迹范围，会把行高撑到约 2 倍）。 }
+    FAscent := Ceil(-FMetrics.fAscent);
+    FDescent := Ceil(FMetrics.fDescent);
   end
   else begin
-    FAscent := FHeight * 3 div 4;
-    FDescent := FHeight div 4;
+    FAscent := (FHeight * 3 + 3) div 4;
+    FDescent := (FHeight + 3) div 4;
   end;
 end;
 
@@ -555,15 +559,25 @@ begin
 end;
 
 function TfpgOhosAggFontResource.GetHeight: integer;
+var
+  em: Integer;
 begin
+  em := Round(FPointSize * 96 / 72);
+  if em < 1 then em := 1;
   if FOffscreen then
   begin
-    { 与 native 一致：设计高度（pt*96/72），不随导出 DPI 抖动 }
-    Result := Round(FPointSize * 96 / 72);
-    if Result < 1 then Result := 1;
+    { 行高 = 逻辑 ascent + descent（含 descender），不是设计 em 字号；
+      与 native 链及 GDI tmHeight 语义一致，且不随导出 DPI 抖动 }
+    Result := FLogicalAscent + FLogicalDescent;
+    if Result < em then
+      Result := em;
   end
   else if FMetricsValid then
-    Result := GetAscent + GetDescent
+  begin
+    Result := GetAscent + GetDescent;
+    if Result < em then
+      Result := em;
+  end
   else
     Result := Round(FHeight / EffectiveSF);
 //fpGUI_Hilog(LOG_WARN, 'GetHeight=' + IntToStr(Result) + ' gHiDPI=' + FloatToStr(gHiDPIScaleFactor) + ' FHeight=' + IntToStr(FHeight));
