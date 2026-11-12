@@ -32,6 +32,9 @@ uses
   fpg_impl,
   fpg_ohos_drawing,
   fpg_ohos_nativewindow,
+  {$ifdef GLPresenter}
+  fpg_ohos_gl_iface,
+  {$endif}
   fpg_wakechannel,
   fpg_cmdlineparams;
 
@@ -195,6 +198,11 @@ type
     { 首帧已上屏标志：第一次 DoPutBufferToScreen 成功 FlushBuffer 后置位，
       并向 ETS 发 NATIVE_CMD_FIRST_FRAME 打开 XComponent 显示门（防黑屏闪现）}
     FFirstFrameSent: Boolean;
+    {$ifdef GLPresenter}
+    { 最近一次使用的 OHNativeWindow 句柄：hide→show 句柄变化时释放旧 presenter，
+      避免非 AGG 路径在句柄切换后残留 EGLSurface/纹理。 }
+    FLastGLHandle: TfpgWinHandle;
+    {$endif}
     { 离屏模式（frfpg 报表导出）：尺寸只存物理请求值，逻辑尺寸/尺度由 DPI 派生 }
     FOffscreen: Boolean;
     FOffscreenWidth: Integer;    // physical pixels (requested)
@@ -232,6 +240,9 @@ type
     procedure   DoDrawPolygon(const Points: array of TPoint); override;
     function    GetBufferAllocated: Boolean; override;
     procedure   DoAllocateBuffer; override;
+    {$ifdef GLPresenter}
+    function    TryPresentGL: Boolean;
+    {$endif}
   public
     function    GetBitmapWidth: Integer;
     function    GetBitmapHeight: Integer;
@@ -870,7 +881,11 @@ uses
   fpg_window,      { TfpgWindow.WindowTitle（窗题读取——应用 Create 阶段设置）}
   fpg_trayicon,    { TfpgSystemTrayIcon（托盘 Owner 强转，仅 implementation 层引用，避免循环）}
   fpg_menu,        { TfpgPopupMenu/TfpgMenuItem（托盘菜单序列化）}
-  fpg_form;        { TfpgBaseForm.CloseQuery（标题栏 X 关闭前 CanClose 查询，静态接管原 dlsym 桥）}
+  fpg_form         { TfpgBaseForm.CloseQuery（标题栏 X 关闭前 CanClose 查询，静态接管原 dlsym 桥）}
+  {$ifdef GLPresenter}
+  , fpg_ohos_gl_presenter
+  {$endif}
+  ;
 
 { 前向声明（TfpgOhosApplication.Create 启动期调用，定义在文件后部）}
 procedure DumpFontFamilies; forward;
@@ -2353,6 +2368,9 @@ begin
   FColorValue := $FF000000;
   FBaseChildSaveCount := 0;
   FHasChildPainted := False;
+  {$ifdef GLPresenter}
+  FLastGLHandle := nil;
+  {$endif}
   FOffscreen := False;
   FOffscreenWidth := 0;
   FOffscreenHeight := 0;
@@ -3016,6 +3034,60 @@ begin
 
 end;
 
+{$ifdef GLPresenter}
+function TfpgOhosCanvas.TryPresentGL: Boolean;
+var
+  p: TfpgOhosGLPresenter;
+  px: Pointer;
+  bmpW, bmpH, winW, winH: Integer;
+  win: TfpgOhosWindow;
+begin
+  Result := False;
+  if (FBitmap = nil) or (FWidget = nil) or (FWidget.Window = nil) then
+    Exit;
+  if not (FWidget.Window is TfpgOhosWindow) then
+    Exit;
+  win := TfpgOhosWindow(FWidget.Window);
+  if win.WinHandle = nil then
+    Exit;
+
+  { hide→show may replace the OHNativeWindow.  Release the old presenter so
+    its EGLSurface is destroyed while the old handle is still meaningful. }
+  if win.WinHandle <> FLastGLHandle then
+  begin
+    if FLastGLHandle <> nil then
+      ReleaseGLPresenter(FLastGLHandle);
+    FLastGLHandle := win.WinHandle;
+  end;
+
+  bmpW := Integer(OH_Drawing_BitmapGetWidth(FBitmap));
+  bmpH := Integer(OH_Drawing_BitmapGetHeight(FBitmap));
+  if (bmpW <= 0) or (bmpH <= 0) then
+    Exit;
+
+  px := OH_Drawing_BitmapGetPixels(FBitmap);
+  if px = nil then
+    Exit;
+
+  p := GetGLPresenter(win.WinHandle, bmpW, bmpH);
+  if p = nil then
+    Exit;
+
+  winW := win.PhysicalWidth;
+  winH := win.PhysicalHeight;
+  if (winW <= 0) or (winH <= 0) then
+  begin
+    winW := bmpW;
+    winH := bmpH;
+  end;
+
+  { The native_drawing bitmap is RGBA8888/PREMUL and its first row is the
+    top row, hence AFlipY=True.  The bitmap has no padding: stride = W*4. }
+  Result := p.UploadAndPresent(px, bmpW * 4, bmpW, bmpH,
+    winW, winH, True, False);
+end;
+{$endif}
+
 procedure TfpgOhosCanvas.DoPutBufferToScreen(x, y, w, h: TfpgCoord);
 var
   nativeWin: TfpgWinHandle;
@@ -3039,6 +3111,9 @@ var
   widgetX, widgetY, widgetW, widgetH: Integer; }
 begin
   if FOffscreen then Exit;
+  {$ifdef GLPresenter}
+  if TryPresentGL then Exit;
+  {$endif}
   if (FWidget = nil) or (FBitmap = nil) then Exit;
   ohosWin := TfpgOhosWindow(FWidget.Window);
   if ohosWin = nil then Exit;
@@ -3860,6 +3935,9 @@ begin
     FSize 未跟随 → 最大化/还原后触摸命中。与渲染物理尺寸一并同步。 }
   FSize.W := Round(AW / gScaleFactorX);
   FSize.H := Round(AH / gScaleFactorY);
+  {$ifdef GLPresenter}
+  NotifyGLWindow(FWinHandle, gleResize, AW, AH);
+  {$endif}
   fpGUI_Hilog(LOG_INFO, format('SetPhysicalSize h=%s phys=%dx%d FSize=%dx%d',
     [IntToHex(PtrUInt(FWinHandle), 8), AW, AH, FSize.W, FSize.H]));
 end;
@@ -3876,6 +3954,10 @@ procedure TfpgOhosWindow.InvalidateNativeHandle;
 begin
   fpGUI_Hilog(LOG_INFO, format('InvalidateNativeHandle: %s -> nil',
     [IntToHex(PtrUInt(FWinHandle), 8)]));
+  {$ifdef GLPresenter}
+  if FWinHandle <> nil then
+    NotifyGLWindow(FWinHandle, gleDestroy, 0, 0);
+  {$endif}
   FWinHandle := nil;
   { 窗口句柄已失效（系统销毁/buffer 释放）：解除 caret 防悬空 blink（编辑框重绘会恢复）}
   if fpgApplication is TfpgOhosApplication then
@@ -3898,6 +3980,9 @@ begin
     { Unregister before destroying the native window }
     if fpgApplication is TfpgOhosApplication then
       TfpgOhosApplication(fpgApplication).UnregisterWindowHandle(FWinHandle);
+    {$ifdef GLPresenter}
+    NotifyGLWindow(FWinHandle, gleDestroy, 0, 0);
+    {$endif}
     if Assigned(_ohos_destroy_window) then
       _ohos_destroy_window(FWinHandle)
     else
@@ -3980,6 +4065,18 @@ begin
       无条件置位对非 AGG 无害（不读此字段）。覆盖 hide→show 句柄未变但 contentReady
       回 false 的场景（与非 AGG 上方重置同效）。 }
   FirstFrameResetPending := True;
+  {$ifdef GLPresenter}
+  if FWinHandle <> nil then
+  begin
+    if AValue then
+    begin
+      NotifyGLWindow(FWinHandle, gleResetFirstFrame, 0, 0);
+      NotifyGLWindow(FWinHandle, gleShow, FPhysicalWidth, FPhysicalHeight);
+    end
+    else
+      NotifyGLWindow(FWinHandle, gleHide, 0, 0);
+  end;
+  {$endif}
   if Assigned(_ohos_set_window_visible) and (FWinHandle <> nil) then
     _ohos_set_window_visible(FWinHandle, Integer(AValue));
   if AValue and (Owner is TfpgWidget) then
@@ -6690,6 +6787,11 @@ begin
     ProcessDragEvents;
     if assigned(gDispatchPump) then gDispatchPump(); //fpgui_dispatch_pump;   { 动态分发：UI 线程执行同步 Handler / 启动异步 Worker }
     SafeDeliverMessages;
+    {$ifdef GLPresenter}
+    { Phase 3: coalesce presents — swap once per pump iteration. }
+    if Assigned(GLFlushPresents) then
+      GLFlushPresents;
+    {$endif}
   except
     on E: Exception do
     begin
@@ -8578,7 +8680,20 @@ begin
   fpGUI_Hilog(LOG_ERROR, AMsg);
 end;
 
+{$ifdef GLPresenter}
+procedure OhosNotifyGLFirstFrame(AWinHandle: TfpgWinHandle);
+begin
+  if AWinHandle = nil then
+    Exit;
+  if Assigned(_notify_first_frame) then
+    _notify_first_frame(AWinHandle);
+end;
+{$endif}
+
 initialization
+  {$ifdef GLPresenter}
+  GLNotifyFirstFrame := @OhosNotifyGLFirstFrame;
+  {$endif}
   ohos_bridge_connect;
   SavedErrorProc := System.ErrorProc;
   System.ErrorProc := @OhosErrorProc;

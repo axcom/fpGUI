@@ -11,7 +11,14 @@
     native_drawing (GPU-accelerated via Skia) paths.
     Define NO_AGGCANVAS to use the native OHOS_Drawing API instead. }
   {$define NO_AGGCANVAS}
-  //{$define AggCanvas}
+  {$define GLPresenter}
+{$endif}
+
+{ GLBackend is the Phase 2 TfpgGLCanvas backend.  It always includes the
+  Phase 1 GL presenter so a mixed/fallback build keeps the same GL surface
+  and first-frame handling. }
+{$ifdef GLBackend}
+  {$define GLPresenter}
 {$endif}
 {$WARN 5024 off : Parameter "$1" not used}
 

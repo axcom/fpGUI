@@ -1716,7 +1716,7 @@ begin
   FTemp             := 50;  // Just to prove that ColumnWidth does adjust.
   FDefaultColWidth  := 64;
   FDefaultRowHeight := FFont.GetHeight + 2;
-  FHeaderHeight     := FFont.GetHeight; //FHeaderFont.GetHeight + 2;
+  FHeaderHeight     := FFont.GetHeight + 2+2; //FHeaderFont.GetHeight + 2;
   FBackgroundColor  := clBoxColor;
   FAlternativeBGColor := clHilite1;
   FColResizing      := False;

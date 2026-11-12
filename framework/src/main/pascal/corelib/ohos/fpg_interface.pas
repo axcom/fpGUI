@@ -23,6 +23,9 @@ interface
 
 uses
   fpg_ohos
+  {$ifdef GLBackend}
+  , fpg_ohos_gl_canvas
+  {$endif}
   {$ifdef AGGCanvas}
   , fpg_hybrid_canvas
   , fpg_ohos_hybrid_canvas
@@ -34,10 +37,14 @@ type
   TfpgFontResourceImpl  = class(TfpgOhosFontResource);
   TfpgImageImpl         = class(TfpgOhosImage);
   {$NOTES OFF}
-  {$ifdef AGGCanvas}
-  TfpgCanvasImpl        = class(TOhosHybridCanvas);
+  {$ifdef GLBackend}
+  TfpgCanvasImpl        = class(TfpgGLCanvas);
   {$else}
-  TfpgCanvasImpl        = class(TfpgOhosCanvas);
+    {$ifdef AGGCanvas}
+    TfpgCanvasImpl      = class(TOhosHybridCanvas);
+    {$else}
+    TfpgCanvasImpl      = class(TfpgOhosCanvas);
+    {$endif}
   {$endif}
   {$NOTES ON}
   TfpgWindowImpl        = class(TfpgOhosWindow);
@@ -52,16 +59,41 @@ type
 
 implementation
 
-{$ifdef AGGCanvas}
 uses
   fpg_main,
-  fpg_fontmanager,
-  fpg_ohos_agg_fontresource;
+  fpg_fontmanager
+  {$if defined(GLBackend) or defined(AGGCanvas)}
+  , fpg_ohos_agg_fontresource
+  {$endif}
+  {$ifdef GLBackend}
+  , fpg_ohos_gl
+  {$endif}
+  ;
 
 initialization
-  DefaultCanvasClass   := TOhosHybridCanvas; 
+{$ifdef GLBackend}
+  if TfpgOhosGLDisplay.Instance.TryInitialize then
+  begin
+    DefaultCanvasClass   := TfpgGLCanvas;
+    AggFontResourceClass := TfpgOhosAggFontResource;
+  end
+  else
+  begin
+    { EGL/GLES is unavailable: keep the software backend. }
+    {$ifdef AGGCanvas}
+    DefaultCanvasClass   := TOhosHybridCanvas;
+    CreateBufferManager  := @CreateOhosBufferManager;
+    AggFontResourceClass := TfpgOhosAggFontResource;
+    {$else}
+    DefaultCanvasClass   := TfpgOhosCanvas;
+    {$endif}
+  end;
+{$else}
+  {$ifdef AGGCanvas}
+  DefaultCanvasClass   := TOhosHybridCanvas;
   CreateBufferManager  := @CreateOhosBufferManager;
   AggFontResourceClass := TfpgOhosAggFontResource;
+  {$endif}
 {$endif}
 
 end.

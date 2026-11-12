@@ -48,6 +48,9 @@ type
       使重新显示后的首帧再次通知开门（与非 AGG TfpgOhosCanvas.FFirstFrameSent
       在 DoSetWindowVisible(True) 重置同效）。 }
     FFirstFrameSent: Boolean;
+    {$ifdef GLPresenter}
+    function  TryPresentGL: Boolean;
+    {$endif}
   public
     constructor Create;
     destructor Destroy; override;
@@ -74,7 +77,11 @@ uses
   unix,
   fpg_main,
   fpg_ohos_nativewindow,
-  fpg_ohos;
+  fpg_ohos
+  {$ifdef GLPresenter}
+  , fpg_ohos_gl_presenter
+  {$endif}
+  ;
 
 { NOTE: fpmmap, fpmunmap, OH_NativeWindow_* functions, and PBufferHandle/TOH_Region
   types are declared in fpg_ohos_nativewindow.pas (moved out of fpg_ohos.pas). }
@@ -102,6 +109,10 @@ end;
 
 destructor TOhosBufferManager.Destroy;
 begin
+  {$ifdef GLPresenter}
+  if FWinHandle <> nil then
+    ReleaseGLPresenter(FWinHandle);
+  {$endif}
   FreeBuffer;
   inherited Destroy;
 end;
@@ -117,7 +128,13 @@ begin
     重置 FFirstFrameSent 使重新显示后的首帧 FlushBuffer 再次通知 ETS 开门。
     句柄未变（同窗口逐帧 Attach）则不重置，避免每帧重复通知。 }
   if FWinHandle <> win.WinHandle then
+  begin
+    {$ifdef GLPresenter}
+    if FWinHandle <> nil then
+      ReleaseGLPresenter(FWinHandle);
+    {$endif}
     FFirstFrameSent := False;
+  end;
   { 消费 DoSetWindowVisible(True) 置位的重置请求：覆盖 hide→show 句柄未变但
     contentReady 回 false 的场景（与非 AGG TfpgOhosCanvas 同效）。 }
   if win.FirstFrameResetPending then
@@ -134,6 +151,10 @@ end;
 procedure TOhosBufferManager.DetachWindow;
 begin
   UnmapCachedAddr;
+  {$ifdef GLPresenter}
+  if FWinHandle <> nil then
+    ReleaseGLPresenter(FWinHandle);
+  {$endif}
   FWinHandle := nil;
 end;
 
@@ -191,6 +212,35 @@ begin
   FMappedFd   := -1;
 end;
 
+{$ifdef GLPresenter}
+function TOhosBufferManager.TryPresentGL: Boolean;
+var
+  p: TfpgOhosGLPresenter;
+  winW, winH: Integer;
+begin
+  Result := False;
+  if (FBuffer = nil) or (FBufWidth <= 0) or (FBufHeight <= 0) then
+    Exit;
+  p := GetGLPresenter(FWinHandle, FBufWidth, FBufHeight);
+  if p = nil then
+    Exit;
+
+  winW := FWindowW;
+  winH := FWindowH;
+  if (winW <= 0) or (winH <= 0) then
+  begin
+    winW := FBufWidth;
+    winH := FBufHeight;
+  end;
+
+  { AggPas/native_drawing buffers have their first row at the top, so the
+    presenter flips Y.  On OHOS the hybrid canvas already stores RGBA (the
+    old R/B swap in fpgColorToAgg), hence ASwizzleRB=False. }
+  Result := p.UploadAndPresent(FBuffer, FStride, FBufWidth, FBufHeight,
+    winW, winH, True, False);
+end;
+{$endif}
+
 procedure TOhosBufferManager.PutBufferToScreen(x, y, w, h: TfpgCoord);
 var
   nativeBuf: Pointer;
@@ -214,6 +264,9 @@ begin
     Exit;
   if (w <= 0) or (h <= 0) then
     Exit;
+  {$ifdef GLPresenter}
+  if TryPresentGL then Exit;
+  {$endif}
 (*
   { ── 检查是否有光标，如果有，判断当前绘制区域是否小于控件区域 ── }
   if Assigned(fpgCaret) and (fpgCaret.Canvas <> nil) then

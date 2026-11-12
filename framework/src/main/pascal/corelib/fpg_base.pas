@@ -295,6 +295,7 @@ type
     FMaskData: pointer;
     FMaskDataSize: integer;
     FMaskPoint: TPoint;
+    FGeneration: Cardinal;
     procedure   DoFreeImage; virtual; abstract;
     procedure   DoInitImage(acolordepth, awidth, aheight: integer; aimgdata: Pointer); virtual; abstract;
     procedure   DoInitImageMask(awidth, aheight: integer; aimgdata: Pointer); virtual; abstract;
@@ -308,6 +309,11 @@ type
     procedure   CreateMaskFromSample(x, y: TfpgCoord);
     { Must always be called AFTER you populated the ImageData array. Then only does it allocate OS resources. }
     procedure   UpdateImage;
+    { Mark the pixel/mask content as changed without rebuilding OS resources.
+      Texture caches (GL) use Generation to invalidate stale uploads.  Call
+      this after mutating ImageData in place when the native image does not
+      need to be re-synced. }
+    procedure   Invalidate;
     { Internal representation of color data is always ARGB }
     property    ImageData: pointer read FImageData;
     property    ImageDataSize: integer read FImageDataSize;
@@ -318,6 +324,9 @@ type
     property    ColorDepth: integer read FColorDepth;
     property    Masked: boolean read FMasked;
     property    MaskPoint: TPoint read FMaskPoint;
+    { Incremented whenever the pixel/mask content changes; GL texture caches
+      use it to invalidate stale uploads. }
+    property    Generation: Cardinal read FGeneration;
     property    Colors[x, y: TfpgCoord]: TfpgColor read GetColor write SetColor;
   end;
 
@@ -564,6 +573,11 @@ type
       before the first paint), in which case the caller should fall back to
       InvalidateRect to trigger a full repaint. }
     function    RestoreFromBuffer(const ARect: TfpgRect): Boolean;
+    { Notify the backend that (X,Y,W,H) of AImage changed in place.  The GL
+      canvas uses this to refresh its texture with glTexSubImage2D.  Default
+      is a no-op. }
+    procedure   UpdateImageRegion(AImage: TfpgImageBase;
+      X, Y, W, H: Integer); virtual;
     property    Color: TfpgColor read FColor write SetColor;
     property    TextColor: TfpgColor read FTextColor write SetTextColor;
     property    Font: TfpgFontResourceBase read FFont;
@@ -3391,6 +3405,12 @@ begin
     DoRestoreFromBuffer(ARect);
 end;
 
+procedure TfpgCanvasBase.UpdateImageRegion(AImage: TfpgImageBase;
+  X, Y, W, H: Integer);
+begin
+  { Default: nothing to do. }
+end;
+
 procedure TfpgCanvasBase.FreeResources;
 begin
   DoEndDraw;
@@ -3872,6 +3892,7 @@ begin
   p := FImageData;
   Inc(p, (FWidth * y) + x);
   p^ := AValue;
+  Inc(FGeneration);
 //  write(IntToHex(AValue, 8) + ' ');
 end;
 
@@ -3887,6 +3908,7 @@ begin
   FMaskDataSize  := 0;
   FMasked        := False;
   FMaskPoint     := Point(0, 0);
+  FGeneration    := 0;
 end;
 
 destructor TfpgImageBase.Destroy;
@@ -3937,6 +3959,7 @@ begin
   FMasked       := False;
   FWidth        := 0;
   FHeight       := 0;
+  Inc(FGeneration);
   DoFreeImage;
 end;
 
@@ -4082,8 +4105,14 @@ begin
 {$endif}
 end;
 
+procedure TfpgImageBase.Invalidate;
+begin
+  Inc(FGeneration);
+end;
+
 procedure TfpgImageBase.UpdateImage;
 begin
+  Invalidate;
   if FImageData <> nil then
     DoInitImage(FColorDepth, FWidth, FHeight, FImageData);
 
