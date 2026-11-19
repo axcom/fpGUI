@@ -226,9 +226,10 @@ begin
       end;
     gleDestroy:
       begin
-        e := FindWindowEntry(AWinHandle);
-        if e <> nil then
-          e.Window.Suspend;
+        { HarmonyOS reuses native window handle addresses.  If the entry is
+          only suspended, a later window with the same handle hits the stale
+          (glsLost) entry and never gets a fresh EGLSurface/FBO.  Remove it. }
+        ReleaseGLWindow(AWinHandle);
       end;
     gleResetFirstFrame:
       begin
@@ -598,7 +599,7 @@ begin
   if FGLWindow = nil then
     Exit;
   GLDraw.Flush;
-  { Phase 3: defer the swap; the message pump presents once per iteration
+  { Defer the swap; the message pump presents once per iteration
     (VSync commit coalescing). }
   FGLWindow.PresentPending := True;
 end;

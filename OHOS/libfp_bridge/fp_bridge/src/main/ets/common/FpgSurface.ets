@@ -142,7 +142,7 @@ let gLastHoverMoveAt: number = 0;
 // AxisEvent（每段都带角度变化）→ 50ms 内只转发一次，防多段重复滚动
 let gLastWheelAt: number = 0;
 
-function imeEnsureAttached(kbType: number, reqId: number): void {
+function imeEnsureAttached(kbType: number, reqId: number, showKeyboard: boolean): void {
   try {
     if (gImeCtl === null) {
       gImeCtl = inputMethod.getController();
@@ -158,7 +158,10 @@ function imeEnsureAttached(kbType: number, reqId: number): void {
       gImeAttached = false;
     }
     gImeSessionReqId = -1;
-    gImeCtl.attach(true, {
+    // 第一个参数 showKeyboard 决定是否弹软键盘。菜单/弹窗关闭后的“会话重连”
+    // 只是为了保证按键还能进来，绝不能在这里弹键盘（attach(true) 会直接
+    // 拉起输入法，表现为点完菜单项软键盘自己冒出来）。
+    gImeCtl.attach(showKeyboard, {
       inputAttribute: {
         textInputType: wantType,
         // 终端要的是换行键：UNSPECIFIED 会让 IME 显示“开始/搜索”等功能键；
@@ -228,30 +231,34 @@ function imeEnsureAttached(kbType: number, reqId: number): void {
 }
 
 // popup/子窗关闭后 IME 会话可能仍挂在已销毁窗口上：stop → attach 重连到主窗。
+// 是否弹软键盘只看 Pascal 有没有真的要求过输入法（show_keyboard → gImeWantedReqId）：
+// 只是点了个菜单项时 wanted=0，重连必须静默，不能把键盘拉起来。
 function imeForceReattach(kbType: number, reqId: number): void {
   const now: number = Date.now();
   if (now - gLastImeReattachAt < 400) return;
   gLastImeReattachAt = now;
+  const showKeyboard: boolean = (gImeWantedReqId === reqId);
   try {
     if (gImeCtl === null) gImeCtl = inputMethod.getController();
     const ctl: inputMethod.InputMethodController = gImeCtl;
     gImeSessionReqId = -1;
     ctl.stopInputSession().then(() => {
       gImeAttached = false;
-      imeEnsureAttached(kbType, reqId);
+      imeEnsureAttached(kbType, reqId, showKeyboard);
     }).catch(() => {
       gImeAttached = false;
-      imeEnsureAttached(kbType, reqId);
+      imeEnsureAttached(kbType, reqId, showKeyboard);
     });
   } catch (_e) {
     gImeAttached = false;
-    imeEnsureAttached(kbType, reqId);
+    imeEnsureAttached(kbType, reqId, showKeyboard);
   }
 }
 
 // 强制重建会话（不走节流）：窗口焦点在子窗间翻转后，IME 的输入客户端可能
 // 已经失效——此时 gImeAttached 仍为 true，但事件不再回传（物理键和 IME 文本
 // 都收不到）。必须 stop → attach 重新绑定到当前焦点窗口。
+// 调用方都是“Pascal 确实在本窗要求输入法”的场景，因此这里要显示键盘。
 function imeRebind(kbType: number, reqId: number): void {
   try {
     if (gImeCtl === null) gImeCtl = inputMethod.getController();
@@ -259,14 +266,14 @@ function imeRebind(kbType: number, reqId: number): void {
     gImeAttached = false;
     gImeSessionReqId = -1;
     ctl.stopInputSession().then(() => {
-      imeEnsureAttached(kbType, reqId);
+      imeEnsureAttached(kbType, reqId, true);
     }).catch(() => {
-      imeEnsureAttached(kbType, reqId);
+      imeEnsureAttached(kbType, reqId, true);
     });
   } catch (_e) {
     gImeAttached = false;
     gImeSessionReqId = -1;
-    imeEnsureAttached(kbType, reqId);
+    imeEnsureAttached(kbType, reqId, true);
   }
 }
 
@@ -781,7 +788,7 @@ export struct FpgSurface {
     // IME 命令模式：attach（输入类型/目标窗口变化时 reattach）→ 弹软键盘。
     // 必须带窗口 reqId：会话按窗口绑定，仅按类型去重会把子窗的字母吞掉。
     if (this.reqId === 1) {
-      imeEnsureAttached(kbType, this.reqId);
+      imeEnsureAttached(kbType, this.reqId, true);
     } else {
       // 子窗：focusControl.requestFocus 是异步的（onFocus 约 20~60ms 后才到），
       // 而 attach() 只有在窗口已有【输入客户端】时才会绑对目标。实测在 showIme

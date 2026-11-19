@@ -633,6 +633,8 @@ begin
 end;
 
 function TfpgOhosGLWindow.Recover(AWidth, AHeight: Integer): Boolean;
+var
+  h: TfpgWinHandle;
 begin
   Result := False;
   if FState = glsReady then
@@ -641,14 +643,16 @@ begin
     and rebuilds it when needed. }
   if not TfpgOhosGLDisplay.Instance.TryInitialize then
     Exit;
+  { Suspend clears FWinHandle; keep it to re-attach the same native window. }
+  h := FWinHandle;
   Suspend;
-  if FWinHandle = nil then
+  if h = nil then
     Exit;
   if AWidth <= 0 then
     AWidth := FWidth;
   if AHeight <= 0 then
     AHeight := FHeight;
-  Result := Attach(FWinHandle, AWidth, AHeight);
+  Result := Attach(h, AWidth, AHeight);
   if Result then
     Result := EnsureFBO(AWidth, AHeight);
   if Result then

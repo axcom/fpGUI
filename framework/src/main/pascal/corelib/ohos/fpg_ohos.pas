@@ -5223,10 +5223,14 @@ end;
         gCursorY := gy;
         gCursorValid := True;
         rw := HitTestWindow(gx, gy);
-        if (wPrev <> nil) and (wPrev <> MainForm.Window) then
-          rw := wPrev                 { pointer was on a subwindow }
-        else if (rw <> nil) and (rw <> MainForm.Window) then
-          rw := rw                    { hit a subwindow }
+        if (rw <> nil) and (rw <> MainForm.Window) then
+        begin
+          { 命中子窗口（可能是刚从父菜单弹出的子菜单）：以命中结果为准。
+            旧逻辑先用 wPrev 覆盖，导致“指针还停在父菜单上、子菜单已弹出”的
+            第一次点击被重路由回父菜单 → 点子项菜单只会把菜单关掉。 }
+        end
+        else if (wPrev <> nil) and (wPrev <> MainForm.Window) then
+          rw := wPrev                 { 未命中子窗（透明边缘）：保持上一个子窗 }
         else if (rw = MainForm.Window) and
                 (gy >= MainForm.Window.Top) and
                 (gy <= MainForm.Window.Top + 20) then
@@ -7007,6 +7011,10 @@ procedure TfpgOhosClipboard.InitClipboard;
 begin
   { Load clipboard bridge functions from the C++ library (in-process).
     bridge_init 已装载时跳过 dlsym（优先使用统一桥）。 }
+  if not Assigned(_clipboard_set_text) then
+    Pointer(_clipboard_set_text) := LibBridgeSym('ohos_clipboard_set_text');
+  if not Assigned(_clipboard_get_text) then
+    Pointer(_clipboard_get_text) := LibBridgeSym('ohos_clipboard_get_text');
   if _clipboard_set_text = nil then
     fpGUI_Hilog(LOG_INFO, 'Clipboard: ohos_clipboard_set_text not found');
   if _clipboard_get_text = nil then
@@ -7590,10 +7598,18 @@ end;
 procedure ohos_update_configuration(config: PChar); cdecl;
 begin
   if config = nil then Exit;
-  if (fpgApplication <> nil) and (fpgApplication is TfpgOhosApplication) then
+  fpGUI_Hilog(LOG_INFO, PChar('ohos_update_configuration: cfg=' + StrPas(config)));
+  {if (fpgApplication <> nil) and (fpgApplication is TfpgOhosApplication) then
     TfpgOhosApplication(fpgApplication).EnqueueConfigurationEvent(StrPas(config))
   else
-    HandleConfigurationEvent(StrPas(config));
+    HandleConfigurationEvent(StrPas(config));}
+  { 永远就地处理：全局 gCfg* 赋值（string/Integer）是原子操作，
+    不存在竞态。HandleConfigurationEvent 内部已做 Application/MainForm
+    判空保护，仅在 UI 线程安全时才投 FPGM_OHOS_CONFIG_CHANGED。
+    之前的 Enqueue 分支依赖 ProcessQueuedConfigEvents 消费队列，
+    首启阶段 Application 一旦被惰性创建（任何初始化段 fpgApplication 调用），
+    配置就被投进队列 —— 首窗体 Create/Show 时 gCfgLanguage 仍然是空值。 }
+  HandleConfigurationEvent(StrPas(config));    
 end;
 
 { 启动载荷 JSON 注入入口（C++ 经 bridge set_launch_params 调用）。

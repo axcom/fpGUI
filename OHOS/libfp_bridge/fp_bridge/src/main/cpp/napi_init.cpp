@@ -630,7 +630,17 @@ static napi_value OnNotifyConfiguration(napi_env env, napi_callback_info info) {
         {
             std::lock_guard<std::mutex> lock(g_cfgMutex);
             fn = (UpdateConfigFn)g_pascal.update_configuration;
-            if (!fn) g_pendingConfig = cfg;
+            //if (!fn) g_pendingConfig = cfg;
+            if (!fn) {
+                // Pascal 未连接：多条 KV 必须合并暂存，不能直接赋值。
+                // 首启时 ArkTS 分三次推：onWindowStageCreate 的语言/深浅色等、
+                // readDateTimeFormat 的 tf/df、probeKeyboard 的 kbd —— 都在
+                // loadContent→Pascal 连接之前到达，覆盖式赋值只会留下最后一条，
+                // 先到的 l=（语言）等字段就丢了。Pascal 侧按键对比，重复 KV 幂等。
+                if (!g_pendingConfig.empty() && g_pendingConfig.back() != ';')
+                    g_pendingConfig += ';';
+                g_pendingConfig += cfg;
+            }            
         }
         if (fn) {
             fn(cfg.c_str());
