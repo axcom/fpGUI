@@ -106,6 +106,12 @@ struct Index {
   // 本事件 → 过滤后避免多余的 SET_BUFFER_GEOMETRY+重绘+提交 → 防拖动花屏。
   private lastMainSizeW: number = 0;
   private lastMainSizeH: number = 0;
+  // 主窗是否 waBorderless（setupMainWindow 记录）：运行期 resize 计算系统装饰
+  // 补偿时用，避免把残留的假装饰算进客户区。
+  private mainBorderless: boolean = false;
+  // 主窗 resize 进行中标志：REFRESH/窗口事件可能重入，重入的 resize 请求直接忽略，
+  // 避免 resizeToClient 的多轮 resize 被并发请求打断（表现为窗口持续抖动）。
+  private mainResizeBusy: boolean = false;
   private lastSubSize: Map<number, [number, number]> = new Map();
   // 主窗按键捕获焦点状态：没有输入控件时也保持隐藏 TextInput 聚焦，
   // 这样 KEYPRESS 仍能到达 TfpgForm.DoKeyShortcut（主菜单快捷键）。
@@ -518,6 +524,7 @@ struct Index {
     const ATTR_BORDERLESS = 1 << 4;
     // waBorderless：主窗无系统装饰（setWindowDecorVisible(false)）→ decW/decH 按 0 处理
     const borderless = (attrs & ATTR_BORDERLESS) !== 0;
+    this.mainBorderless = borderless;
     const mainWin = getMainWindow();
     if (mainWin === null) return;
     // 主窗句柄缓存：FpgSurface 首次事件前读取 windowRect 原点（兼容缩放/移动）
@@ -1396,9 +1403,106 @@ struct Index {
     if (reqId === 1) terminateAbility();
   }
 
+  // 主窗口运行期 resize（fpGUI「选项 → 尺寸」触发）。
+  // 逻辑与 setupMainWindow 的非全屏分支一致：客户区 + 系统装饰补偿、二次校正、
+  // resize 后复位位置、刷新装饰值。区别：
+  //   1) 不在这里注册 windowSizeChange（启动时已注册，重复注册会多次回调）；
+  //   2) 系统拒绝自由 resize（全屏/手机）时不强制切沉浸全屏 —— 用户只是改
+  //      棋盘大小，窗口模式应保持不变，Pascal 会按实际客户区重新居中；
+  //   3) 幂等 + 忙标志：FpgSurface 的 REFRESH 会反复调用 DoUpdateWindowPosition，
+  //      若尺寸已达成还执行 win.resize，会再次触发 windowSizeChange → 刷新 →
+  //      resize 的自激循环（窗口在界面上不停调整）。
+  private async resizeMainWindow(w: number, h: number): Promise<void> {
+    const mainWin = getMainWindow();
+    if (mainWin === null) return;
+    if (this.mainResizeBusy) {
+      // 重入请求（REFRESH/尺寸反馈抖动）直接忽略：本轮结束后 Pascal 会按
+      // 实际客户区继续反馈，下一轮若仍有差异会再次请求（见下方幂等判定）。
+      hilog.info(DOMAIN, TAG, 'MainWindow resize skipped: another resize is in progress');
+      return;
+    }
+    let posX = 0;
+    let posY = 0;
+    let havePos = false;
+    try {
+      const cur = mainWin.getWindowProperties();
+      // 目标客户区已达成（±2px，与 resizeToClient 的收敛判定一致）→ 直接返回。
+      // REFRESH 会以当前 FSize 反复请求同一尺寸，这里必须幂等，否则永不停息。
+      if (this.isNear(cur.drawableRect.width, w) && this.isNear(cur.drawableRect.height, h)) {
+        hilog.info(DOMAIN, TAG,
+          'MainWindow resize skipped (already %{public}dx%{public}d, want %{public}dx%{public}d)',
+          cur.drawableRect.width, cur.drawableRect.height, w, h);
+        return;
+      }
+      posX = cur.windowRect.left;
+      posY = cur.windowRect.top;
+      havePos = true;
+    } catch (_e) {}
+    const borderless: boolean = this.mainBorderless;
+    const densityPx: number = display.getDefaultDisplaySync().densityPixels;
+    this.mainResizeBusy = true;
+    try {
+      await this.resizeToClient(mainWin, w, h);
+      try {
+        const props2 = mainWin.getWindowProperties();
+        const decW2 = borderless ? 0 : props2.windowRect.width - props2.drawableRect.width;
+        const decH2 = borderless ? 0 : props2.windowRect.height - props2.drawableRect.height;
+        hilog.info(DOMAIN, TAG,
+          'MainWindow resize by request: windowRect=%{public}dx%{public}d drawable=%{public}dx%{public}d dec=%{public}d,%{public}d expect client=%{public}dx%{public}d',
+          props2.windowRect.width, props2.windowRect.height,
+          props2.drawableRect.width, props2.drawableRect.height,
+          decW2, decH2, w, h);
+        if (!this.isNear(props2.drawableRect.width, w) || !this.isNear(props2.drawableRect.height, h)) {
+          await this.resizeToClient(mainWin, w, h);
+          hilog.info(DOMAIN, TAG,
+            'MainWindow resize corrected: resizeToClient %{public}dx%{public}d', w, h);
+        }
+      } catch (_e) {}
+      // resize 可能按中心/底边锚定挪动窗口 → 复位，避免弹窗锚点错位
+      if (havePos) {
+        try {
+          const moved = mainWin.getWindowProperties();
+          if (moved.windowRect.left !== posX || moved.windowRect.top !== posY) {
+            await mainWin.moveWindowTo(posX, posY);
+          }
+        } catch (_e) {}
+      }
+      // 装饰值可能变化：同步给弹窗定位 / 触摸补偿
+      try {
+        const props3 = mainWin.getWindowProperties();
+        const decW3 = borderless ? 0 : props3.windowRect.width - props3.drawableRect.width;
+        const decH3 = borderless ? 0 : props3.windowRect.height - props3.drawableRect.height;
+        AppStorage.setOrCreate<number>('decH_1', decH3 / densityPx);
+        AppStorage.setOrCreate<number>('decW_1', decW3 / 2 / densityPx);
+        fpbridge.setMainWindowDec(Math.round(decW3 / densityPx), Math.round(decH3 / densityPx));
+      } catch (_e) {}
+    } catch (e) {
+      // 全屏 / 手机等不允许自由 resize：窗口保持原样，回传真实客户区，
+      // 让 Pascal 用实际尺寸重排（棋盘居中），而不是把错误尺寸当真。
+      hilog.warn(DOMAIN, TAG,
+        'MainWindow resize by request rejected (msg=%{public}s) -> keep window size',
+        (e as Error).message || '');
+      try {
+        const p = mainWin.getWindowProperties();
+        fpbridge.onWindowResized(1, p.drawableRect.width, p.drawableRect.height);
+        hilog.info(DOMAIN, TAG,
+          'MainWindow actual after reject: drawable=%{public}dx%{public}d',
+          p.drawableRect.width, p.drawableRect.height);
+      } catch (_e) {}
+    } finally {
+      this.mainResizeBusy = false;
+    }
+  }
+
   // 调整窗口尺寸：fpGUI 传的是客户区尺寸（不含标题栏/边框）。
   // 仅系统子窗口：win.resize(客户区 + 装饰 dec)（含标题栏补偿）
   private async resizeWindow(reqId: number, w: number, h: number): Promise<void> {
+    // 主窗口（req=1）没有系统子窗对象，subWinMap 里查不到；不单独处理的话
+    // 尺寸命令会被静默丢弃，Pascal 改了 size 而窗口不跟随。
+    if (reqId === 1) {
+      await this.resizeMainWindow(w, h);
+      return;
+    }
     const win = this.subWinMap.get(reqId);
     if (win !== undefined) {
       try {

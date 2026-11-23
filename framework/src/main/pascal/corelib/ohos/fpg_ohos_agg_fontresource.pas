@@ -40,6 +40,8 @@ type
     FDescent: Integer;
     FHeight: Integer;
     FIsBold: Boolean;
+    FIsItalic: Boolean;
+    FBaseFontName: string;      { FontDesc 的 FaceName，用于 fonts.ini 映射 }
     FMetricsValid: Boolean;
     FMetrics: TOH_Drawing_FontMetrics;
     { 文本渲染缓存：避免每次绘制创建/销毁临时位图/canvas/笔刷 }
@@ -49,8 +51,10 @@ type
     FCachePen: POH_Drawing_Pen;      // 描边笔刷（Agg2D 空心/描边文字）
     FCacheW: Integer;   // 缓存位图宽度（物理像素）
     FCacheH: Integer;   // 缓存位图高度
-    { 字符 fallback 字体链（缺 glyph 时备用） }
+    { 字符 fallback 字体链（主字体缺 glyph 时备用） }
     FFallbackTypefaces: array of POH_Drawing_Typeface;
+    FFallbackFonts: array of POH_Drawing_Font;        { 物理字号，绘制用 }
+    FFallbackLogicalFonts: array of POH_Drawing_Font; { 96-DPI 逻辑字号，度量用 }
     { 离屏专用：96-DPI 逻辑字号字体，只用于度量（宽度/字形步进），
       保证同一字体在不同导出 DPI 下度量完全一致（与 native 对齐）。}
     FLogicalFont: POH_Drawing_Font;
@@ -63,6 +67,7 @@ type
     procedure   EnsureLogicalFont;
     procedure   RefreshLogicalMetrics;
     function    MeasureLogicalChar(const ch: string): Single;
+    function    SelectDrawFont(const ch: string; out ADrawFont: POH_Drawing_Font): Single;
     function    EffectiveSF: Double; inline;   { 唯一的缩放取值点 }
     procedure   RefreshMetrics;
     procedure   BuildFallbackTypefaces;
@@ -94,6 +99,8 @@ implementation
 
 uses
   Math, fpg_main, fpg_ohos;
+
+function FrIsCJKChar(const ch: string): Boolean; forward;
 
 { Byte length of one UTF-8 code point, given its first byte.
   Matches the per-character width accumulation used by fpGUI's caret math. }
@@ -330,12 +337,143 @@ end;
 function TfpgOhosAggFontResource.MeasureLogicalChar(const ch: string): Single;
 var
   w: Single;
+  i: Integer;
 begin
+  if FrIsCJKChar(ch) then
+  begin
+    for i := 0 to High(FFallbackLogicalFonts) do
+    begin
+      w := 0;
+      if (FFallbackLogicalFonts[i] <> nil) and
+         (OH_Drawing_FontMeasureText(FFallbackLogicalFonts[i], PChar(ch),
+           Length(ch), TEXT_ENCODING_UTF8, nil, @w) = 0) and (w > 0) then
+        Exit(w);
+    end;
+  end;
   w := 0;
   if FLogicalFont <> nil then
     OH_Drawing_FontMeasureText(FLogicalFont, PChar(ch), Length(ch),
       TEXT_ENCODING_UTF8, nil, @w);
+  if w <= 0 then
+  begin
+    { 主字体缺字形 → CJK/emoji fallback（与窗口路径一致） }
+    for i := 0 to High(FFallbackLogicalFonts) do
+    begin
+      w := 0;
+      if (FFallbackLogicalFonts[i] <> nil) and
+         (OH_Drawing_FontMeasureText(FFallbackLogicalFonts[i], PChar(ch),
+           Length(ch), TEXT_ENCODING_UTF8, nil, @w) = 0) and (w > 0) then
+        Exit(w);
+    end;
+    w := 0;
+  end;
   Result := w;
+end;
+
+{ 主字体（例如应用内置的 arial.ttf）通常只有拉丁字形。CJK 字符一律交给
+  fallback 字体，而不是依赖 measure(0)：某些 OHOS 版本对缺字形返回
+  .notdef 宽度(>0)，会把汉字画成 '?'。 }
+function FrUtf8CodePoint(const s: string): LongWord;
+var
+  b: Byte;
+begin
+  Result := 0;
+  if s = '' then Exit;
+  b := Byte(s[1]);
+  if b < $80 then
+    Result := b
+  else if (b and $E0) = $C0 then
+  begin
+    if Length(s) < 2 then Exit;
+    Result := LongWord(b and $1F) shl 6 or (Byte(s[2]) and $3F);
+  end
+  else if (b and $F0) = $E0 then
+  begin
+    if Length(s) < 3 then Exit;
+    Result := LongWord(b and $0F) shl 12 or
+      LongWord(Byte(s[2]) and $3F) shl 6 or (Byte(s[3]) and $3F);
+  end
+  else if (b and $F8) = $F0 then
+  begin
+    if Length(s) < 4 then Exit;
+    Result := LongWord(b and $07) shl 18 or
+      LongWord(Byte(s[2]) and $3F) shl 12 or
+      LongWord(Byte(s[3]) and $3F) shl 6 or (Byte(s[4]) and $3F);
+  end;
+end;
+
+function FrIsCJKChar(const ch: string): Boolean;
+var
+  cp: LongWord;
+begin
+  cp := FrUtf8CodePoint(ch);
+  Result := ((cp >= $2E80) and (cp <= $9FFF)) or   { radicals, kana, CJK }
+            ((cp >= $AC00) and (cp <= $D7AF)) or   { Hangul }
+            ((cp >= $F900) and (cp <= $FAFF)) or   { CJK compatibility }
+            ((cp >= $FE30) and (cp <= $FE4F)) or   { CJK compatibility forms }
+            ((cp >= $FF00) and (cp <= $FFEF)) or   { fullwidth forms }
+            (cp >= $20000);                        { CJK extensions B+ }
+end;
+
+{ 选择一个能绘制 ch 的字体：主字体优先，缺字形时逐级使用 fallback。
+  返回逻辑宽度（离屏）或物理宽度（窗口路径），与调用点的步进公式一致。 }
+function TfpgOhosAggFontResource.SelectDrawFont(const ch: string;
+  out ADrawFont: POH_Drawing_Font): Single;
+var
+  i: Integer;
+  w: Single;
+begin
+  ADrawFont := FNativeFont;
+  Result := 0;
+  if FOffscreen then
+  begin
+    if FrIsCJKChar(ch) then
+      for i := 0 to High(FFallbackLogicalFonts) do
+      begin
+        w := 0;
+        if (FFallbackLogicalFonts[i] <> nil) and
+           (OH_Drawing_FontMeasureText(FFallbackLogicalFonts[i], PChar(ch),
+             Length(ch), TEXT_ENCODING_UTF8, nil, @w) = 0) and (w > 0) then
+        begin
+          ADrawFont := FFallbackFonts[i];
+          Exit(w);
+        end;
+      end;
+    if FLogicalFont <> nil then
+      OH_Drawing_FontMeasureText(FLogicalFont, PChar(ch), Length(ch),
+        TEXT_ENCODING_UTF8, nil, @Result);
+    if Result > 0 then Exit;
+    for i := 0 to High(FFallbackLogicalFonts) do
+    begin
+      w := 0;
+      if (FFallbackLogicalFonts[i] <> nil) and
+         (OH_Drawing_FontMeasureText(FFallbackLogicalFonts[i], PChar(ch),
+           Length(ch), TEXT_ENCODING_UTF8, nil, @w) = 0) and (w > 0) then
+      begin
+        ADrawFont := FFallbackFonts[i];
+        Exit(w);
+      end;
+    end;
+    Result := 0;
+    Exit;
+  end;
+
+  if FNativeFont <> nil then
+    OH_Drawing_FontMeasureText(FNativeFont, PChar(ch), Length(ch),
+      TEXT_ENCODING_UTF8, nil, @Result);
+  if Result > 0 then Exit;
+  for i := 0 to High(FFallbackFonts) do
+  begin
+    Result := 0;
+    if (FFallbackFonts[i] <> nil) and
+       (OH_Drawing_FontMeasureText(FFallbackFonts[i], PChar(ch), Length(ch),
+         TEXT_ENCODING_UTF8, nil, @Result) = 0) and (Result > 0) then
+    begin
+      ADrawFont := FFallbackFonts[i];
+      Exit;
+    end;
+  end;
+  Result := 0;
 end;
 
 function TfpgOhosAggFontResource.EffectiveSF: Double; inline;
@@ -349,6 +487,8 @@ begin
 end;
 
 procedure TfpgOhosAggFontResource.SetRenderScale(AValue: Double);
+var
+  i: Integer;
 begin
   if AValue <= 0 then
     AValue := 1.0;                 { 允许 72/60 DPI（0.75/0.625）}
@@ -366,11 +506,18 @@ begin
 
   if FNativeFont <> nil then
     OH_Drawing_FontSetTextSize(FNativeFont, FHeight);
+  for i := 0 to High(FFallbackFonts) do
+    if FFallbackFonts[i] <> nil then
+      OH_Drawing_FontSetTextSize(FFallbackFonts[i], FHeight);
 
   { 离屏度量字体：固定 96-DPI 逻辑字号，跨 DPI 度量保持一致 }
   EnsureLogicalFont;
   if FLogicalFont <> nil then
     OH_Drawing_FontSetTextSize(FLogicalFont, Round(FPointSize * 96 / 72));
+  for i := 0 to High(FFallbackLogicalFonts) do
+    if FFallbackLogicalFonts[i] <> nil then
+      OH_Drawing_FontSetTextSize(FFallbackLogicalFonts[i],
+        Round(FPointSize * 96 / 72));
   RefreshLogicalMetrics;
 
   { Invalidate the text cache; next DrawTextToBuffer will rebuild it. }
@@ -400,6 +547,9 @@ begin
     FOffscreen := False;
     FHeight := Round(fd.Size * 96 / 72 * gScaleFactor * gHiDPIScaleFactor);
     FIsBold := fpgFontBold in fd.Attributes;
+    FIsBold := fpgFontBold in fd.Attributes;
+    FIsItalic := fpgFontItalic in fd.Attributes;
+    FBaseFontName := fd.FaceName;
     FFakeBold := FIsBold and (Pos('FontMgr:', dummy) = 0);
     FLogicalFont := nil;
     FLogicalAscent := 0;
@@ -439,6 +589,14 @@ destructor TfpgOhosAggFontResource.Destroy;
 var
   i: Integer;
 begin
+  for i := 0 to High(FFallbackFonts) do
+    if FFallbackFonts[i] <> nil then
+      OH_Drawing_FontDestroy(FFallbackFonts[i]);
+  SetLength(FFallbackFonts, 0);
+  for i := 0 to High(FFallbackLogicalFonts) do
+    if FFallbackLogicalFonts[i] <> nil then
+      OH_Drawing_FontDestroy(FFallbackLogicalFonts[i]);
+  SetLength(FFallbackLogicalFonts, 0);
   for i := 0 to High(FFallbackTypefaces) do
     if FFallbackTypefaces[i] <> nil then
       OH_Drawing_TypefaceDestroy(FFallbackTypefaces[i]);
@@ -467,36 +625,109 @@ procedure TfpgOhosAggFontResource.BuildFallbackTypefaces;
 var
   p, dummy: string;
   tf: POH_Drawing_Typeface;
+  cands, seen: TStringList;
+  i: Integer;
 
   procedure AddTypeface(ATypeface: POH_Drawing_Typeface);
+  var
+    f, lf: POH_Drawing_Font;
   begin
     if ATypeface = nil then Exit;
     SetLength(FFallbackTypefaces, Length(FFallbackTypefaces) + 1);
     FFallbackTypefaces[High(FFallbackTypefaces)] := ATypeface;
+
+    f := OH_Drawing_FontCreate;
+    if f <> nil then
+    begin
+      OH_Drawing_FontSetTypeface(f, ATypeface);
+      OH_Drawing_FontSetTextSize(f, FHeight);
+      if FFakeBold then
+        OH_Drawing_FontSetFakeBoldText(f, True);
+    end;
+    lf := OH_Drawing_FontCreate;
+    if lf <> nil then
+    begin
+      OH_Drawing_FontSetTypeface(lf, ATypeface);
+      OH_Drawing_FontSetTextSize(lf, Round(FPointSize * 96 / 72));
+      if FFakeBold then
+        OH_Drawing_FontSetFakeBoldText(lf, True);
+    end;
+    SetLength(FFallbackFonts, Length(FFallbackFonts) + 1);
+    FFallbackFonts[High(FFallbackFonts)] := f;
+    SetLength(FFallbackLogicalFonts, Length(FFallbackLogicalFonts) + 1);
+    FFallbackLogicalFonts[High(FFallbackLogicalFonts)] := lf;
+  end;
+
+  procedure AddToken(const AToken: string);
+  var
+    path: string;
+  begin
+    if AToken = '' then Exit;
+    path := '';
+    tf := OhosResolveFontToken(AToken, FIsBold, FIsItalic, path);
+    if tf = nil then Exit;
+    if (path <> '') and (seen.IndexOf(path) >= 0) then
+    begin
+      OH_Drawing_TypefaceDestroy(tf);
+      Exit;
+    end;
+    if path <> '' then
+      seen.Add(path);
+    AddTypeface(tf);
   end;
 
 begin
   SetLength(FFallbackTypefaces, 0);
-  { CJK 兜底：FontMgr 家族优先；失败再试应用内置 CJK 文件 }
-  dummy := '';
-  tf := TryLoadSystemTypeface(dummy, FIsBold, False, '');
-  if tf = nil then
-  begin
-    p := OhosResolveFontFile(OhosCJKFontFiles);
-    if p <> '' then
-      tf := OH_Drawing_TypefaceCreateFromFile(PChar(p), 0);
+  SetLength(FFallbackFonts, 0);
+  SetLength(FFallbackLogicalFonts, 0);
+
+  seen := TStringList.Create;
+  try
+    { 1) fonts.ini 的显式映射 / 框架默认优先级 }
+    cands := OhosFontFallbackCandidates(FBaseFontName);
+    try
+      for i := 0 to cands.Count - 1 do
+        AddToken(cands[i]);
+    finally
+      cands.Free;
+    end;
+
+    { 2) 系统 FontMgr 按字符兜底 }
+    tf := OhosTrySystemTypefaceForChar($4E2D, FIsBold, False, p);
+    if tf <> nil then
+    begin
+      if (p <> '') and (seen.IndexOf(p) >= 0) then
+        OH_Drawing_TypefaceDestroy(tf)
+      else
+      begin
+        if p <> '' then
+          seen.Add(p);
+        AddTypeface(tf);
+      end;
+    end;
+
+    { 3) 扫描应用字体目录，最后兜底 }
+    cands := OhosScanAppFontFiles;
+    try
+      for i := 0 to cands.Count - 1 do
+        AddToken(cands[i]);
+    finally
+      cands.Free;
+    end;
+
+    { emoji：FontMgr 家族优先；失败再试应用内置 emoji 文件 }
+    dummy := '';
+    tf := TryLoadEmojiTypeface(dummy);
+    if tf = nil then
+    begin
+      p := OhosResolveFontFile(OhosEmojiFontFiles);
+      if p <> '' then
+        tf := OH_Drawing_TypefaceCreateFromFile(PChar(p), 0);
+    end;
+    AddTypeface(tf);
+  finally
+    seen.Free;
   end;
-  AddTypeface(tf);
-  { emoji：FontMgr 家族优先；失败再试应用内置 emoji 文件 }
-  dummy := '';
-  tf := TryLoadEmojiTypeface(dummy);
-  if tf = nil then
-  begin
-    p := OhosResolveFontFile(OhosEmojiFontFiles);
-    if p <> '' then
-      tf := OH_Drawing_TypefaceCreateFromFile(PChar(p), 0);
-  end;
-  AddTypeface(tf);
 end;
 
 procedure TfpgOhosAggFontResource.RefreshMetrics;
@@ -586,6 +817,7 @@ end;
 function TfpgOhosAggFontResource.GetTextWidth(const txt: string): integer;
 var
   i, clen, total: Integer;
+  j: Integer;
   ch: string;
   textWidth: Single;
   ret: Int32;
@@ -622,7 +854,17 @@ begin
         ret := OH_Drawing_FontMeasureText(FNativeFont, PChar(ch), Length(ch),
           TEXT_ENCODING_UTF8, nil, @textWidth);
         if (ret <> 0) or (textWidth <= 0) then
-          textWidth := FHeight * 3 div 5;
+        begin
+          textWidth := 0;
+          for j := 0 to High(FFallbackFonts) do
+            if (FFallbackFonts[j] <> nil) and
+               (OH_Drawing_FontMeasureText(FFallbackFonts[j], PChar(ch),
+                 Length(ch), TEXT_ENCODING_UTF8, nil, @textWidth) = 0) and
+               (textWidth > 0) then
+              Break;
+          if textWidth <= 0 then
+            textWidth := FHeight * 3 div 5;
+        end;
       end
       else
         textWidth := FHeight * 3 div 5;
@@ -657,6 +899,7 @@ var
   i, clen: Integer;
   ch: string;
   curX, chW: Single;
+  drawFont: POH_Drawing_Font;
 begin
   if (AText = '') or (ABuf = nil) or (FNativeFont = nil) then Exit;
 
@@ -684,20 +927,16 @@ begin
     if clen < 1 then clen := 1;
     if i + clen - 1 > Length(AText) then clen := Length(AText) - i + 1;
     ch := Copy(AText, i, clen);
+    chW := SelectDrawFont(ch, drawFont);
+    if chW <= 0 then
+      if FOffscreen then
+        chW := Round(FPointSize * 96 / 72) * 0.6
+      else
+        chW := FHeight * 0.6;
     if FOffscreen then
-    begin
-      chW := MeasureLogicalChar(ch);
-      if chW <= 0 then
-        chW := Round(FPointSize * 96 / 72) * 0.6;
-      textW := textW + Round(chW) * sf;
-    end
+      textW := textW + Round(chW) * sf
     else
-    begin
-      chW := 0;
-      OH_Drawing_FontMeasureText(FNativeFont, PChar(ch), Length(ch),
-        TEXT_ENCODING_UTF8, nil, @chW);
       textW := textW + chW;
-    end;
     Inc(i, clen);
   end;
   if (textW <= 0) then
@@ -758,7 +997,8 @@ begin
       if i + clen - 1 > Length(AText) then clen := Length(AText) - i + 1;
       ch := Copy(AText, i, clen);
 
-      textBlob := OH_Drawing_TextBlobCreateFromText(PChar(ch), Length(ch), FNativeFont,
+      chW := SelectDrawFont(ch, drawFont);
+      textBlob := OH_Drawing_TextBlobCreateFromText(PChar(ch), Length(ch), drawFont,
         TEXT_ENCODING_UTF8);
       if textBlob <> nil then
       begin
@@ -766,12 +1006,6 @@ begin
         OH_Drawing_TextBlobDestroy(textBlob);
       end;
 
-      chW := 0;
-      if FOffscreen then
-        chW := MeasureLogicalChar(ch)
-      else
-        OH_Drawing_FontMeasureText(FNativeFont, PChar(ch), Length(ch),
-          TEXT_ENCODING_UTF8, nil, @chW);
       { Step in physical pixels. Offscreen uses the logical width (integer),
         exactly matching GetTextWidth (sum of Round(chWlogical)). }
       if FOffscreen then
@@ -1175,6 +1409,7 @@ end;
 procedure TfpgOhosAggFontResource.SetTextSize(APtSize: Integer);
 var
   physH: Integer;
+  i: Integer;
 begin
   { Convert pt → physical px (same formula as constructor):
     logical px = APtSize * 96/72 (pt→px);
@@ -1206,6 +1441,9 @@ begin
 
   if FNativeFont <> nil then
     OH_Drawing_FontSetTextSize(FNativeFont, physH);
+  for i := 0 to High(FFallbackFonts) do
+    if FFallbackFonts[i] <> nil then
+      OH_Drawing_FontSetTextSize(FFallbackFonts[i], physH);
 
   { Invalidate the cache bitmap — its size was computed from the old
     metrics (bmpH = FAscent + FDescent), and the DrawTextToBuffer call

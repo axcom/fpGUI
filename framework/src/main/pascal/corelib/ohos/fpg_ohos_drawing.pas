@@ -345,7 +345,7 @@ function OH_Drawing_FontMgrMatchFamilyStyle(fontMgr: POH_Drawing_FontMgr;
   cdecl; external LIB_DRAWING;
 function OH_Drawing_FontMgrMatchFamilyStyleCharacter(fontMgr: POH_Drawing_FontMgr;
   familyName: PChar; fontStyle: TOH_Drawing_FontStyleStruct;
-  bcp47: PChar; bcp47Count: Int32; character: Int32): POH_Drawing_Typeface;
+  bcp47: PPChar; bcp47Count: Int32; character: Int32): POH_Drawing_Typeface;
   cdecl; external LIB_DRAWING;
 function OH_Drawing_FontStyleSetGetStyle(fontStyleSet: POH_Drawing_FontStyleSet;
   index: Int32; styleName: PPChar): TOH_Drawing_FontStyleStruct;

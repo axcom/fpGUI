@@ -120,6 +120,7 @@ type
     FIsBold: Boolean;
     FIsItalic: Boolean;
     FIsUnderline: Boolean;
+    FBaseFontName: string;         { FontDesc 的 FaceName，用于 fonts.ini 映射 }
     FNativeFont: POH_Drawing_Font;
     FNativeTypeface: POH_Drawing_Typeface;
     FNativeTypefacePath: string;   { 主 typeface 来源（'FontMgr:xxx' 或文件路径）}
@@ -129,9 +130,6 @@ type
     FMetrics: TOH_Drawing_FontMetrics;
     FFallbackTypefaces: array of POH_Drawing_Typeface;  { CJK 兜底 + emoji }
     FFallbackFonts: array of POH_Drawing_Font;          { 平行于 typefaces（同 FHeight）}
-    FPointSize: Double;        { 原始 point size（不含任何 DPI 缩放）}
-    FRenderScale: Double;      { 默认 1.0；离屏时 = ADPI/96 }
-    FOffscreen: Boolean;       { False = 原 UI 路径；True = 离屏统一契约 }
     procedure   BuildFallbackChain;       { 探测构建 fallback 字体链 }
     function    ResolveFallbackWidth(const ch: string; var AWidth: Single): Boolean;
     function    ResolveFallbackFont(const ch: string;
@@ -145,8 +143,6 @@ type
     function  GetHeight: Integer; override;
     function  GetTextWidth(const txt: string): Integer; override;
     function  HandleIsValid: boolean; override;
-    procedure SetRenderScale(AValue: Double);
-    property  RenderScale: Double read FRenderScale write SetRenderScale;
     property  NativeFont: POH_Drawing_Font read FNativeFont;
     property  IsBold: Boolean read FIsBold;
     property  IsItalic: Boolean read FIsItalic;
@@ -203,11 +199,6 @@ type
       避免非 AGG 路径在句柄切换后残留 EGLSurface/纹理。 }
     FLastGLHandle: TfpgWinHandle;
     {$endif}
-    { 离屏模式（frfpg 报表导出）：尺寸只存物理请求值，逻辑尺寸/尺度由 DPI 派生 }
-    FOffscreen: Boolean;
-    FOffscreenWidth: Integer;    // physical pixels (requested)
-    FOffscreenHeight: Integer;   // physical pixels (requested)
-    FOffscreenDPI: Integer;      // ADPI; scale = DPI / 96
     procedure   DoSetFontRes(fntres: TfpgFontResourceBase); override;
     procedure   DoSetTextColor(cl: TfpgColor); override;
     procedure   DoSetColor(cl: TfpgColor); override;
@@ -225,11 +216,6 @@ type
     function    DoGetClipRect: TfpgRect; override;
     procedure   DoAddClipRect(const ARect: TfpgRect); override;
     procedure   DoClearClipRect; override;
-    procedure   DoGetWinRect(out r: TfpgRect); override;
-    function    OffscreenScale: Single; inline;
-    function    OffscreenLogicalRect: TfpgRect;
-    function    ScaleX: Single; inline;
-    function    ScaleY: Single; inline;
     procedure   DoBeginDraw(awidget: TfpgWidgetBase; CanvasTarget: TfpgCanvasBase); override;
     procedure   DoPutBufferToScreen(x, y, w, h: TfpgCoord); override;
     procedure   DoEndDraw; override;
@@ -247,10 +233,6 @@ type
     function    GetBitmapWidth: Integer;
     function    GetBitmapHeight: Integer;
     function    GetBitmapPixels: Pointer;
-    procedure   CreateOffscreen(AWidth, AHeight, ADPI: Integer);
-    procedure   ReleaseOffscreen;
-    procedure   ReadPixelsBGRA(ADest: PByte; ADestStride: Integer;
-      AUnpremultiply: Boolean = True);
     procedure   DrawString(x, y: TfpgCoord; const txt: string); override;
     procedure   CopyRect(ADest_x, ADest_y: TfpgCoord; ASrcCanvas: TfpgCanvasBase; var ASrcRect: TfpgRect); override;
     procedure   GradientFill(ARect: TfpgRect; AStart, AStop: TfpgColor; ADirection: TGradientDirection); override;
@@ -632,6 +614,23 @@ function OhosFontExists(const APath: string): Boolean;
 function OhosFindFontFile(const AName: string): string;
 { 按序解析候选（绝对路径直接探测；相对名走 OhosFindFontFile） }
 function OhosResolveFontFile(const ACandidates: array of string): string;
+{ 读取 resfile/fonts.ini，返回 ABaseFont 的 CJK fallback 候选（调用者释放）。
+  没有 fonts.ini / 没有匹配项时返回框架默认列表。 }
+function OhosFontFallbackCandidates(const ABaseFont: string): TStringList;
+{ 把一个候选解析成 typeface。候选可以是：
+  - 沙箱字体文件名：'simsun.ttc'、'simsun.ttc#1'
+  - 沙箱字体完整路径
+  - 系统字体家族名：'HarmonyOS Sans SC'
+  调用者负责 OH_Drawing_TypefaceDestroy。 }
+function OhosResolveFontToken(const AToken: string; ABold, AItalic: Boolean;
+  out APath: string): POH_Drawing_Typeface;
+{ 让系统 FontMgr 按字符找一个可以绘制 AChar 的 typeface。
+  用于 /system/fonts 路径不可读的设备。调用者负责销毁。 }
+function OhosTrySystemTypefaceForChar(AChar: LongWord; ABold, AItalic: Boolean;
+  out APath: string): POH_Drawing_Typeface;
+{ 扫描应用字体目录中的 .ttf/.ttc，返回完整路径列表（调用者释放）。 }
+function OhosScanAppFontFiles: TStringList;
+
 { fpGUI 默认家族（'Sans' 等）→ 鸿蒙中文默认家族（SC 存在优先，否则 Sans） }
 function OhosMapDefaultFaceName(const AFaceName: string): string;
 
@@ -851,10 +850,8 @@ const
     OhosFindFontFile）。系统字体一律经 FontMgr 家族接口使用（family name），
     禁止按路径读取系统字体文件（/system/fonts 等）。
     注意：系统无独立 Bold 文件——粗体由 FontMgr style 或 fake bold 合成。 }
-  OhosCJKFontFiles: array[0..2] of string = (
-    'HarmonyOS_Sans_SC.ttf',       { 鸿蒙中文（简）优先（应用 resfile 随包）}
-    'HarmonyOS_Sans.ttf',
-    'NotoSansCJK-Regular.ttc'
+  OhosCJKFontFiles: array[0..0] of string = (
+    ''  { framework default: app fonts come from fonts.ini / resfile scan }
   );
   OhosItalicFontFiles: array[0..1] of string = (
     'HarmonyOS_Sans_Italic.ttf',
@@ -888,11 +885,13 @@ uses
   ;
 
 { 前向声明（TfpgOhosApplication.Create 启动期调用，定义在文件后部）}
-procedure DumpFontFamilies; forward;
 procedure OhosLoadSystemFontConfig; forward;
+procedure LoadFontFallbackConfig; forward;
 { 字体路径/字体名扫描（字体选择对话框列表用；定义在文件后部）}
 function OhosAppFontDirs: TStringList; forward;
 function OhosScanAppFontNames: TStringList; forward;
+function OhosDefaultFallbackTypeface(ABold, AItalic: Boolean;
+  out APath: string): POH_Drawing_Typeface; forward;
 
 { 文本绘制诊断标志（首例 TextBlob 创建结果打印一次）}
 var
@@ -1645,6 +1644,11 @@ begin
   finally
     OH_Drawing_FontMgrDestroy(mgr);
   end;
+
+  { 3) 系统家族链没有命中时，按字符向 FontMgr 要一个能画“中”的 typeface。
+    这是 /system/fonts 目录不可读时唯一可靠的系统字体回退方式。 }
+  if Result = nil then
+    Result := OhosTrySystemTypefaceForChar($4E2D, AIsBold, AIsItalic, APath);
 end;
 
 { FontMgr 家族枚举：命中含 'emoji' 的家族 → 创建 typeface（官方家族接口，
@@ -1760,33 +1764,6 @@ begin
   end;
 end;
 
-procedure TfpgOhosFontResource.SetRenderScale(AValue: Double);
-var
-  i: Integer;
-begin
-  if AValue <= 0 then
-    AValue := 1.0;                 { 允许 72/60 DPI（0.75/0.625）}
-  if FOffscreen and (FRenderScale = AValue) then
-    Exit;
-
-  FRenderScale := AValue;
-  FOffscreen := True;
-
-  { Native text is rendered through the OHOS canvas transform. Keep the
-    native font at 96-DPI logical size; CanvasScale=ADPI/96 maps it to
-    physical pixels. Metrics therefore stay logical. }
-  FHeight := Round(FPointSize * 96 / 72);
-
-  if FNativeFont <> nil then
-    OH_Drawing_FontSetTextSize(FNativeFont, FHeight);
-
-  for i := 0 to High(FFallbackFonts) do
-    if FFallbackFonts[i] <> nil then
-      OH_Drawing_FontSetTextSize(FFallbackFonts[i], FHeight);
-
-  RefreshMetrics;
-end;
-
 constructor TfpgOhosFontResource.Create(const afontdesc: string);
 var
   fd: TfpgFontDefinition;
@@ -1797,14 +1774,12 @@ begin
   try
     { Font height in LOGICAL units. Canvas has CanvasScale(gScaleFactor)
       applied, so the font renders at fd.Size * gScaleFactor physical pixels. }
-    FPointSize := fd.Size;
-    FRenderScale := 1.0;
-    FOffscreen := False;
     FHeight := Round(fd.Size * 96 / 72 * gScaleFactor);
     //FHeight := fd.Size;
     FIsBold := fpgFontBold in fd.Attributes;
     FIsItalic := fpgFontItalic in fd.Attributes;
     FIsUnderline := fpgFontUnderline in fd.Attributes;
+    FBaseFontName := fd.FaceName;
     FMetricsValid := False;
     FillChar(FMetrics, SizeOf(FMetrics), 0);
 
@@ -1848,6 +1823,9 @@ procedure TfpgOhosFontResource.BuildFallbackChain;
 var
   p: string;
   tf: POH_Drawing_Typeface;
+  cands: TStringList;
+  seen: TStringList;
+  i: Integer;
 
   procedure AddTypefaceFont(ATypeface: POH_Drawing_Typeface; AIsBold: Boolean);
   var
@@ -1871,30 +1849,77 @@ var
     FFallbackFonts[High(FFallbackFonts)] := f;
   end;
 
-begin
-  { CJK 兜底：FontMgr 家族优先（与主字体同家族时去重跳过）}
-  p := '';
-  tf := TryLoadSystemTypeface(p, FIsBold, FIsItalic, '');
-  if (tf <> nil) and (p <> FNativeTypefacePath) then
-    AddTypefaceFont(tf, False)
-  else
+  procedure AddToken(const AToken: string);
+  var
+    path: string;
   begin
-    if tf <> nil then
+    if AToken = '' then Exit;
+    path := '';
+    tf := OhosResolveFontToken(AToken, FIsBold, FIsItalic, path);
+    if tf = nil then Exit;
+    if (path <> '') and (path = FNativeTypefacePath) then
+    begin
       OH_Drawing_TypefaceDestroy(tf);
-    p := OhosResolveFontFile(OhosCJKFontFiles);
-    if (p <> '') and (p <> FNativeTypefacePath) then
-      AddTypefaceFont(OH_Drawing_TypefaceCreateFromFile(PChar(p), 0), FIsBold);
+      Exit;
+    end;
+    if (path <> '') and (seen.IndexOf(path) >= 0) then
+    begin
+      OH_Drawing_TypefaceDestroy(tf);
+      Exit;
+    end;
+    if path <> '' then
+      seen.Add(path);
+    AddTypefaceFont(tf, FIsBold and (Pos('FontMgr:', path) <> 1));
   end;
-  { emoji：FontMgr 家族优先；失败再试应用内置 emoji 文件 }
-  p := '';
-  tf := TryLoadEmojiTypeface(p);
-  if tf <> nil then
-    AddTypefaceFont(tf, False)
-  else
-  begin
-    p := OhosResolveFontFile(OhosEmojiFontFiles);
-    if p <> '' then
-      AddTypefaceFont(OH_Drawing_TypefaceCreateFromFile(PChar(p), 0), False);
+
+begin
+  { 1) fonts.ini 的显式映射 / 框架默认优先级 }
+  seen := TStringList.Create;
+  try
+    cands := OhosFontFallbackCandidates(FBaseFontName);
+    try
+      for i := 0 to cands.Count - 1 do
+        AddToken(cands[i]);
+    finally
+      cands.Free;
+    end;
+
+    { 2) 系统 FontMgr 按字符兜底 }
+    tf := OhosTrySystemTypefaceForChar($4E2D, FIsBold, FIsItalic, p);
+    if tf <> nil then
+    begin
+      if (p <> '') and (seen.IndexOf(p) >= 0) then
+        OH_Drawing_TypefaceDestroy(tf)
+      else
+      begin
+        if p <> '' then
+          seen.Add(p);
+        AddTypefaceFont(tf, False);
+      end;
+    end;
+
+    { 3) 扫描应用字体目录，最后兜底 }
+    cands := OhosScanAppFontFiles;
+    try
+      for i := 0 to cands.Count - 1 do
+        AddToken(cands[i]);
+    finally
+      cands.Free;
+    end;
+
+    { emoji：FontMgr 家族优先；失败再试应用内置 emoji 文件 }
+    p := '';
+    tf := TryLoadEmojiTypeface(p);
+    if tf <> nil then
+      AddTypefaceFont(tf, False)
+    else
+    begin
+      p := OhosResolveFontFile(OhosEmojiFontFiles);
+      if p <> '' then
+        AddTypefaceFont(OH_Drawing_TypefaceCreateFromFile(PChar(p), 0), False);
+    end;
+  finally
+    seen.Free;
   end;
 end;
 
@@ -2152,207 +2177,6 @@ end;
   TfpgOhosCanvas
   --------------------------------------------------------------------- }
 
-function TfpgOhosCanvas.OffscreenScale: Single; inline;
-begin
-  if FOffscreenDPI > 0 then
-    Result := FOffscreenDPI / 96
-  else
-    Result := 1.0;
-end;
-
-function TfpgOhosCanvas.OffscreenLogicalRect: TfpgRect;
-begin
-  { Integer ceil, not Round: the caller computes WPhys=Round(WLog*s), so
-    dividing back can lose 1px (e.g. 100*0.625 -> 62 -> 62/0.625 = 99.2).
-    A slightly larger logical rect is harmless (canvas still clips to bitmap). }
-  if FOffscreenDPI > 0 then
-    Result.SetRect(0, 0,
-      (FOffscreenWidth * 96 + FOffscreenDPI - 1) div FOffscreenDPI,
-      (FOffscreenHeight * 96 + FOffscreenDPI - 1) div FOffscreenDPI)
-  else
-    Result.SetRect(0, 0, FOffscreenWidth, FOffscreenHeight);
-end;
-
-function TfpgOhosCanvas.ScaleX: Single; inline;
-begin
-  if FOffscreen then
-    Result := OffscreenScale
-  else
-    Result := gScaleFactorX;
-end;
-
-function TfpgOhosCanvas.ScaleY: Single; inline;
-begin
-  if FOffscreen then
-    Result := OffscreenScale
-  else
-    Result := gScaleFactorY;
-end;
-
-procedure TfpgOhosCanvas.CreateOffscreen(AWidth, AHeight, ADPI: Integer);
-var
-  fmt: TOH_Drawing_BitmapFormat;
-  scale: Single;
-begin
-  if FSaveCount <> 0 then
-    raise Exception.Create('TfpgOhosCanvas.CreateOffscreen: canvas is in use');
-
-  if AWidth < 1 then AWidth := 1;
-  if AHeight < 1 then AHeight := 1;
-  if ADPI < 1 then ADPI := 96;
-  scale := ADPI / 96;
-
-  { Recreate both objects: guarantees a clean matrix/clip/save state. }
-  if FCanvas <> nil then
-  begin
-    OH_Drawing_CanvasDestroy(FCanvas);
-    FCanvas := nil;
-  end;
-  if FBitmap <> nil then
-  begin
-    OH_Drawing_BitmapDestroy(FBitmap);
-    FBitmap := nil;
-  end;
-
-  FCanvas := OH_Drawing_CanvasCreate();
-  FBitmap := OH_Drawing_BitmapCreate();
-  if (FCanvas = nil) or (FBitmap = nil) then
-    raise Exception.Create('TfpgOhosCanvas.CreateOffscreen: allocation failed');
-
-  fmt.colorFormat := COLOR_FORMAT_RGBA_8888;
-  fmt.alphaFormat := ALPHA_FORMAT_PREMUL;
-  OH_Drawing_BitmapBuild(FBitmap, AWidth, AHeight, @fmt);
-  OH_Drawing_CanvasBind(FCanvas, FBitmap);
-
-  { Logical coordinate system: same as 96-DPI design coordinates.
-    CanvasScale maps logical -> physical; matches font RenderScale. }
-  OH_Drawing_CanvasScale(FCanvas, scale, scale);
-  OH_Drawing_CanvasClear(FCanvas, $00000000);
-
-  FOffscreenWidth := AWidth;
-  FOffscreenHeight := AHeight;
-  FOffscreenDPI := ADPI;
-  FOffscreen := True;
-  FClipDepth := 0;
-  { Keep "unassigned": the base BeginDraw then goes through ClearClipRect
-    (offscreen branch) instead of dereferencing FWidget. }
-  FClipRect.Clear;
-  FDeltaX := 0;
-  FDeltaY := 0;
-end;
-
-procedure TfpgOhosCanvas.ReleaseOffscreen;
-begin
-  if not FOffscreen then
-    Exit;
-
-  FOffscreen := False;
-  FOffscreenWidth := 0;
-  FOffscreenHeight := 0;
-  FOffscreenDPI := 0;
-
-  if FCanvas <> nil then
-  begin
-    OH_Drawing_CanvasDestroy(FCanvas);
-    FCanvas := nil;
-  end;
-  if FBitmap <> nil then
-  begin
-    OH_Drawing_BitmapDestroy(FBitmap);
-    FBitmap := nil;
-  end;
-
-  FClipDepth := 0;
-  FClipRect.Clear;
-end;
-
-procedure TfpgOhosCanvas.ReadPixelsBGRA(ADest: PByte; ADestStride: Integer;
-  AUnpremultiply: Boolean);
-var
-  Info: TOH_Drawing_Image_Info;
-  Tmp: array of Byte;
-  TmpStride, BmpW, BmpH, x, y: Integer;
-  Src, SRow, DRow: PByte;
-  R, G, B, A: Byte;
-  RR, GG, BB: Cardinal;
-  SrcIsUnpremul: Boolean;
-
-  procedure CopyRow(S: PByte; D: PByte; ACount: Integer);
-  var
-    i: Integer;
-  begin
-    for i := 0 to ACount - 1 do
-    begin
-      R := S[0];
-      G := S[1];
-      B := S[2];
-      A := S[3];
-
-      if A = 0 then
-      begin
-        R := 0;
-        G := 0;
-        B := 0;
-      end
-      else if (not SrcIsUnpremul) and AUnpremultiply and (A < 255) then
-      begin
-        RR := (Cardinal(R) * 255 + A div 2) div A;
-        GG := (Cardinal(G) * 255 + A div 2) div A;
-        BB := (Cardinal(B) * 255 + A div 2) div A;
-        if RR > 255 then RR := 255;
-        if GG > 255 then GG := 255;
-        if BB > 255 then BB := 255;
-        R := Byte(RR);
-        G := Byte(GG);
-        B := Byte(BB);
-      end;
-
-      { RGBA_8888 -> fpGUI/TfpgImage BGRA byte order. }
-      D[0] := B;
-      D[1] := G;
-      D[2] := R;
-      D[3] := A;
-
-      Inc(S, 4);
-      Inc(D, 4);
-    end;
-  end;
-
-begin
-  if (ADest = nil) or (FBitmap = nil) then
-    Exit;
-
-  BmpW := Integer(OH_Drawing_BitmapGetWidth(FBitmap));
-  BmpH := Integer(OH_Drawing_BitmapGetHeight(FBitmap));
-  if (BmpW <= 0) or (BmpH <= 0) then
-    Exit;
-
-  if ADestStride = 0 then
-    ADestStride := BmpW * 4;
-
-  SrcIsUnpremul := True;
-  TmpStride := BmpW * 4;
-  SetLength(Tmp, TmpStride * BmpH);
-  Info.width := BmpW;
-  Info.height := BmpH;
-  Info.colorType := COLOR_FORMAT_RGBA_8888;
-  Info.alphaType := ALPHA_FORMAT_UNPREMUL;
-
-  { Path 1 only: OH_Drawing_BitmapReadPixels (API 12) handles stride and
-    GPU-backed bitmaps. GetPixels+GetRowBytes is NOT used (GetRowBytes is
-    API 26 and our compatible SDK is 20). }
-  if not OH_Drawing_BitmapReadPixels(FBitmap, @Info, @Tmp[0], TmpStride, 0, 0) then
-    Exit;
-  Src := @Tmp[0];
-
-  for y := 0 to BmpH - 1 do
-  begin
-    SRow := Src + y * TmpStride;
-    DRow := ADest + y * ADestStride;
-    CopyRow(SRow, DRow, BmpW);
-  end;
-end;
-
 constructor TfpgOhosCanvas.Create(awidget: TfpgWidgetBase);
 begin
   inherited Create(awidget);
@@ -2371,10 +2195,6 @@ begin
   {$ifdef GLPresenter}
   FLastGLHandle := nil;
   {$endif}
-  FOffscreen := False;
-  FOffscreenWidth := 0;
-  FOffscreenHeight := 0;
-  FOffscreenDPI := 0;
   FDeltaX := 0;
   FDeltaY := 0;
 end;
@@ -2513,10 +2333,10 @@ begin
   stride := bw * 4;
 
   { Logical rect (incl. canvas offset) → physical bitmap pixels. }
-  x0 := Round((x + FDeltaX) * ScaleX);
-  y0 := Round((y + FDeltaY) * ScaleY);
-  x1 := Round((x + FDeltaX + w) * ScaleX) - 1;
-  y1 := Round((y + FDeltaY + h) * ScaleY) - 1;
+  x0 := Round((x + FDeltaX) * gScaleFactorX);
+  y0 := Round((y + FDeltaY) * gScaleFactorY);
+  x1 := Round((x + FDeltaX + w) * gScaleFactorX) - 1;
+  y1 := Round((y + FDeltaY + h) * gScaleFactorY) - 1;
   if x0 < 0 then x0 := 0;
   if y0 < 0 then y0 := 0;
   if x1 >= Integer(bw) then x1 := Integer(bw) - 1;
@@ -2694,12 +2514,8 @@ begin
       { FFont 非 OHOS 资源/资源缺 typeface 时的兜底：进程级单例，
         仅首次创建，后续绘制直接复用。 }
       if gFallbackTypeface = nil then
-      begin
-        gFallbackTypefacePath := OhosResolveFontFile(OhosCJKFontFiles);
-        if gFallbackTypefacePath <> '' then
-          gFallbackTypeface := OH_Drawing_TypefaceCreateFromFile(
-            PChar(gFallbackTypefacePath), 0);
-      end;
+        gFallbackTypeface := OhosDefaultFallbackTypeface(False, False,
+          gFallbackTypefacePath);
       lTypeface := gFallbackTypeface;   { ownTypeface 恒 False：进程级单例不销毁 }
     end;
     if lTypeface <> nil then
@@ -2788,10 +2604,7 @@ begin
     their parent, and for tab labels that exceed the control width). }
   native := ARect;
   native.OffsetRect(FDeltaX, FDeltaY);
-  if FOffscreen then
-    wRect := OffscreenLogicalRect
-  else
-    wRect := GetWidgetWindowRect;
+  wRect := GetWidgetWindowRect;
   native.IntersectRect(native, wRect);
   { SetClipRect = REPLACE semantics: drop any active clip saves first }
   if FClipDepth > 0 then
@@ -2836,19 +2649,8 @@ begin
   { Match X11 behavior: ClearClipRect resets clip to widget bounds
     instead of removing all clipping. This prevents tab labels and
     other child drawings from overflowing beyond the control area. }
-  if FOffscreen then
-    r := OffscreenLogicalRect
-  else
-    r.SetRect(0, 0, FWidget.ActualWidth, FWidget.ActualHeight);
+  r.SetRect(0, 0, FWidget.ActualWidth, FWidget.ActualHeight);
   DoSetClipRectInternal(r);
-end;
-
-procedure TfpgOhosCanvas.DoGetWinRect(out r: TfpgRect);
-begin
-  if FOffscreen then
-    r := OffscreenLogicalRect
-  else
-    inherited DoGetWinRect(r);
 end;
 
 procedure TfpgOhosCanvas.DoBeginDraw(awidget: TfpgWidgetBase; CanvasTarget: TfpgCanvasBase);
@@ -2860,13 +2662,6 @@ var
   ohosTarget: TfpgOhosCanvas;
   curW,curH,needW,needH: integer;
 begin
-  if FOffscreen then
-  begin
-    if FBitmap = nil then
-      CreateOffscreen(FOffscreenWidth, FOffscreenHeight, FOffscreenDPI);
-    Exit;
-  end;
-
   { Child widget: share parent canvas/bitmap with offset }
   if (CanvasTarget <> nil) and (CanvasTarget <> Self) then
   begin
@@ -3110,7 +2905,6 @@ var
   dx, dy: TfpgCoord;
   widgetX, widgetY, widgetW, widgetH: Integer; }
 begin
-  if FOffscreen then Exit;
   {$ifdef GLPresenter}
   if TryPresentGL then Exit;
   {$endif}
@@ -3316,7 +3110,6 @@ end;
 procedure TfpgOhosCanvas.DoEndDraw;
 var n: Integer;
 begin
-  if FOffscreen then Exit;
   if FSaveCount <> 0 then
   begin
    // 恢复原生画布状态
@@ -3404,8 +3197,8 @@ begin
   if px = nil then Exit;
   bw := OH_Drawing_BitmapGetWidth(FBitmap);
   bh := OH_Drawing_BitmapGetHeight(FBitmap);
-  sx := Round((X + FDeltaX) * ScaleX);
-  sy := Round((Y + FDeltaY) * ScaleY);
+  sx := Round((X + FDeltaX) * gScaleFactorX);
+  sy := Round((Y + FDeltaY) * gScaleFactorY);
   if (sx < 0) or (sy < 0) or (sx >= bw) or (sy >= bh) then Exit;
   stride := bw * 4;
   v := PLongWord(PByte(px) + sy * stride + sx * 4)^;
@@ -3426,8 +3219,8 @@ begin
   if px = nil then Exit;
   bw := OH_Drawing_BitmapGetWidth(FBitmap);
   bh := OH_Drawing_BitmapGetHeight(FBitmap);
-  sx := Round((X + FDeltaX) * ScaleX);
-  sy := Round((Y + FDeltaY) * ScaleY);
+  sx := Round((X + FDeltaX) * gScaleFactorX);
+  sy := Round((Y + FDeltaY) * gScaleFactorY);
   { Bounds check: negative or oversized coordinates must not write outside
     the bitmap (unlike the hybrid canvas this one had no guard). }
   if (sx < 0) or (sy < 0) or (sx >= bw) or (sy >= bh) then Exit;
@@ -3439,9 +3232,9 @@ begin
   { FPG: 逻辑像素 = 物理像元——HiDPI 下 1 个逻辑像素应覆盖整格（与画布矩阵对
     填充矩形的缩放语义一致）。只写单点会让逐像素绘制（VT 背景 BitBlt 垫片、
     点线框、拉伸回退等）在 2x 屏上呈稀疏点阵（Speed 页背景发糊）。 }
-  cellW := Round(ScaleX);
+  cellW := Round(gScaleFactorX);
   if cellW < 1 then cellW := 1;
-  cellH := Round(ScaleY);
+  cellH := Round(gScaleFactorY);
   if cellH < 1 then cellH := 1;
   for pyy := sy to sy + cellH - 1 do
   begin
@@ -3483,8 +3276,8 @@ begin
   { Source rect is in the SOURCE canvas bitmap pixel space; use the source
     canvas scale (which may differ from ours across DPI). Dest rect is
     logical: this canvas carries its own CanvasScale transform. }
-  sRect := OH_Drawing_RectCreate(ASrcRect.Left * src.ScaleX, ASrcRect.Top * src.ScaleY,
-    (ASrcRect.Right + 1) * src.ScaleX, (ASrcRect.Bottom + 1) * src.ScaleY);
+  sRect := OH_Drawing_RectCreate(ASrcRect.Left * gScaleFactorX, ASrcRect.Top * gScaleFactorY,
+    (ASrcRect.Right + 1) * gScaleFactorX, (ASrcRect.Bottom + 1) * gScaleFactorY);
   dRect := OH_Drawing_RectCreate(ADest_x, ADest_y, ADest_x + w, ADest_y + h);
   OH_Drawing_CanvasDrawBitmapRect(FCanvas, srcBmp, sRect, dRect, nil);
   OH_Drawing_RectDestroy(dRect);
@@ -3510,10 +3303,10 @@ begin
   stride := bw * 4;
 
   { Logical rect (incl. canvas offset) → physical bitmap pixels. }
-  x0 := Round((ARect.Left   + FDeltaX) * ScaleX);
-  y0 := Round((ARect.Top    + FDeltaY) * ScaleY);
-  x1 := Round((ARect.Right  + 1 + FDeltaX) * ScaleX) - 1;
-  y1 := Round((ARect.Bottom + 1 + FDeltaY) * ScaleY) - 1;
+  x0 := Round((ARect.Left   + FDeltaX) * gScaleFactorX);
+  y0 := Round((ARect.Top    + FDeltaY) * gScaleFactorY);
+  x1 := Round((ARect.Right  + 1 + FDeltaX) * gScaleFactorX) - 1;
+  y1 := Round((ARect.Bottom + 1 + FDeltaY) * gScaleFactorY) - 1;
   if x0 < 0 then x0 := 0;
   if y0 < 0 then y0 := 0;
   if x1 >= Integer(bw) then x1 := Integer(bw) - 1;
@@ -3610,15 +3403,6 @@ var
   winRect: TfpgRect;
   fmt: TOH_Drawing_BitmapFormat;
 begin
-  if FOffscreen then
-  begin
-    if (FBitmap = nil) or
-       (Integer(OH_Drawing_BitmapGetWidth(FBitmap)) <> FOffscreenWidth) or
-       (Integer(OH_Drawing_BitmapGetHeight(FBitmap)) <> FOffscreenHeight) then
-      CreateOffscreen(FOffscreenWidth, FOffscreenHeight, FOffscreenDPI);
-    Exit;
-  end;
-
   if FCanvas <> nil then begin OH_Drawing_CanvasDestroy(FCanvas); FCanvas := nil; end;
   if FBitmap <> nil then begin OH_Drawing_BitmapDestroy(FBitmap); FBitmap := nil; end;
   FCanvas := OH_Drawing_CanvasCreate();
@@ -4330,10 +4114,9 @@ begin
   { 动态分发：注入主循环唤醒 + 结果回传（WakeChannel 就绪后）}
   if assigned(gDispatchUIThreadId) then gDispatchUIThreadId(GetCurrentThreadId); { 当前即 fpGUI 主线程 }
   FIsInitialized := True;
-  { 启动调试：打印 FontMgr 家族清单（前 25 个），用于校准 CJK 匹配/默认映射 }
-  DumpFontFamilies;
   { 系统字体配置：权威字体目录 + 默认家族（版本/厂商无关）}
   OhosLoadSystemFontConfig;
+  LoadFontFallbackConfig;
   { WakeMainThread disabled for OHOS: FPC target does not support
     class method as procedure-of-object, and TMethod(Code, nil) hack
     causes instability. The event loop uses fpSelect on wake pipe
@@ -8355,29 +8138,320 @@ begin
 end;
 
 { 启动调试：打印 FontMgr 家族清单（前 25 个）——校准 CJK 匹配与默认映射 }
-procedure DumpFontFamilies;
+var
+  gFontFallbackConfig: TStringList = nil;
+  gFontFallbackConfigLoaded: Boolean = False;
+
+procedure LoadFontFallbackConfig;
+var
+  L: TStringList;
+  p, line, key, val: string;
+  i, eq: Integer;
+begin
+  if gFontFallbackConfigLoaded then Exit;
+  if gFontFallbackConfig = nil then
+  begin
+    gFontFallbackConfig := TStringList.Create;
+    gFontFallbackConfig.CaseSensitive := False;
+    gFontFallbackConfig.NameValueSeparator := '=';
+  end;
+  p := OhosFindFontFile('fonts.ini');
+  if p = '' then Exit;   { 资源目录尚未就绪时不要固化；下次再试 }
+  gFontFallbackConfigLoaded := True;
+  fpGUI_Hilog(LOG_INFO, 'FONT FALLBACK CONFIG: ' + p);
+  L := TStringList.Create;
+  try
+    L.LoadFromFile(p);
+    for i := 0 to L.Count - 1 do
+    begin
+      line := Trim(L[i]);
+      if (line = '') or (line[1] = '#') or (line[1] = ';') then Continue;
+      eq := Pos('=', line);
+      if eq <= 1 then Continue;
+      key := Trim(Copy(line, 1, eq - 1));
+      val := Trim(Copy(line, eq + 1, MaxInt));
+      if key <> '' then
+        gFontFallbackConfig.Values[key] := val;
+    end;
+  finally
+    L.Free;
+  end;
+end;
+
+procedure AddCommaCandidates(const AValue: string; AList: TStringList);
+var
+  S, T: string;
+  P: Integer;
+begin
+  S := AValue;
+  repeat
+    P := Pos(',', S);
+    if P > 0 then
+    begin
+      T := Trim(Copy(S, 1, P - 1));
+      Delete(S, 1, P);
+    end
+    else
+    begin
+      T := Trim(S);
+      S := '';
+    end;
+    if T <> '' then
+      AList.Add(T);
+  until P = 0;
+end;
+
+function OhosFontFallbackCandidates(const ABaseFont: string): TStringList;
+var
+  idx, idxDefault, i: Integer;
+begin
+  Result := TStringList.Create;
+  LoadFontFallbackConfig;
+  if gFontFallbackConfig <> nil then
+  begin
+    { 先加入该字体自己的映射，再追加 *= 默认兜底；
+      两者都按逗号列表解析，重复项由调用方的 seen 去重。 }
+    idx := gFontFallbackConfig.IndexOfName(ABaseFont);
+    if idx >= 0 then
+      AddCommaCandidates(gFontFallbackConfig.ValueFromIndex[idx], Result);
+    idxDefault := gFontFallbackConfig.IndexOfName('*');
+    if (idxDefault >= 0) and (idxDefault <> idx) then
+      AddCommaCandidates(gFontFallbackConfig.ValueFromIndex[idxDefault], Result);
+  end;
+  if Result.Count = 0 then
+    for i := Low(OhosCJKFontFiles) to High(OhosCJKFontFiles) do
+      if Trim(OhosCJKFontFiles[i]) <> '' then
+        Result.Add(Trim(OhosCJKFontFiles[i]));
+end;
+
+function FontTokenLooksLikeFile(const AToken: string): Boolean;
+var
+  l: string;
+begin
+  l := LowerCase(AToken);
+  Result := (Pos('.ttf', l) > 0) or (Pos('.ttc', l) > 0) or
+    (Pos('.otf', l) > 0) or (Pos('/', l) > 0) or (Pos('\', l) > 0) or
+    (Pos('#', l) > 0);
+end;
+
+function OhosResolveFontToken(const AToken: string; ABold, AItalic: Boolean;
+  out APath: string): POH_Drawing_Typeface;
+var
+  token, fname, p: string;
+  ttcIdx, hpos: Integer;
+  cands: array of string;
+  fileOnly, familyOnly: Boolean;
+begin
+  Result := nil;
+  APath := '';
+  token := Trim(AToken);
+  if token = '' then Exit;
+
+  fileOnly := False;
+  familyOnly := False;
+  if Pos('file:', LowerCase(token)) = 1 then
+  begin
+    token := Trim(Copy(token, 6, MaxInt));
+    fileOnly := True;
+  end
+  else if Pos('family:', LowerCase(token)) = 1 then
+  begin
+    token := Trim(Copy(token, 8, MaxInt));
+    familyOnly := True;
+  end;
+  if token = '' then Exit;
+
+  { 裸 token：带 .ttf/.ttc/#/路径的只按文件处理，不再回退到系统家族 }
+  if not familyOnly and not fileOnly then
+    fileOnly := FontTokenLooksLikeFile(token);
+
+  if not familyOnly then
+  begin
+    fname := token;
+    ttcIdx := 0;
+    hpos := Pos('#', fname);
+    if hpos > 0 then
+    begin
+      ttcIdx := StrToIntDef(Copy(fname, hpos + 1, MaxInt), 0);
+      fname := Copy(fname, 1, hpos - 1);
+    end;
+    SetLength(cands, 6);
+    cands[0] := fname;
+    cands[1] := LowerCase(fname);
+    cands[2] := fname + '.ttf';
+    cands[3] := LowerCase(fname) + '.ttf';
+    cands[4] := fname + '.ttc';
+    cands[5] := LowerCase(fname) + '.ttc';
+    p := OhosResolveFontFile(cands);
+    if p <> '' then
+    begin
+      Result := OH_Drawing_TypefaceCreateFromFile(PChar(p), ttcIdx);
+      if Result <> nil then
+      begin
+        APath := p + '#' + IntToStr(ttcIdx);
+        fpGUI_Hilog(LOG_INFO, 'FONT FALLBACK FILE: ' + APath);
+        Exit;
+      end;
+      fpGUI_Hilog(LOG_ERROR, 'FONT FALLBACK CREATE FAIL: ' + p);
+    end;
+  end;
+
+  if fileOnly then Exit;
+
+  Result := TryLoadSystemTypeface(APath, ABold, AItalic, token);
+  if Result <> nil then
+    Exit;
+end;
+
+function OhosTrySystemTypefaceForChar(AChar: LongWord; ABold, AItalic: Boolean;
+  out APath: string): POH_Drawing_Typeface;
 var
   mgr: POH_Drawing_FontMgr;
-  cnt, i: Int32;
-  fname: PChar;
+  style: TOH_Drawing_FontStyleStruct;
+  bcp: array[0..0] of PChar;
+  tf, accepted: POH_Drawing_Typeface;
+  f: POH_Drawing_Font;
+  s: UTF8String;
+  w: Single;
+  families: array[0..2] of string;
+  i: Integer;
 begin
+  Result := nil;
+  APath := '';
   mgr := OH_Drawing_FontMgrCreate;
   if mgr = nil then Exit;
   try
-    cnt := OH_Drawing_FontMgrGetFamilyCount(mgr);
-    for i := 0 to cnt - 1 do
+    style.weight := FONT_WEIGHT_400;
+    if ABold then
+      style.weight := FONT_WEIGHT_700;
+    style.width := FONT_WIDTH_NORMAL;
+    if AItalic then
+      style.slant := FONT_STYLE_ITALIC
+    else
+      style.slant := FONT_STYLE_NORMAL;
+    bcp[0] := 'zh-Hans';
+
+    families[0] := 'sans-serif';
+    families[1] := 'HarmonyOS Sans SC';
+    families[2] := 'Noto Sans CJK SC';
+
+    for i := 0 to High(families) do
     begin
-      fname := OH_Drawing_FontMgrGetFamilyName(mgr, i);
-      if fname <> nil then
+      tf := OH_Drawing_FontMgrMatchFamilyStyleCharacter(mgr,
+        PChar(families[i]), style, @bcp[0], 1, Int32(AChar));
+      if tf = nil then
+        Continue;
+
+      accepted := nil;
+      f := OH_Drawing_FontCreate;
+      if f <> nil then
       begin
-        fpGUI_Hilog(LOG_INFO, format('FONT FAMILY[%d]: %s', [i, StrPas(fname)]));
-        OH_Drawing_FontMgrDestroyFamilyName(fname);
+        OH_Drawing_FontSetTypeface(f, tf);
+        OH_Drawing_FontSetTextSize(f, 32);
+        s := '';
+        if AChar <= $FFFF then
+          s := UTF8Encode(WideString(WideChar(AChar)));
+        w := 0;
+        if (Length(s) > 0) and
+           (OH_Drawing_FontMeasureText(f, PChar(s), Length(s),
+             TEXT_ENCODING_UTF8, nil, @w) = 0) and (w > 0) then
+          accepted := tf;
+        OH_Drawing_FontDestroy(f);
       end;
-      if i >= 24 then Break;
+
+      if accepted <> nil then
+      begin
+        Result := accepted;
+        APath := 'FontMgr:char:' + families[i];
+        fpGUI_Hilog(LOG_INFO, 'FONT FALLBACK SYSTEM: ' + APath);
+        Exit;
+      end;
+      OH_Drawing_TypefaceDestroy(tf);
     end;
-    fpGUI_Hilog(LOG_INFO, format('FONT FAMILY total=%d', [cnt]));
   finally
     OH_Drawing_FontMgrDestroy(mgr);
+  end;
+end;
+
+function OhosScanAppFontFiles: TStringList;
+var
+  dirs: TStringList;
+  i: Integer;
+  sr: TSearchRec;
+  p: string;
+
+  procedure AddMask(const ADir, AMask: string);
+  begin
+    if FindFirst(IncludeTrailingPathDelimiter(ADir) + AMask,
+      faAnyFile, sr) <> 0 then
+      Exit;
+    try
+      repeat
+        if (sr.Name <> '.') and (sr.Name <> '..') then
+        begin
+          p := IncludeTrailingPathDelimiter(ADir) + sr.Name;
+          if Result.IndexOf(p) < 0 then
+            Result.Add(p);
+        end;
+      until FindNext(sr) <> 0;
+    finally
+      FindClose(sr);
+    end;
+  end;
+
+  procedure AddDir(const ADir: string);
+  begin
+    AddMask(ADir, '*.ttf');
+    AddMask(ADir, '*.ttc');
+    AddMask(ADir, '*.TTF');
+    AddMask(ADir, '*.TTC');
+    AddMask(IncludeTrailingPathDelimiter(ADir) + 'fonts', '*.ttf');
+    AddMask(IncludeTrailingPathDelimiter(ADir) + 'fonts', '*.ttc');
+    AddMask(IncludeTrailingPathDelimiter(ADir) + 'fonts', '*.TTF');
+    AddMask(IncludeTrailingPathDelimiter(ADir) + 'fonts', '*.TTC');
+  end;
+
+begin
+  Result := TStringList.Create;
+  dirs := OhosAppFontDirs;
+  for i := 0 to dirs.Count - 1 do
+    AddDir(dirs[i]);
+end;
+
+function OhosDefaultFallbackTypeface(ABold, AItalic: Boolean;
+  out APath: string): POH_Drawing_Typeface;
+var
+  L: TStringList;
+  i: Integer;
+begin
+  Result := nil;
+  APath := '';
+  L := OhosFontFallbackCandidates('');
+  try
+    for i := 0 to L.Count - 1 do
+    begin
+      Result := OhosResolveFontToken(L[i], ABold, AItalic, APath);
+      if Result <> nil then
+        Exit;
+    end;
+  finally
+    L.Free;
+  end;
+
+  Result := OhosTrySystemTypefaceForChar($4E2D, ABold, AItalic, APath);
+  if Result <> nil then
+    Exit;
+
+  L := OhosScanAppFontFiles;
+  try
+    for i := 0 to L.Count - 1 do
+    begin
+      Result := OhosResolveFontToken(L[i], ABold, AItalic, APath);
+      if Result <> nil then
+        Exit;
+    end;
+  finally
+    L.Free;
   end;
 end;
 

@@ -15,6 +15,7 @@
  */
 
 import { common, Want } from '@kit.AbilityKit';
+import { fileUri } from '@kit.CoreFileKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 
 const DOMAIN = 0xFF00;
@@ -40,25 +41,49 @@ export async function openUrl(url: string): Promise<void> {
     return;
   }
 
+  // ---- Local file: turn the sandbox path into a shareable FileUri ------
+  let target: string = url;
+  if (target.startsWith('file://')) {
+    target = target.substring(7);
+  }
+  let localFile: boolean = false;
+  if (target.startsWith('/')) {
+    localFile = true;
+    try {
+      target = new fileUri.FileUri(target).toString();
+      hilog.info(DOMAIN, TAG, 'local file uri: %{public}s', target);
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'FileUri conversion failed: %{public}s', JSON.stringify(e));
+      target = url;
+    }
+  }
+
   // ---- Strategy 1: openLink (API 12+, recommended) ---------------------
-  // openLink picks the default browser / document viewer automatically.
-  // Available as a typed method on UIAbilityContext since API 12.
-  try {
-    await ctx.openLink(url);
-    return;
-  } catch (e) {
-    hilog.warn(DOMAIN, TAG, 'openLink failed, falling back to startAbility: %{public}s', JSON.stringify(e));
+  // openLink handles web/app links; local files go through viewData below
+  // so the read grant flag reaches the viewer.
+  if (!localFile) {
+    try {
+      await ctx.openLink(target);
+      return;
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'openLink failed, falling back to startAbility: %{public}s', JSON.stringify(e));
+    }
   }
 
   // ---- Strategy 2: startAbility with viewData want --------------------
   const want: Want = {
     action: 'ohos.want.action.viewData',
-    uri: url,
+    uri: target,
   };
+  if (localFile) {
+    want.type = 'application/pdf';
+    // FLAG_AUTH_READ_URI_PERMISSION lets the viewer read the app's file URI.
+    want.flags = 1;
+  }
   try {
     await ctx.startAbility(want);
   } catch (e) {
     hilog.error(DOMAIN, TAG, 'startAbility(viewData) failed for %{public}s: %{public}s',
-      url, JSON.stringify(e));
+      target, JSON.stringify(e));
   }
 }
