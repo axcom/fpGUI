@@ -4,7 +4,9 @@ import { unifiedDataChannel } from '@kit.ArkData';
 import { common, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
-import { getWindowStage, getMainWindow, terminateAbility, getLaunchPayload, getMergedArgs } from '../fp_bridgeability/Fp_bridgeAbility';
+import { getWindowStage, getMainWindow, getAbilityContext, terminateAbility, getLaunchPayload, getMergedArgs } from '../fp_bridgeability/Fp_bridgeAbility';
+import { closeAbilityWindow, closeAllAbilityWindows, getAbilityWindowStage, getActiveWindowReqId,
+  loadAbilityWindowContent, markActiveWindow, waitForAbilityWindow } from '../common/FpWindowRegistry';
 import { APP_LIB_NAME } from '../common/FpAppConfig';
 import { FpgSurface, FpgSurfaceCtrl, notifyFirstFrame, registerWindowPositionSync, unregisterWindowPositionSync, imeConsumedChar, imeConsumedDelete, imeConsumedEnter, imeTouchWindow, imeNoteWindowActive, imeNoteWindowInactive, imeSetWindowKind, imeClearWindowKind, isInputBlocked, setShakeWindowCallback, setModalStateCallback, refreshModalState } from '../common/FpgSurface';
 import { ohosKeyToUnicode } from '../common/FpKeyMap';
@@ -53,6 +55,17 @@ interface DragExtraParams {
 const DOMAIN = 0x0000;
 const TAG = 'page-Index';
 
+// ── 顶层主窗策略 ────────────────────────────────────────────────
+// waSizeable 的普通窗/模态窗走 FpWindowAbility（multiton）：每个窗口一个
+// Ability 实例 = 一个独立 WindowStage 主窗（真正的顶层主窗）。
+// 置 false 可一键回退旧的系统子窗路径（手机等不支持多主窗的形态）。
+const USE_TOPLEVEL_WINDOWS: boolean = true;
+// fpGUI TWindowAttribute：waSizeable = 1<<0（attrs & 1）
+const ATTR_SIZEABLE = 1 << 0;
+// waSizeable 的普通/模态窗走多实例主窗（FpWindowAbility），真正的顶层主窗。
+// window.WindowType.TYPE_MAIN 仅可读、不可用于创建（官方文档与实测均如此）。
+const FP_WINDOW_ABILITY: string = 'FpWindowAbility';
+
 // 兼容模式判定：主窗真实显示区域与 layout rect 不一致（存在 compat scale）。
 // 原始比例：getGlobalRect 与 windowRect 同尺寸；
 // 18:9/2:3 等兼容比例：存在缩放，子窗 moveWindowTo 以父窗左上角为原点。
@@ -77,6 +90,13 @@ export function isCompatScaled(win: window.Window | null): boolean {
 @Component
 struct Index {
   private subWinMap: Map<number, window.Window> = new Map();
+  // 子窗 → 所属顶层主窗 reqId。子窗必须建在同一个 WindowStage 上，
+  // 否则从新主窗弹出的对话框会挂到 id=1 主窗下、被新主窗挡住。
+  private subWinTop: Map<number, number> = new Map();
+  // 以多实例 Ability 主窗创建的 reqId：模态 Z 序/剪枝/关闭/销毁需区别对待
+  private topLevelReqIds: Set<number> = new Set<number>();
+  // 窗口创建串行链：currentReqId 是全局键，并发创建会让后一窗覆盖前一窗的 reqId
+  private winCreateChain: Promise<void> = Promise.resolve();
   private popupReqIds: Set<number> = new Set<number>();
   // 弹出菜单 moveWindowTo 原点语义：0=未知 1=屏幕绝对 2=父窗口相对
   private popupMoveMode: number = 0;
@@ -173,13 +193,40 @@ struct Index {
       this.mainReadyTimer = -1;
     }
     stopTimerTick();
+    // 退出前回收本页创建的窗口：多实例主窗要结束对应 Ability 实例，
+    // 子窗直接销毁；失败忽略（Ability 退出时系统也会清）。
+    const ids: number[] = [];
+    this.subWinMap.forEach((_w: window.Window, id: number) => { ids.push(id); });
+    for (let i = 0; i < ids.length; i++) {
+      const id: number = ids[i];
+      const w: window.Window | undefined = this.subWinMap.get(id);
+      this.subWinMap.delete(id);
+      this.lastSubSize.delete(id);
+      unregisterWindowPositionSync(id);
+      if (this.topLevelReqIds.has(id)) {
+        closeAbilityWindow(id);
+      } else if (w !== undefined) {
+        w.destroyWindow().catch(() => {});
+      }
+    }
+    this.topLevelReqIds.clear();
+    this.subWinTop.clear();
+    closeAllAbilityWindows();   // 兜底：注册表里可能还有未进 subWinMap 的实例
   }
 
   private handleNativeCommand(cmd: NativeCommand): void {
     switch (cmd.type) {
       case 0:
-        this.createWindowFromNative(cmd.reqId, cmd.xcId, cmd.width, cmd.height,
-          cmd.x, cmd.y, cmd.windowAttributes, cmd.windowType, cmd.surfaceId, cmd.title);
+        // 串行化：createSubWin 先写全局 currentReqId 再 setUIContent，
+        // 并发创建时后一窗会覆盖前一窗的值 → WindowSurface 认错 reqId。
+        this.winCreateChain = this.winCreateChain.then(() =>
+          this.createWindowFromNative(cmd.reqId, cmd.xcId, cmd.width, cmd.height,
+            cmd.x, cmd.y, cmd.windowAttributes, cmd.windowType, cmd.surfaceId, cmd.title))
+          .catch((e: Error) => {
+            hilog.error(DOMAIN, TAG,
+              'createWindowFromNative(req=%{public}d) failed: %{public}s',
+              cmd.reqId, e.message || '');
+          });
         break;
       case 1:
         this.moveWindow(cmd.reqId, cmd.x, cmd.y);
@@ -518,6 +565,98 @@ struct Index {
     this.reportWindowRect(1, reason);
   }
 
+  // 多实例主窗标题：Ability 创建期 setWindowTitle 可能报 1300002，或被随后
+  // loadContent 重置 → 窗口显示后再设一次，失败按 300/600ms 重试。
+  private applyTopWindowTitle(win: window.Window, title: string): void {
+    if (title.length === 0) return;
+    let tries = 0;
+    const attempt = (): void => {
+      tries += 1;
+      win.setWindowTitle(title).then(() => {
+        hilog.info(DOMAIN, TAG, 'window title applied: %{public}s', title);
+      }).catch((e: Error) => {
+        if (tries < 3) {
+          setTimeout(attempt, tries * 300);
+        } else {
+          hilog.warn(DOMAIN, TAG, 'setWindowTitle failed: %{public}s', JSON.stringify(e));
+        }
+      });
+    };
+    attempt();
+  }
+
+  // 标题栏按钮策略（show 之前调用 setWindowTitleButtonVisible 会报 1300002，
+  // 这里在窗口显示后立即尝试，失败再 300ms/900ms 重试）：
+  //   reqId=1：非 waSizeable → 隐藏最大化按钮（最小化/关闭保留）
+  //   reqId>1 顶层主窗：隐藏最小化按钮（最大化/关闭保留，由托盘/主窗统一管理）
+  //   waBorderless：无系统装饰，按钮本就不可见，直接跳过
+  private applyTitleButtons(reqId: number, win: window.Window, attrs: number): void {
+    if ((attrs & (1 << 4)) !== 0) return;
+    const sizeable: boolean = (attrs & ATTR_SIZEABLE) !== 0;
+    const apply = (): boolean => {
+      try {
+        if (reqId === 1) {
+          win.setWindowTitleButtonVisible(sizeable, true, true);
+        } else {
+          win.setWindowTitleButtonVisible(true, false, true);
+        }
+        hilog.info(DOMAIN, TAG,
+          'title buttons applied req=%{public}d sizeable=%{public}d',
+          reqId, sizeable ? 1 : 0);
+        return true;
+      } catch (e) {
+        return false;
+      }
+    };
+    if (apply()) return;
+    setTimeout(() => {
+      if (apply()) return;
+      setTimeout(() => { apply(); }, 900);
+    }, 300);
+  }
+
+  private isWinFocused(win: window.Window | null): boolean {
+    if (win === null) return false;
+    try {
+      return win.isFocused();
+    } catch (_e) {
+      return false;
+    }
+  }
+
+  // 新窗口应挂到哪个顶层主窗：
+  // 1) 实时查询焦点窗口（isFocused 是 WMS 状态，不受 windowEvent 到达顺序影响）
+  //    - 聚焦的顶层主窗 → 它自己
+  //    - 聚焦的子窗 → 其所属顶层主窗
+  // 2) 焦点查询失败/无焦点时，回退到 windowEvent 维护的 activeWindowReqId
+  // 3) 最后回退 id=1 主窗
+  private resolveParentTopReq(): number {
+    const mainFocused: boolean = this.isWinFocused(getMainWindow());
+    if (mainFocused) return 1;
+
+    let focusedTop: number = 0;
+    let focusedChild: number = 0;
+    this.subWinMap.forEach((w: window.Window, id: number) => {
+      if (!this.isWinFocused(w)) return;
+      if (this.topLevelReqIds.has(id)) focusedTop = id;
+      else focusedChild = id;
+    });
+    hilog.info(DOMAIN, TAG,
+      'resolve parent: main=%{public}d focusedTop=%{public}d focusedChild=%{public}d active=%{public}d',
+      mainFocused ? 1 : 0, focusedTop, focusedChild, getActiveWindowReqId());
+    if (focusedTop > 0) return focusedTop;
+    if (focusedChild > 0) {
+      const top: number | undefined = this.subWinTop.get(focusedChild);
+      if (top !== undefined && (top === 1 || this.topLevelReqIds.has(top))) return top;
+    }
+
+    const a: number = getActiveWindowReqId();
+    if (a > 1 && this.topLevelReqIds.has(a)) return a;
+    const t: number | undefined = this.subWinTop.get(a);
+    if (t !== undefined && t > 1 && this.topLevelReqIds.has(t)) return t;
+    return 1;
+  }
+
   private async setupMainWindow(width: number, height: number,
       posX: number, posY: number, attrs: number, winTitle: string): Promise<void> {
     const ATTR_FULLSCREEN = 1 << 3;
@@ -682,6 +821,7 @@ struct Index {
               terminateAbility();
             } else if (t === 2) {   // WINDOW_ACTIVE：主窗重新激活 → 恢复隐藏 TextInput
               this.mainWindowActive = true;
+              markActiveWindow(1);
               this.imeNeedsReattach = true;
               hilog.info(DOMAIN, TAG, 'MainWindow event: active, IME reattach scheduled');
               imeNoteWindowActive(1);
@@ -747,12 +887,63 @@ struct Index {
     }
   }
 
+  // 拉起一个 FpWindowAbility 实例（multiton）：新实例 = 新 WindowStage 主窗。
+  // 只负责 startAbility；Window 对象由 FpWindowAbility 在 onWindowStageCreate
+  // 里注册到 FpWindowRegistry，随后 createSubWin 用 waitForAbilityWindow 取回。
+  private async spawnAbilityWindow(reqId: number, width: number, height: number,
+      posX: number, posY: number, attrs: number, wtype: number,
+      winTitle: string): Promise<boolean> {
+    const ctx = getAbilityContext();
+    if (ctx === null) {
+      hilog.warn(DOMAIN, TAG, 'spawnAbilityWindow: ability context unavailable');
+      return false;
+    }
+    const want: Want = {
+      bundleName: ctx.abilityInfo.bundleName,
+      abilityName: FP_WINDOW_ABILITY,
+      parameters: {
+        'fpWindowReqId': reqId,
+        'fpWidth': width,
+        'fpHeight': height,
+        'fpX': posX,
+        'fpY': posY,
+        'fpAttrs': attrs,
+        'fpType': wtype,
+        'fpTitle': winTitle
+      }
+    };
+    try {
+      await ctx.startAbility(want);
+      hilog.info(DOMAIN, TAG,
+        'startAbility %{public}s req=%{public}d OK (multiton instance)',
+        FP_WINDOW_ABILITY, reqId);
+      return true;
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG,
+        'startAbility %{public}s req=%{public}d failed: %{public}s',
+        FP_WINDOW_ABILITY, reqId, JSON.stringify(e));
+      return false;
+    }
+  }
+
   private async createSubWin(reqId: number, xcId: string,
       width: number, height: number, posX: number, posY: number,
-      attrs: number, wtype: number, winTitle: string): Promise<boolean> {
+      attrs: number, wtype: number, winTitle: string,
+      topLevel: boolean = false): Promise<boolean> {
     hilog.info(DOMAIN, TAG, 'createSubWin reqId=%{public}d,scid=%{public}s %{public}d %{public}d %{public}d %{public}d attrs=%{public}d type=%{public}d title=%{public}s',reqId,xcId,posX,posY,width,height,attrs,wtype,winTitle);
-    const ws = getWindowStage();
+    // 子窗建在所属顶层主窗的 WindowStage 上，才会以该主窗为父窗。
+    // 否则（固定用主 Ability 的 stage）从新主窗弹出的对话框会挂到 id=1 主窗下，
+    // 被新主窗挡住、点不到。
+    const parentTopReq: number = this.resolveParentTopReq();
+    let ws = getWindowStage();
+    if (parentTopReq > 1) {
+      const topStage: window.WindowStage | null = getAbilityWindowStage(parentTopReq);
+      if (topStage !== null) ws = topStage;
+    }
     if (ws === null) return false;
+    hilog.info(DOMAIN, TAG,
+      'window parent: req=%{public}d top=%{public}d active=%{public}d type=%{public}d',
+      reqId, parentTopReq, getActiveWindowReqId(), wtype);
 
     // fpGUI TWindowAttributes：waFullScreen=bit3(1<<3)，waBorderless=bit4(1<<4)
     const ATTR_FULLSCREEN = 1 << 3;
@@ -770,7 +961,11 @@ struct Index {
     // 用自绘标题栏（FpgSurface）替代——平时隐藏，需要时按主窗标题栏高展示。
     const wantedDecor = !isPopup && !hasBL;
 
-    const winName: string = 'fpg_win_' + reqId;
+    let winName: string = (topLevel ? 'fpg_main_' : 'fpg_win_') + reqId;
+    // 实际是否按顶层主窗（多实例 Ability）创建：失败时回退系统子窗
+    let isTopLevelWin: boolean = topLevel;
+    // 是否已成功拉起 FpWindowAbility 实例（失败清理时需 terminateSelf 回收）
+    let spawnedAbility: boolean = false;
 
     // 记录已创建但尚未完成初始化的子窗口，失败时销毁，避免留下空白窗口
     let createdWin: window.Window | undefined = undefined;
@@ -817,9 +1012,40 @@ struct Index {
         }
         hilog.info(DOMAIN, TAG, 'legacy createSubWindow OK (req=%{public}d)', reqId);
       }*/
-      win = await ws.createSubWindow(winName);  //有些版本有标题栏&有些又没有，都自绘吧~
+      if (isTopLevelWin) {
+        // ── 顶层主窗：启动 FpWindowAbility（multiton）实例 ──
+        // 每个实例独占一个 WindowStage 主窗；TYPE_MAIN 不可用于创建，
+        // 多实例 Ability 是系统唯一支持的"应用内多主窗"路径。
+        try {
+          spawnedAbility = await this.spawnAbilityWindow(reqId, width, height,
+            posX, posY, attrs, wtype, winTitle);
+          if (!spawnedAbility) throw new Error('spawn FpWindowAbility failed');
+          const topWin: window.Window | null = await waitForAbilityWindow(reqId, 10000);
+          if (topWin === null) throw new Error('wait FpWindowAbility window timeout');
+          win = topWin;
+          decorEnabled = !hasBL;
+          hilog.info(DOMAIN, TAG,
+            'FpWindowAbility window ready (req=%{public}d) decor=%{public}d',
+            reqId, decorEnabled ? 1 : 0);
+        } catch (e) {
+          hilog.warn(DOMAIN, TAG,
+            'top-level window failed req=%{public}d: %{public}s -> subwindow fallback',
+            reqId, JSON.stringify(e));
+          isTopLevelWin = false;
+          closeAbilityWindow(reqId);          // 已拉起的实例（如超时晚到）一并回收
+          winName = 'fpg_win_' + reqId;
+          win = await ws.createSubWindow(winName);
+          decorEnabled = false;
+        }
+      } else {
+        win = await ws.createSubWindow(winName);  //有些版本有标题栏&有些又没有，都自绘吧~
+        decorEnabled = false;
+      }
       createdWin = win;
-      decorEnabled = false;
+      if (isTopLevelWin) this.topLevelReqIds.add(reqId);
+      // 记录父级归属：顶层主窗以自己为根；子窗记录所属顶层主窗（供嵌套子窗/
+      // 位置换算使用）。
+      this.subWinTop.set(reqId, isTopLevelWin ? reqId : parentTopReq);
       // ── 激活事件必须【在 showWindow 之前】注册 ──
       // 新子窗在 showWindow() 过程中就会收到 WINDOW_ACTIVE；而下方 windowEvent
       // 的注册点在 setUIContent/resize/首帧等待等一串 await 之后（实测 0.5~1s），
@@ -828,6 +1054,7 @@ struct Index {
         win.on('windowEvent', (t: number) => {
           if (t === 2) {
             hilog.info(DOMAIN, TAG, 'Sub-window %{public}d event: active (early)', reqId);
+            markActiveWindow(reqId);
             imeNoteWindowActive(reqId);
           } else if (t === 3) {
             imeNoteWindowInactive(reqId);
@@ -856,14 +1083,32 @@ struct Index {
         }
       })();
       const props = win.getWindowProperties();
+      hilog.info(DOMAIN, TAG,
+        'createSubWin props req=%{public}d winRect=%{public}dx%{public}d drawable=%{public}dx%{public}d top=%{public}d',
+        reqId, props.windowRect.width, props.windowRect.height,
+        props.drawableRect.width, props.drawableRect.height, isTopLevelWin ? 1 : 0);
       // 子窗 windowId 上报（per-window 光标切换）；销毁时清除（setWindowPointerId(reqId, 0)）
       try {
         this.winPointerIds.set(reqId, props.id);
       } catch (_e) {}
-      const decW = props.windowRect.width - props.drawableRect.width;
-      const decH = props.windowRect.height - props.drawableRect.height;
-      // 自绘标题栏判定：期望装饰但实际无装饰（OpenHarmony legacy 回退路径）
-      const titleBar = wantedDecor && (!decorEnabled /*|| (decH===0)*/);
+      // drawableRect 在窗口首次布局前为 0x0 —— 不能把 windowRect 全值当装饰
+      // （否则 total=客户区+整窗 = 2 倍尺寸，实测 2280x1330 被放大到 4370x2724）。
+      let decW = props.drawableRect.width > 0
+        ? props.windowRect.width - props.drawableRect.width : 0;
+      let decH = props.drawableRect.height > 0
+        ? props.windowRect.height - props.drawableRect.height : 0;
+      if (isTopLevelWin && decorEnabled && decH <= 0) {
+        // 多实例主窗：系统装饰高度可直接查询（vp）→ 预估首帧总高
+        let decorVp = 0;
+        try { decorVp = win.getWindowDecorHeight(); } catch (_e) {}
+        if (decorVp > 0) {
+          decH = Math.round(decorVp * display.getDefaultDisplaySync().densityPixels);
+        }
+      }
+      // 自绘标题栏判定：期望装饰但实际无装饰（OpenHarmony legacy 回退路径）。
+      // 多实例主窗（isTopLevelWin）始终使用系统装饰：主窗都有系统标题栏，
+      // 再叠自绘栏会双标题栏 + 多算 70px 高度。
+      const titleBar: boolean = !isTopLevelWin && wantedDecor && (!decorEnabled /*|| (decH===0)*/);
       // 单位：width/height 与 resize/windowRect 均为 px（C++ 透传的 Pascal 逻辑 px
       // 与 OHOS px 1:1）→ dec 直接用 px 原值补偿（勿 ÷density）
       const densityPx: number = display.getDefaultDisplaySync().densityPixels;
@@ -939,7 +1184,7 @@ struct Index {
       if (posX !== 0 || posY !== 0) {
         const postRect = win.getWindowProperties().windowRect;
         if (postRect.left !== posX || postRect.top !== posY) {
-          await this.movePopupTo(win, isPopup, posX, posY, false);
+          await this.movePopupTo(win, isPopup, posX, posY, false, parentTopReq);
         } else {
           hilog.info(DOMAIN, TAG,
             'createSubWin move skipped (req=%{public}d): already at (%{public}d,%{public}d)',
@@ -950,11 +1195,24 @@ struct Index {
       // FpgSurface Stack 背景 '#F1F3F5' 已就绪 → 消除黑屏闪现。
       // surface 初始可能为压缩态，由 contentReady 门 + setXComponentSurfaceRect +
       // refreshWindow 机制在 2nd-pass resize 后自动校正。
-      hilog.info(DOMAIN, TAG, 'setUIContent before showWindow (anti black-flash)');
-      await win.setUIContent('pages/WindowSurface');
+      hilog.info(DOMAIN, TAG, 'load content before showWindow (anti black-flash)');
+      if (isTopLevelWin) {
+        // 页面由 FpWindowAbility 的 WindowStage 加载（per-window LocalStorage 传 reqId，
+        // 见 MainWindowSurface）；这里按与子窗相同的时序触发加载。
+        if (!(await loadAbilityWindowContent(reqId))) {
+          throw new Error('loadAbilityWindowContent failed');
+        }
+      } else {
+        await win.setUIContent('pages/WindowSurface');
+      }
       // 窗口背景色兜底（部分版本 setUIContent 后才生效）
       try { win.setWindowBackgroundColor('#00000000'); } catch (_e) {}
       await win.showWindow();
+      // 多实例主窗：隐藏最小化按钮 + 补写标题（show 前设置可能失效/被重置）
+      if (isTopLevelWin) {
+        this.applyTitleButtons(reqId, win, attrs);
+        this.applyTopWindowTitle(win, winTitle);
+      }
       // ── 弹出菜单/下拉（wtPopup）必须压在模态之上 ──
       // 模态可能被 raiseToAppTop() 提到应用最前（被阻塞点击时），之后新建的子窗
       // 会落在它下面：表现为菜单被模态盖住、点菜单项反而点到模态（抖动）。
@@ -987,13 +1245,20 @@ struct Index {
         // （压缩）→ buffer 偏小 → "拉高"。用主窗口标题栏高（decH_1，同源系统
         // 标题栏）预估，使 resize 总尺寸=客户区+dec。
         if (decorEnabled && (decH2 <= 0 || props2.windowRect.width <= 0)) {
-          const estDecVp = AppStorage.get<number>('decH_1');
-          if (estDecVp && estDecVp > 0) {
+          // 顶层主窗优先用自身的 decorHeight（与 Ability 主窗的 decH_1 可能不同源），
+          // 取不到再退回主窗标题栏高。
+          let estDecVp = 0;
+          if (isTopLevelWin) {
+            try { estDecVp = win.getWindowDecorHeight(); } catch (_e) {}
+          }
+          if (estDecVp <= 0) estDecVp = AppStorage.get<number>('decH_1') ?? 0;
+          if (estDecVp > 0) {
             const estDecPx = Math.round(estDecVp * densityPx);
             if (decH2 <= 0) decH2 = estDecPx;
             hilog.info(DOMAIN, TAG,
-              'Sub-window %{public}d dec unavailable (winRect=%{public}dx%{public}d), est decH=%{public}dpx from main',
-              reqId, props2.windowRect.width, props2.windowRect.height, estDecPx);
+              'Window %{public}d dec unavailable (winRect=%{public}dx%{public}d), est decH=%{public}dpx (top=%{public}d)',
+              reqId, props2.windowRect.width, props2.windowRect.height, estDecPx,
+              isTopLevelWin ? 1 : 0);
           }
         }
         hilog.info(DOMAIN, TAG,
@@ -1013,7 +1278,7 @@ struct Index {
             'Sub-window %d corrected: resize to %{public}dx%{public}d', reqId, totalW2, totalH2);
           // resize 可能改变窗口位置 → 重新定位（保持弹窗/菜单在正确屏幕位置）
           if (posX !== 0 || posY !== 0) {
-            try { await this.movePopupTo(win, isPopup, posX, posY, true); } catch (_e) {}
+            try { await this.movePopupTo(win, isPopup, posX, posY, true, parentTopReq); } catch (_e) {}
           }
           // 装饰值若有变化，更新存储（触摸 vp）与 C++（定位逻辑值）
           // （原补偿路线不变：decH/decW 恒存真实装饰值）
@@ -1118,8 +1383,23 @@ struct Index {
       try {
         win.on('windowWillClose', async (): Promise<boolean> => {
           const can: number = fpbridge.queryCanClose(reqId);
+          const topLevel: boolean = this.topLevelReqIds.has(reqId);
           hilog.info(DOMAIN, TAG,
-            'Window %{public}d windowWillClose: canClose=%{public}d', reqId, can);
+            'Window %{public}d windowWillClose: canClose=%{public}d topLevel=%{public}d',
+            reqId, can, topLevel ? 1 : 0);
+          if (topLevel) {
+            // 顶层主窗：系统 × 关闭可能连带结束整个 Ability → 恒拦截系统关闭，
+            // CanClose 放行时改走受控销毁（先通知 C++ 释放 native window）。
+            if (can !== 0) {
+              this.imeNeedsReattach = true;
+              setTimeout(() => {
+                if (this.subWinMap.get(reqId) === undefined) return;
+                fpbridge.onWindowClosed(reqId);
+                this.destroyWindow(reqId);
+              }, 0);
+            }
+            return true;   // 始终阻止系统直接关窗
+          }
           if (can !== 0) {
             // 右键菜单/popup 关闭时可能不触发 windowEvent t=7：提前清理并恢复主窗焦点
             this.imeNeedsReattach = true;
@@ -1140,6 +1420,13 @@ struct Index {
           // 这里只兜底 t=7，避免同一事件被处理两次（会重复 attach）。
           if (t === 7) {   // WINDOW_DESTROYED：窗口已被系统销毁
             hilog.info(DOMAIN, TAG, 'Window %{public}d destroyed by system', reqId);
+            const wasTop: boolean = this.topLevelReqIds.has(reqId);
+            if (wasTop) this.dropChildWindows(reqId);
+            const parentTop: number = this.subWinTop.get(reqId) ?? 1;
+            this.subWinTop.delete(reqId);
+            if (getActiveWindowReqId() === reqId) {
+              markActiveWindow(wasTop ? 1 : parentTop);
+            }
             fpbridge.onWindowClosed(reqId);
             try {
               this.winPointerIds.delete(reqId);
@@ -1153,6 +1440,7 @@ struct Index {
             this.lastSubSize.delete(reqId);
             this.lastWinStatus.delete(reqId);
             this.winModalFlags.delete(reqId);
+            this.topLevelReqIds.delete(reqId);
             imeClearWindowKind(reqId);
             this.imeNeedsReattach = true;
             // 系统关闭子窗后主窗可能未获得焦点：延迟强制恢复
@@ -1200,8 +1488,11 @@ struct Index {
         'createSubWin failed for req %{public}d: code=%{public}d msg=%{public}s',
         reqId, err.code, err.message || '');
 
-      // setUIContent/showWindow 失败时，子窗口可能已经创建但未登记到 subWinMap
-      if (createdWin !== undefined) {
+      // 失败清理：多实例主窗 → 结束该 Ability 实例；子窗 → 销毁半成品窗口
+      if (spawnedAbility) {
+        hilog.info(DOMAIN, TAG, 'close ability window after failure req=%{public}d', reqId);
+        closeAbilityWindow(reqId);
+      } else if (createdWin !== undefined) {
         try {
           await createdWin.destroyWindow();
           hilog.info(DOMAIN, TAG,
@@ -1214,6 +1505,8 @@ struct Index {
       }
 
       imeClearWindowKind(reqId);
+      this.topLevelReqIds.delete(reqId);
+      this.subWinTop.delete(reqId);
       return false;
     }
   }
@@ -1305,6 +1598,8 @@ struct Index {
               hilog.info(DOMAIN, TAG,
                 'MainWindow showWindow before XComponent (mainReady=0)');
               await mw.showWindow();
+              // 主窗按钮策略：非 waSizeable → 隐藏最大化按钮
+              this.applyTitleButtons(1, mw, attrs);
             } catch (_e) {}
           }
         } catch (_e) {}
@@ -1338,11 +1633,20 @@ struct Index {
         return;
       }
 
-      // 其它窗口：系统子窗口（createSubWindowWithOptions，独立窗口/系统标题栏）
+      // 其它窗口：waSizeable 的普通窗/模态窗 → 顶层主窗（TYPE_MAIN），
+      // popup/child/不可缩放窗 → 系统子窗。设备不支持多主窗时 createSubWin 内回退。
+      const isPopupWin: boolean = wtype === 3;
+      const isChildWin: boolean = wtype === 0;
+      const wantTopLevel: boolean = USE_TOPLEVEL_WINDOWS && reqId !== 1
+        && !isPopupWin && !isChildWin && (attrs & ATTR_SIZEABLE) !== 0;
+      hilog.info(DOMAIN, TAG,
+        'Window %{public}d route: topLevel=%{public}d (type=%{public}d attrs=%{public}d sizeable=%{public}d)',
+        reqId, wantTopLevel ? 1 : 0, wtype, attrs, (attrs & ATTR_SIZEABLE) !== 0 ? 1 : 0);
       this.imeNeedsReattach = true;
       this.creatingSubWinCount += 1;
       try {
-        if (!(await this.createSubWin(reqId, xcId, width, height, posX, posY, attrs, wtype, title))) {
+        if (!(await this.createSubWin(reqId, xcId, width, height, posX, posY,
+            attrs, wtype, title, wantTopLevel))) {
           hilog.warn(DOMAIN, TAG,
             'createSubWin failed for req %{public}d (no fallback inline window)', reqId);
 
@@ -1360,12 +1664,44 @@ struct Index {
       }
   }
 
+  // 顶层主窗销毁时，其 WindowStage 上的子窗随 Ability 一并销毁；
+  // 同步清掉 ETS 侧记录，避免 subWinMap 残留死窗口（焦点/剪枝判断会误判）。
+  private dropChildWindows(topReqId: number): void {
+    const ids: number[] = [];
+    this.subWinTop.forEach((top: number, id: number) => {
+      if (top === topReqId && id !== topReqId) ids.push(id);
+    });
+    for (let i = 0; i < ids.length; i++) {
+      const id: number = ids[i];
+      this.subWinMap.delete(id);
+      this.lastSubSize.delete(id);
+      this.subWinTop.delete(id);
+      this.popupReqIds.delete(id);
+      this.winModalFlags.delete(id);
+      imeClearWindowKind(id);
+      unregisterWindowPositionSync(id);
+      AppStorage.delete('titleBar_' + id);
+      AppStorage.delete('winTitle_' + id);
+      AppStorage.delete('winHandle_' + id);
+      if (getActiveWindowReqId() === id) markActiveWindow(topReqId);
+      hilog.info(DOMAIN, TAG, 'child window %{public}d dropped with top %{public}d', id, topReqId);
+    }
+  }
+
   private async destroyWindow(reqId: number): Promise<void> {
+    const wasTopLevel: boolean = this.topLevelReqIds.has(reqId);
+    const parentTopOfWin: number = this.subWinTop.get(reqId) ?? 1;
+    this.subWinTop.delete(reqId);
+    if (getActiveWindowReqId() === reqId) {
+      markActiveWindow(wasTopLevel ? 1 : parentTopOfWin);
+    }
+    if (wasTopLevel) this.dropChildWindows(reqId);
     // 清除 per-window 光标 id（防句柄复用错配）
     try {
       this.winPointerIds.delete(reqId);
     } catch (_e) {}
     this.popupReqIds.delete(reqId);
+    this.topLevelReqIds.delete(reqId);
     this.winModalFlags.delete(reqId);
     imeClearWindowKind(reqId);
     unregisterWindowPositionSync(reqId);
@@ -1381,8 +1717,15 @@ struct Index {
       try { subWin.off('windowWillClose'); } catch (_e) {}
       try { subWin.off('windowEvent'); } catch (_e) {}
       try { subWin.off('windowRectChange'); } catch (_e) {}
-      try { await subWin.destroyWindow(); } catch (_e) {}
-      hilog.info(DOMAIN, TAG, 'Sub-window %d destroyed', reqId);
+      if (wasTopLevel) {
+        // 多实例主窗：结束所属 Ability 实例（窗口随实例销毁）。只 destroyWindow
+        // 会留下无窗口的 Ability 实例；onWindowStageDestroy 负责通知 C++ 释放 surface。
+        closeAbilityWindow(reqId);
+      } else {
+        try { await subWin.destroyWindow(); } catch (_e) {}
+      }
+      hilog.info(DOMAIN, TAG, 'Sub-window %d destroyed (topLevel=%{public}d)',
+        reqId, wasTopLevel ? 1 : 0);
       if (reqId === 1) {
         // 诊断：主窗销毁→终止应用（黑底未绘/弹菜单切换期闪退排查：确认谁触发）
         hilog.warn(DOMAIN, TAG, 'destroyWindow MAIN -> terminateAbility (req=1)');
@@ -1543,26 +1886,28 @@ struct Index {
   }
 
   // 弹出菜单/下拉（wtPopup）：兼容缩放下 moveWindowTo 以父窗左上角为原点，
-  // 原始比例用屏幕绝对坐标。首次 show 后按实际 windowRect 校准并缓存模式。
+  // 原始比例用屏幕绝对坐标。parentReqId 指定所属顶层主窗（1=Ability 主窗）。
   private async movePopupTo(win: window.Window, isPopup: boolean,
-      x: number, y: number, verify: boolean): Promise<void> {
+      x: number, y: number, verify: boolean,
+      parentReqId: number = 1): Promise<void> {
     if (!isPopup) {
       try { await win.moveWindowTo(x, y); } catch (_e) {}
       return;
     }
-    const main = getMainWindow();
+    const parentWin: window.Window | null = parentReqId === 1
+      ? getMainWindow() : (this.subWinMap.get(parentReqId) ?? null);
     let left: number = 0;
     let top: number = 0;
-    if (main !== null) {
+    if (parentWin !== null) {
       try {
-        const mp: window.WindowProperties = main.getWindowProperties();
+        const mp: window.WindowProperties = parentWin.getWindowProperties();
         left = mp.windowRect.left;
         top = mp.windowRect.top;
       } catch (_e) {}
     }
     let mode: number = this.popupMoveMode;
     if (mode === 0) {
-      mode = isCompatScaled(main) ? 2 : 1;
+      mode = isCompatScaled(parentWin) ? 2 : 1;
     }
     let relative: boolean = (mode === 2);
     try {
@@ -1608,7 +1953,8 @@ struct Index {
     const win = this.subWinMap.get(reqId);
     if (win !== undefined) {
       try {
-        await this.movePopupTo(win, this.popupReqIds.has(reqId), x, y, true);
+        const parentTop: number = this.subWinTop.get(reqId) ?? 1;
+        await this.movePopupTo(win, this.popupReqIds.has(reqId), x, y, true, parentTop);
       } catch (_e) {}
     }
   }
@@ -1693,7 +2039,13 @@ struct Index {
     // 把它 raise 到最前（子窗默认 raise-by-click），模态就被盖住了。
     // raiseToAppTop 只作用于同父窗、同类型的兄弟子窗，正好是这些对话框。
     if (win !== undefined) {
-      win.raiseToAppTop().catch(() => {});
+      if (this.topLevelReqIds.has(reqId)) {
+        // 顶层主窗与 Ability 主窗同级：raiseToAppTop 只作用于兄弟子窗（会 1300004），
+        // 用 showWindow 重新上屏，配合下方 shiftAppWindowFocus 切系统焦点。
+        win.showWindow().catch(() => {});
+      } else {
+        win.raiseToAppTop().catch(() => {});
+      }
     }
     // 节流：鼠标悬停/拖动在模态外会高频触发 DROPPED → 连续 shake 互相打断，
     // 动画永远走不完（看不到抖动）。500ms（>一次完整序列时长）内只执行一次。
@@ -1767,12 +2119,23 @@ struct Index {
       } catch (_e) {
         showing = false;
       }
-      if (!showing) dead.push(reqId);
+      if (showing) return;
+      // 最小化窗口 isWindowShowing()=false，但它仍是活窗口
+      // （托盘收起/顶层主窗最小化）→ 不能当死窗剪掉。
+      let minimized: boolean = false;
+      try {
+        minimized = win.getWindowStatus() === window.WindowStatusType.MINIMIZE;
+      } catch (_e) {}
+      if (!minimized) dead.push(reqId);
     });
     for (let i = 0; i < dead.length; i++) {
       const id: number = dead[i];
       this.subWinMap.delete(id);
       this.lastSubSize.delete(id);
+      this.topLevelReqIds.delete(id);
+      const top: number | undefined = this.subWinTop.get(id);
+      this.subWinTop.delete(id);
+      if (getActiveWindowReqId() === id) markActiveWindow(top ?? 1);
       unregisterWindowPositionSync(id);
     }
   }

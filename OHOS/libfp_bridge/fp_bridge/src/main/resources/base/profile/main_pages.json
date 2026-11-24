@@ -1,6 +1,7 @@
 {
   "src": [
     "pages/Index",
-    "pages/WindowSurface"
+    "pages/WindowSurface",
+    "pages/MainWindowSurface"
   ]
 }

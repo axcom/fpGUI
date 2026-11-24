@@ -1,4 +1,4 @@
-import { AbilityConstant, ConfigurationConstant, UIAbility, Want, abilityAccessCtrl } from '@kit.AbilityKit';
+import { AbilityConstant, ConfigurationConstant, UIAbility, Want, abilityAccessCtrl, common } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
 import { settings } from '@kit.BasicServicesKit';
@@ -6,6 +6,7 @@ import { inputDevice } from '@kit.InputKit';
 import fpbridge from 'libfp_bridge.so';
 import { startDispatchRelay, stopDispatchRelay } from '../common/FpDispatchRelay';
 import { bindOpenUrlContext, openUrl } from '../common/OpenUrl';
+import { closeAllAbilityWindows } from '../common/FpWindowRegistry';
 import { APP_ARGS, WANT_PARAM_ARGS } from '../common/FpAppConfig';
 import type { Configuration, Context, PermissionRequestResult, Permissions } from '@kit.AbilityKit';
 
@@ -246,6 +247,13 @@ export function getWindowStage(): window.WindowStage | null {
   return gWindowStage;
 }
 
+// 应用上下文：window.createWindow(config) 的 ctx 必须是有效 BaseContext。
+// 页面里 getUIContext().getHostContext() 可能为 undefined（参数错 401），
+// 这里直接取 Ability 自己的 context，最稳妥。
+export function getAbilityContext(): common.UIAbilityContext | null {
+  return gAbility ? gAbility.context : null;
+}
+
 // 主窗口（Ability 应用窗口）：供 Index.ets 控制尺寸/位置/全屏/装饰
 export function getMainWindow(): window.Window | null {
   if (gWindowStage === null) return null;
@@ -258,6 +266,8 @@ export function getMainWindow(): window.Window | null {
 }
 
 export function terminateAbility(): void {
+  // 主 Ability 的 terminateSelf 不会带上 multiton 拉起的其他实例 → 先全部结束。
+  closeAllAbilityWindows();
   if (gAbility) {
     try {
       gAbility.context.terminateSelf();
@@ -298,6 +308,9 @@ export default class Fp_bridgeAbility extends UIAbility {
   }
 
   onDestroy(): void {
+    // 主 Ability 被关闭/退出：multiton 拉起的顶层主窗实例不会自动跟随销毁，
+    // 必须显式全部结束，避免进程内残留无主窗口。
+    closeAllAbilityWindows();
     stopDispatchRelay();
     gAbility = null;
     hilog.info(DOMAIN, TAG, '%{public}s', 'Ability onDestroy');

@@ -42,6 +42,17 @@
             ]
           }
         ]
+      },
+      {
+        // waSizeable 的普通/模态窗：每个窗口一个 multiton 实例，各自拥有
+        // 独立 WindowStage 主窗（真正的顶层主窗；TYPE_MAIN 不允许用于创建）。
+        "name": "FpWindowAbility",
+        "srcEntry": "./ets/fp_bridgeability/FpWindowAbility.ets",
+        "description": "$string:Fp_bridgeAbility_desc",
+        "startWindowIcon": "$media:startIcon",
+        "startWindowBackground": "$color:start_window_background",
+        "exported": false,
+        "launchType": "multiton"
       }
     ],
     "requestPermissions": [

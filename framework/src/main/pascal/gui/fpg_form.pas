@@ -287,7 +287,7 @@ begin
   FScaleDPIApplied := 0;   // FPG(R2): 尚未做 DPI 缩放
   FWindowTitle     := fpgApplication.AppTitle;
   FIconName        := fpgApplication.AppIcon;
-  FSizeable        := True;
+  FSizeable        := False;//True;
   FParentForm      := nil;
   FBackgroundColor := clWindowBackground;
   FTextColor       := clText1;
