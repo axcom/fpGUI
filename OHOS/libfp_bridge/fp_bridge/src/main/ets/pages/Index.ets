@@ -152,15 +152,9 @@ struct Index {
   aboutToAppear(): void {
     fpbridge.setEtsReady();
     hilog.info(DOMAIN, TAG, 'Index: setEtsReady called');
-    // 启动 Pascal fpGUI 应用（库名由外部配置 FpAppConfig.APP_LIB_NAME 动态指定；
-    // PascalThread 内部等待 ETS ready 后 dlopen "lib<APP_LIB_NAME>.so"）
-    // 第二参数：启动载荷 JSON（want.uri/action/entities/parameters）→ C++ argv → RunLazarus
-    // 第三参数：命令行参数（-b debug / key=value 风格）→ Pascal ICmdLineParams
-    fpbridge.start(APP_LIB_NAME, getLaunchPayload(), getMergedArgs());
-    TrayManager.getInstance().init(this.getUIContext().getHostContext() as common.UIAbilityContext);
-    // 物理键盘检测（PC 模式 → 不弹软键盘）；含热插拔监听
-    initKeyboardDetector();
 
+    // 先注册 window 回调，再启动 Pascal：否则 Pascal 启动早期发出的命令
+    // （含启动 URI 物化所需的 file_io type=21）会在 C++ g_tsfn 为空时被丢弃。
     fpbridge.setNativeCallback((cmdObj: object) => {
       const cmd: NativeCommand = {
         type: cmdObj['type'] as number,
@@ -183,6 +177,15 @@ struct Index {
       this.handleNativeCommand(cmd);
     }, 'window');
     hilog.info(DOMAIN, TAG, 'Index: window callback registered');
+
+    // 启动 Pascal fpGUI 应用（库名由外部配置 FpAppConfig.APP_LIB_NAME 动态指定；
+    // PascalThread 内部等待 ETS ready 后 dlopen "lib<APP_LIB_NAME>.so"）
+    // 第二参数：启动载荷 JSON（want.uri/action/entities/parameters）→ C++ argv → RunLazarus
+    // 第三参数：命令行参数（-b debug / key=value 风格）→ Pascal ICmdLineParams
+    fpbridge.start(APP_LIB_NAME, getLaunchPayload(), getMergedArgs());
+    TrayManager.getInstance().init(this.getUIContext().getHostContext() as common.UIAbilityContext);
+    // 物理键盘检测（PC 模式 → 不弹软键盘）；含热插拔监听
+    initKeyboardDetector();
     // 定时器 ArkUI 注入：补查当前是否有活动定时器（Pascal 早发通知时回调未注册会丢）
     initTimerDaemon();
   }

@@ -67,13 +67,15 @@ function requestStartupPermissions(ctx: Context): void {
 // 冷启动：Index.ets start(appLib, payload) → C++ argv[1] → RunLazarus；
 // 热启动：onNewWant → fpbridge.setLaunchParams(payload) → Pascal 事件。
 let gLaunchPayload: string = '';
-let gLastWarmPush: string = '';
 
 function buildLaunchPayload(want: Want | null): string {
   if (!want) return '';
   const payload: Record<string, Object> = {};
   if (want.uri !== undefined && want.uri !== null && want.uri !== '') {
     payload['uri'] = want.uri;
+  }
+  if (want.type !== undefined && want.type !== null && want.type !== '') {
+    payload['type'] = want.type;
   }
   if (want.action !== undefined && want.action !== null && want.action !== '') {
     payload['action'] = want.action;
@@ -92,15 +94,11 @@ function setLaunchPayload(want: Want | null): void {
   const payload = buildLaunchPayload(want);
   if (payload === '') return;
   gLaunchPayload = payload;
-  // 热启动推送（去重：同一载荷不重复推，Pascal 侧逐条消费）
-  if (payload !== gLastWarmPush) {
-    gLastWarmPush = payload;
-    try {
-      fpbridge.setLaunchParams(payload);
-      hilog.info(DOMAIN, TAG, 'Warm launch params pushed: %{public}s', payload);
-    } catch (err) {
-      hilog.error(DOMAIN, TAG, 'setLaunchParams failed: %{public}s', JSON.stringify(err));
-    }
+  try {
+    fpbridge.setLaunchParams(payload);
+    hilog.info(DOMAIN, TAG, 'Launch params pushed: %{public}s', payload);
+  } catch (err) {
+    hilog.error(DOMAIN, TAG, 'setLaunchParams failed: %{public}s', JSON.stringify(err));
   }
 }
 
@@ -287,6 +285,8 @@ export default class Fp_bridgeAbility extends UIAbility {
       hilog.error(DOMAIN, TAG, 'Failed to set colorMode. Cause: %{public}s', JSON.stringify(err));
     }
     gAbility = this;
+    gLaunchPayload = '';
+    hilog.info(DOMAIN, TAG, 'onCreate want=%{public}s', buildLaunchPayload(want));
     setLaunchPayload(want);   // 冷启动：捕获 want.uri/action/entities/parameters
     gMergedArgs = buildMergedArgs(want);  // 合并静态参数和 want 动态参数
     if (gMergedArgs.length > 0) {
@@ -302,9 +302,17 @@ export default class Fp_bridgeAbility extends UIAbility {
 
   onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     // 热启动：更新合并参数
+    hilog.info(DOMAIN, TAG, 'onNewWant want=%{public}s', buildLaunchPayload(want));
     setLaunchPayload(want);
     gMergedArgs = buildMergedArgs(want);
     hilog.info(DOMAIN, TAG, 'onNewWant: appArgs=%{public}s', gMergedArgs);
+
+    // 托盘/最小化状态下再次打开文件时，尽量把主窗恢复到前台
+    const win = getMainWindow();
+    if (win !== null) {
+      win.restore().catch(() => {});
+      win.show().catch(() => {});
+    }
   }
 
   onDestroy(): void {

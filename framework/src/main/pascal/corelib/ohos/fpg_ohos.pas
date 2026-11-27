@@ -1494,6 +1494,53 @@ begin
     Result := 1;
 end;
 
+{ Decode one UTF-8 code point from a single character string. }
+function OhosUtf8CodePoint(const s: string): LongWord;
+var
+  b: Byte;
+begin
+  Result := 0;
+  if s = '' then Exit;
+  b := Byte(s[1]);
+  if b < $80 then
+    Result := b
+  else if (b and $E0) = $C0 then
+  begin
+    if Length(s) < 2 then Exit;
+    Result := LongWord(b and $1F) shl 6 or (Byte(s[2]) and $3F);
+  end
+  else if (b and $F0) = $E0 then
+  begin
+    if Length(s) < 3 then Exit;
+    Result := LongWord(b and $0F) shl 12 or
+      LongWord(Byte(s[2]) and $3F) shl 6 or (Byte(s[3]) and $3F);
+  end
+  else if (b and $F8) = $F0 then
+  begin
+    if Length(s) < 4 then Exit;
+    Result := LongWord(b and $07) shl 18 or
+      LongWord(Byte(s[2]) and $3F) shl 12 or
+      LongWord(Byte(s[3]) and $3F) shl 6 or (Byte(s[4]) and $3F);
+  end;
+end;
+
+{ True when the character normally lives outside a Latin-only UI face and
+  must be taken from the fallback chain even if the main font reports a
+  positive .notdef width.  OHOS returns the .notdef advance (> 0) for a
+  missing glyph, so checking width <= 0 alone never selects CJK fallback. }
+function OhosCharNeedsFallback(const ch: string): Boolean;
+var
+  cp: LongWord;
+begin
+  cp := OhosUtf8CodePoint(ch);
+  Result := ((cp >= $2E80) and (cp <= $9FFF)) or   { radicals, kana, CJK }
+            ((cp >= $AC00) and (cp <= $D7AF)) or   { Hangul }
+            ((cp >= $F900) and (cp <= $FAFF)) or   { CJK compatibility }
+            ((cp >= $FE30) and (cp <= $FE4F)) or   { CJK compatibility forms }
+            ((cp >= $FF00) and (cp <= $FFEF)) or   { fullwidth forms }
+            (cp >= $20000);                        { CJK extensions B+ }
+end;
+
 { ---------------------------------------------------------------------
   TfpgOhosFontResource
   --------------------------------------------------------------------- }
@@ -2045,7 +2092,7 @@ var
   ch: string;
   textWidth: Single;
   ret: Int32;
-  charW: Integer;
+  fallbackFound: Boolean;
 begin
   if txt = '' then Exit(0);
   { 逐字符 Round 累加：与渲染（DoDrawString 逐字符步进）及 fpg_edit
@@ -2063,17 +2110,26 @@ begin
     textWidth := 0;
     if FNativeFont <> nil then
     begin
-      ret := OH_Drawing_FontMeasureText(FNativeFont, PChar(ch), Length(ch),
-        TEXT_ENCODING_UTF8, nil, @textWidth);
-      if (ret <> 0) or (textWidth <= 0) then
+      fallbackFound := False;
+      { CJK/宽字符：OHOS 对缺字形返回 .notdef 宽度（> 0），不能只用
+        width <= 0 判断；先按字符取 fallback，保持与绘制一致。 }
+      if OhosCharNeedsFallback(ch) then
+        fallbackFound := ResolveFallbackWidth(ch, textWidth);
+
+      if not fallbackFound then
       begin
-        { 主字体缺字形 → fallback 链实测（防方框宽误差）}
-        if not ResolveFallbackWidth(ch, textWidth) then
+        ret := OH_Drawing_FontMeasureText(FNativeFont, PChar(ch), Length(ch),
+          TEXT_ENCODING_UTF8, nil, @textWidth);
+        if (ret <> 0) or (textWidth <= 0) then
         begin
-          if FMetricsValid and (FMetrics.fAvgCharWidth > 0) then
-            textWidth := Round(FMetrics.fAvgCharWidth)
-          else
-            textWidth := FHeight * 3 div 5;
+          { 主字体缺字形 → fallback 链实测（防方框宽误差）}
+          if not ResolveFallbackWidth(ch, textWidth) then
+          begin
+            if FMetricsValid and (FMetrics.fAvgCharWidth > 0) then
+              textWidth := Round(FMetrics.fAvgCharWidth)
+            else
+              textWidth := FHeight * 3 div 5;
+          end;
         end;
       end;
     end
@@ -2552,7 +2608,9 @@ begin
     chW := 0;
     OH_Drawing_FontMeasureText(lFont, PChar(ch), Length(ch), TEXT_ENCODING_UTF8, nil, @chW);
     fallbackUsed := False;
-    if (chW <= 0) and (ohosFntRes <> nil) then
+    { CJK/宽字符：即使主字体返回了 .notdef 的正宽度，也要尝试 fallback。 }
+    if (ohosFntRes <> nil) and
+       (OhosCharNeedsFallback(ch) or (chW <= 0)) then
       fallbackUsed := ohosFntRes.ResolveFallbackFont(ch, useFont, chW);
 
     lTextBlob := OH_Drawing_TextBlobCreateFromText(PChar(ch), Length(ch), useFont,
@@ -3137,10 +3195,9 @@ procedure TfpgOhosCanvas.DrawString(x, y: TfpgCoord; const txt: string);
 var
   underline: integer;
   fontdesc: string;
-  ulW, chW: Single;
+  ulW: Single;
   i, clen: Integer;
   ch: string;
-  nativeFont: POH_Drawing_Font;
 begin
   DoDrawString(x, y, txt);
 
@@ -3160,10 +3217,7 @@ begin
     { Underline width must use the same per-character accumulation as
       DoDrawString, otherwise it drifts on long/scrollable text. }
     ulW := 0;
-    nativeFont := nil;
-    if (FFont <> nil) and (FFont is TfpgOhosFontResource) then
-      nativeFont := TfpgOhosFontResource(FFont).NativeFont;
-    if nativeFont <> nil then
+    if FFont <> nil then
     begin
       i := 1;
       while i <= Length(txt) do
@@ -3172,9 +3226,8 @@ begin
         if clen < 1 then clen := 1;
         if i + clen - 1 > Length(txt) then clen := Length(txt) - i + 1;
         ch := Copy(txt, i, clen);
-        chW := 0;
-        OH_Drawing_FontMeasureText(nativeFont, PChar(ch), Length(ch), TEXT_ENCODING_UTF8, nil, @chW);
-        ulW := ulW + Round(chW);
+        { Fallback-aware width, matching DoDrawString and caret math. }
+        ulW := ulW + FFont.GetTextWidth(ch);
         Inc(i, clen);
       end;
     end;
@@ -3727,9 +3780,38 @@ begin
 end;
 
 procedure TfpgOhosWindow.SetScreenPosition(AX, AY: Integer);
+var
+  lx, ly: TfpgCoord;
+  w: TfpgWidget;
+  msg: TfpgMessageParams;
 begin
-  FPosition.X := Round(AX / gScaleFactorX);
-  FPosition.Y := Round(AY / gScaleFactorY);
+  lx := Round(AX / gScaleFactorX);
+  ly := Round(AY / gScaleFactorY);
+  FPosition.X := lx;
+  FPosition.Y := ly;
+  { 与 GDI 的 WM_MOVE→FPGM_MOVE、X11 的 ConfigureNotify→FPGM_MOVE 对齐：
+    系统拖动/最大化/还原/平铺只改原生窗口位置，这里除窗口 FPosition 外还必须
+    把移动事件派发给顶层窗体，让 TfpgWidget.MsgMove 更新其 Left/Top。
+    否则 fpg_form.ApplyWindowPosition 的 wpMainFormCenter 仍按最大化前的
+    主窗原点计算，子窗整体偏右下（实测：IDE 主窗最大化后 Find 等对话框
+    跑向屏幕右下）。
+    仅同步顶层窗体（wtWindow/wtModalForm）：wtChild 的 Left/Top 是父相对
+    坐标，不能写屏幕坐标；wtPopup 由 ShowAt 自行定位，无需回写。 }
+  if (WindowType in [wtWindow, wtModalForm]) and (PrimaryWidget is TfpgWidget) then
+  begin
+    w := TfpgWidget(PrimaryWidget);
+    if (w.Left <> lx) or (w.Top <> ly) then
+    begin
+      fpGUI_Hilog(LOG_INFO, format(
+        'SetScreenPosition sync widget h=%s wtype=%d left/top (%d,%d)->(%d,%d)',
+        [IntToHex(PtrUInt(FWinHandle), 8), Ord(WindowType),
+         w.Left, w.Top, lx, ly]));
+      FillChar(msg, SizeOf(msg), 0);
+      msg.rect.Left := lx;
+      msg.rect.Top  := ly;
+      fpgSendMessage(nil, Self, FPGM_MOVE, msg);
+    end;
+  end;
   fpGUI_Hilog(LOG_INFO, format('SetScreenPosition handle=%s px=%d,%d log=(%d,%d)',
     [IntToHex(PtrUInt(FWinHandle), 8), AX, AY, FPosition.X, FPosition.Y]));
 end;
@@ -7936,10 +8018,12 @@ begin
     Exit;
   end;
   Result := FileExists(APath);
+  { Only cache positive hits.  The first probe can run before the HAP
+    resource/files directories are mounted; caching a negative result would
+    hide the font for the whole process lifetime.  Misses are cheap and are
+    re-probed on the next font creation. }
   if Result then
-    gFontProbeCache.Add(APath + '=1')
-  else
-    gFontProbeCache.Add(APath + '=0');
+    gFontProbeCache.Add(APath + '=1');
 end;
 
 { 应用沙箱字体搜索目录（惰性缓存；全部来自官方 Context/桥接，禁止硬编码
@@ -7972,29 +8056,40 @@ function OhosAppFontDirs: TStringList;
 var
   d: string;
   abi: string;
+
+  procedure AddDirOnce(const ADir: string);
+  var
+    p: string;
+  begin
+    if ADir = '' then Exit;
+    p := IncludeTrailingPathDelimiter(ADir);
+    if gAppFontDirs.IndexOf(p) < 0 then
+      gAppFontDirs.Add(p);
+  end;
+
 begin
   if gAppFontDirs = nil then
-  begin
     gAppFontDirs := TStringList.Create;
-    gAppFontDirs.Add('');                       { CWD = resfile(resourceDir) }
-    d := GetResfileDir;
-    if d <> '' then
-      gAppFontDirs.Add(IncludeTrailingPathDelimiter(d));
-    d := GetRawfileDir;                         { Context.filesDir（可写）}
-    if d <> '' then
-    begin
-      gAppFontDirs.Add(IncludeTrailingPathDelimiter(d));
-      gAppFontDirs.Add(IncludeTrailingPathDelimiter(d) + 'fonts' + PathDelim);
-    end;
-    d := GetBundleCodeDir;                      { Context.bundleCodeDir }
-    abi := OhosAbiLibDirName;
-    if (d <> '') and (abi <> '') then
-    begin
-      gAppFontDirs.Add(IncludeTrailingPathDelimiter(d) + 'libs' + PathDelim +
-        abi + PathDelim);
-      gAppFontDirs.Add(IncludeTrailingPathDelimiter(d) + 'libs' + PathDelim +
-        abi + PathDelim + 'fonts' + PathDelim);
-    end;
+
+  { Re-evaluate Context directories on every call: they can still be empty
+    during the first font probe, and the process CWD may change later (the
+    IDE switches to the project directory).  Only absolute paths are added,
+    so a cached candidate never becomes stale after a chdir. }
+  AddDirOnce(GetCurrentDir);
+  AddDirOnce(GetResfileDir);
+  d := GetRawfileDir;                         { Context.filesDir（可写）}
+  if d <> '' then
+  begin
+    AddDirOnce(d);
+    AddDirOnce(IncludeTrailingPathDelimiter(d) + 'fonts');
+  end;
+  d := GetBundleCodeDir;                      { Context.bundleCodeDir }
+  abi := OhosAbiLibDirName;
+  if (d <> '') and (abi <> '') then
+  begin
+    AddDirOnce(IncludeTrailingPathDelimiter(d) + 'libs' + PathDelim + abi);
+    AddDirOnce(IncludeTrailingPathDelimiter(d) + 'libs' + PathDelim + abi +
+      PathDelim + 'fonts');
   end;
   Result := gAppFontDirs;
 end;

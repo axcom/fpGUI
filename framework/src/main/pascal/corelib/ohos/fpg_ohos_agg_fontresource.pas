@@ -458,6 +458,21 @@ begin
     Exit;
   end;
 
+  { 窗口路径同样不能依赖 width <= 0：OHOS 对缺字形返回 .notdef
+    正宽度，CJK/宽字符先查 fallback。 }
+  if FrIsCJKChar(ch) then
+    for i := 0 to High(FFallbackFonts) do
+    begin
+      w := 0;
+      if (FFallbackFonts[i] <> nil) and
+         (OH_Drawing_FontMeasureText(FFallbackFonts[i], PChar(ch),
+           Length(ch), TEXT_ENCODING_UTF8, nil, @w) = 0) and (w > 0) then
+      begin
+        ADrawFont := FFallbackFonts[i];
+        Exit(w);
+      end;
+    end;
+
   if FNativeFont <> nil then
     OH_Drawing_FontMeasureText(FNativeFont, PChar(ch), Length(ch),
       TEXT_ENCODING_UTF8, nil, @Result);
@@ -849,25 +864,39 @@ begin
     end
     else
     begin
-      if FNativeFont <> nil then
+      textWidth := 0;
+      { 窗口路径的 CJK 字符先取 fallback，避免主字体的 .notdef 正宽度
+        把 fallback 挡掉。 }
+      if FrIsCJKChar(ch) then
+        for j := 0 to High(FFallbackFonts) do
+          if (FFallbackFonts[j] <> nil) and
+             (OH_Drawing_FontMeasureText(FFallbackFonts[j], PChar(ch),
+               Length(ch), TEXT_ENCODING_UTF8, nil, @textWidth) = 0) and
+             (textWidth > 0) then
+            Break;
+
+      if textWidth <= 0 then
       begin
-        ret := OH_Drawing_FontMeasureText(FNativeFont, PChar(ch), Length(ch),
-          TEXT_ENCODING_UTF8, nil, @textWidth);
-        if (ret <> 0) or (textWidth <= 0) then
+        if FNativeFont <> nil then
         begin
-          textWidth := 0;
-          for j := 0 to High(FFallbackFonts) do
-            if (FFallbackFonts[j] <> nil) and
-               (OH_Drawing_FontMeasureText(FFallbackFonts[j], PChar(ch),
-                 Length(ch), TEXT_ENCODING_UTF8, nil, @textWidth) = 0) and
-               (textWidth > 0) then
-              Break;
-          if textWidth <= 0 then
-            textWidth := FHeight * 3 div 5;
-        end;
-      end
-      else
-        textWidth := FHeight * 3 div 5;
+          ret := OH_Drawing_FontMeasureText(FNativeFont, PChar(ch), Length(ch),
+            TEXT_ENCODING_UTF8, nil, @textWidth);
+          if (ret <> 0) or (textWidth <= 0) then
+          begin
+            textWidth := 0;
+            for j := 0 to High(FFallbackFonts) do
+              if (FFallbackFonts[j] <> nil) and
+                 (OH_Drawing_FontMeasureText(FFallbackFonts[j], PChar(ch),
+                   Length(ch), TEXT_ENCODING_UTF8, nil, @textWidth) = 0) and
+                 (textWidth > 0) then
+                Break;
+            if textWidth <= 0 then
+              textWidth := FHeight * 3 div 5;
+          end;
+        end
+        else
+          textWidth := FHeight * 3 div 5;
+      end;
 
       total := total + Round(textWidth / sf);
     end;

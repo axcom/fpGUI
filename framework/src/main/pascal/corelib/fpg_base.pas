@@ -3479,6 +3479,8 @@ end;
 procedure TfpgFontDefinition.ParseFontDesc;
 var
   cp: integer;
+  sizePos: integer;
+  i: integer;
   token: string;
   prop: string;
   propval: string;
@@ -3496,17 +3498,24 @@ begin
     Exit;
   end;
 
-  // Extract face name (everything before '-' or ':')
-  while (cp <= Length(FFontDesc)) and (FFontDesc[cp] <> '-') and (FFontDesc[cp] <> ':') do
+  // Extract face name and size. The size separator is the last '-' before
+  // any attribute section that is followed by a decimal digit, so family or
+  // font-file names may themselves contain hyphens (e.g.
+  // 'JetBrainsMono-Regular.ttf-12').
+  sizePos := 0;
+  i := 1;
+  while (i <= Length(FFontDesc)) and (FFontDesc[i] <> ':') do
   begin
-    FFaceName := FFaceName + FFontDesc[cp];
-    Inc(cp);
+    if (FFontDesc[i] = '-') and (i < Length(FFontDesc)) and
+       (FFontDesc[i+1] >= '0') and (FFontDesc[i+1] <= '9') then
+      sizePos := i;
+    Inc(i);
   end;
 
-  // Extract size (number after '-')
-  if (cp <= Length(FFontDesc)) and (FFontDesc[cp] = '-') then
+  if sizePos > 0 then
   begin
-    Inc(cp);
+    FFaceName := Trim(Copy(FFontDesc, 1, sizePos - 1));
+    cp := sizePos + 1;
     token := '';
     while (cp <= Length(FFontDesc)) and (FFontDesc[cp] >= '0') and (FFontDesc[cp] <= '9') do
     begin
@@ -3515,6 +3524,11 @@ begin
     end;
     if token <> '' then
       FSize := StrToIntDef(token, 10);
+  end
+  else
+  begin
+    FFaceName := Trim(Copy(FFontDesc, 1, i - 1));
+    cp := i;
   end;
 
   // Parse attributes (after ':')
